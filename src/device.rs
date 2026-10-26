@@ -43,6 +43,13 @@ pub enum Cmd {
 pub struct Snapshot {
     pub connected: bool,
     pub model: String,
+    pub kind: String,
+    pub has_dpi: bool,
+    pub has_rate: bool,
+    pub has_leds: bool,
+    pub has_profiles: bool,
+    pub has_button_spy: bool,
+    pub profile_format: u8,
     pub path: String,
     pub firmware: String,
     pub protocol: String,
@@ -129,29 +136,77 @@ pub fn spawn() -> Handle {
 /// Take host mode only if we are not already in it. Each switch costs a
 /// 150ms settle, which is very noticeable when it happens on every click.
 fn ensure_host(l: &mut Live) -> crate::hidpp::Result<()> {
-    if l.profiles.mode(&mut l.dev).unwrap_or(0) == crate::profiles::MODE_HOST {
-        return Ok(());
-    }
-    l.profiles.set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+    let p = l.profiles.take().ok_or_else(|| missing("onboard profiles"))?;
+    let r = if p.mode(&mut l.dev).unwrap_or(0) == crate::profiles::MODE_HOST {
+        Ok(())
+    } else {
+        p.set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+    };
+    l.profiles = Some(p);
+    r
 }
 
 struct Live {
     dev: Device,
-    model: &'static str,
-    leds: Leds,
-    dpi: Dpi,
-    rate: ReportRate,
-    profiles: OnboardProfiles,
+    name: String,
+    kind: String,
+    caps: crate::capabilities::Capabilities,
+    // Each is present only if the device's own feature table reports it, so an
+    // arbitrary Logitech mouse gets exactly the controls it supports.
+    leds: Option<Leds>,
+    dpi: Option<Dpi>,
+    rate: Option<ReportRate>,
+    profiles: Option<OnboardProfiles>,
+}
+
+/// Fail a command cleanly when the device lacks the feature it needs.
+fn missing(what: &str) -> crate::hidpp::Error {
+    crate::hidpp::Error::Protocol(format!("this device has no {what}"))
+}
+
+/// Borrow one optional feature and the device at the same time.
+///
+/// `l.dpi()?.set(&mut l.dev, ..)` cannot work: the accessor borrows all of
+/// `l`. Destructuring borrows the fields disjointly, which is what this does.
+macro_rules! feat {
+    ($l:expr, $field:ident, $what:expr) => {{
+        let Live { dev, $field, .. } = $l;
+        match $field.as_ref() {
+            Some(f) => Ok((f, dev)),
+            None => Err(missing($what)),
+        }
+    }};
+}
+
+impl Live {
+    fn leds(&self) -> crate::hidpp::Result<&Leds> {
+        self.leds.as_ref().ok_or_else(|| missing("RGB lighting"))
+    }
+    fn dpi(&self) -> crate::hidpp::Result<&Dpi> {
+        self.dpi.as_ref().ok_or_else(|| missing("adjustable DPI"))
+    }
+    fn rate(&self) -> crate::hidpp::Result<&ReportRate> {
+        self.rate.as_ref().ok_or_else(|| missing("adjustable report rate"))
+    }
+    fn profiles(&self) -> crate::hidpp::Result<&OnboardProfiles> {
+        self.profiles.as_ref().ok_or_else(|| missing("onboard profiles"))
+    }
 }
 
 fn connect() -> Result<Live, String> {
     let found = discover::open_device().map_err(|e| e.to_string())?;
     let mut dev = found.device;
-    let leds = Leds::new(&mut dev).map_err(|e| e.to_string())?;
-    let dpi = Dpi::new(&mut dev).map_err(|e| e.to_string())?;
-    let rate = ReportRate::new(&mut dev).map_err(|e| e.to_string())?;
-    let profiles = OnboardProfiles::new(&mut dev).map_err(|e| e.to_string())?;
-    Ok(Live { dev, model: found.model, leds, dpi, rate, profiles })
+    let caps = found.caps;
+    // Build only what the device advertises. A failure to construct a feature
+    // it claims is not fatal either; the control just stays unavailable.
+    let leds = caps.color_leds.then(|| Leds::new(&mut dev).ok()).flatten();
+    let dpi = caps.dpi.then(|| Dpi::new(&mut dev).ok()).flatten();
+    let rate = caps.report_rate.then(|| ReportRate::new(&mut dev).ok()).flatten();
+    let profiles = caps
+        .onboard_profiles
+        .then(|| OnboardProfiles::new(&mut dev).ok())
+        .flatten();
+    Ok(Live { dev, name: found.name, kind: found.kind, caps, leds, dpi, rate, profiles })
 }
 
 /// Cheap state: about seven HID++ round trips.
@@ -161,91 +216,77 @@ fn connect() -> Result<Live, String> {
 /// after every click made the UI feel hung.
 fn read_state(l: &mut Live, into: &mut Snapshot) {
     into.connected = true;
-    into.model = l.model.to_string();
+    into.model = l.name.clone();
+    into.kind = l.kind.clone();
     into.path = l.dev.path.clone();
+    into.has_dpi = l.dpi.is_some();
+    into.has_rate = l.rate.is_some();
+    into.has_leds = l.leds.is_some();
+    into.has_profiles = l.profiles.is_some();
+    into.has_button_spy = l.caps.button_spy;
     if let Ok((a, b)) = l.dev.protocol_version() {
         into.protocol = format!("{a}.{b}");
     }
-    into.dpi = l.dpi.get(&mut l.dev, 0).unwrap_or(into.dpi);
-    if into.dpi_cap.is_none() {
-        into.dpi_cap = l.dpi.capability(&mut l.dev, 0).ok();
+    if let Some(d) = l.dpi.take() {
+        into.dpi = d.get(&mut l.dev, 0).unwrap_or(into.dpi);
+        if into.dpi_cap.is_none() {
+            into.dpi_cap = d.capability(&mut l.dev, 0).ok();
+        }
+        l.dpi = Some(d);
     }
-    into.rate = l.rate.get(&mut l.dev).unwrap_or(into.rate);
-    if into.rates.is_empty() {
-        into.rates = l.rate.supported(&mut l.dev).unwrap_or_default();
+    if let Some(r) = l.rate.take() {
+        into.rate = r.get(&mut l.dev).unwrap_or(into.rate);
+        if into.rates.is_empty() {
+            into.rates = r.supported(&mut l.dev).unwrap_or_default();
+        }
+        l.rate = Some(r);
     }
-    into.profile_count = l.profiles.info.profile_count;
-    into.button_count = l.profiles.info.button_count;
-    into.active_profile = l.profiles.current(&mut l.dev).unwrap_or(into.active_profile);
-    into.mode = l.profiles.mode(&mut l.dev).unwrap_or(into.mode);
+    if let Some(p) = l.profiles.take() {
+        into.profile_count = p.info.profile_count;
+        into.button_count = p.info.button_count;
+        into.profile_format = p.info.profile_format_id;
+        into.active_profile = p.current(&mut l.dev).unwrap_or(into.active_profile);
+        into.mode = p.mode(&mut l.dev).unwrap_or(into.mode);
+        l.profiles = Some(p);
+    }
     if into.zones.is_empty() {
-        into.zones = l
-            .leds
-            .zones
-            .iter()
-            .map(|z| ZoneInfo {
-                index: z.index,
-                location: z.location_name().to_string(),
-                modes: z.modes.clone(),
-                live_modes: l.leds.live_modes(z.index),
-            })
-            .collect();
+        if let Some(leds) = l.leds.take() {
+            into.zones = leds
+                .zones
+                .iter()
+                .map(|z| ZoneInfo {
+                    index: z.index,
+                    location: z.location_name().to_string(),
+                    modes: z.modes.clone(),
+                    live_modes: leds.live_modes(z.index),
+                })
+                .collect();
+            l.leds = Some(leds);
+        }
     }
 }
 
 /// The expensive part: every profile sector, 80 round trips. Only worth doing
 /// on an explicit refresh or after something wrote flash.
 fn read_profiles(l: &mut Live, into: &mut Snapshot) {
-    let mut out = Vec::new();
-    for i in 0..into.profile_count {
-        if let Ok(blob) = l.profiles.read_sector(&mut l.dev, i as u16 + 1, None) {
-            if let Ok(p) = Profile::parse(&blob) {
-                out.push(p);
+    let Some(p) = l.profiles.take() else { return };
+    // Only the 256-byte format-2 layout is decodable; another device may use a
+    // different one, and guessing at it would print nonsense.
+    if p.info.profile_format_id == 2 && p.info.sector_size as usize == crate::profile_blob::SECTOR_SIZE
+    {
+        let mut out = Vec::new();
+        for i in 0..into.profile_count {
+            if let Ok(blob) = p.read_sector(&mut l.dev, i as u16 + 1, None) {
+                if let Ok(parsed) = Profile::parse(&blob) {
+                    out.push(parsed);
+                }
             }
         }
-    }
-    if !out.is_empty() {
-        into.profiles = out;
-    }
-}
-
-fn read_snapshot(l: &mut Live) -> Snapshot {
-    let mut s = Snapshot {
-        connected: true,
-        model: l.model.to_string(),
-        path: l.dev.path.clone(),
-        ..Default::default()
-    };
-    if let Ok((a, b)) = l.dev.protocol_version() {
-        s.protocol = format!("{a}.{b}");
-    }
-    s.dpi = l.dpi.get(&mut l.dev, 0).unwrap_or(0);
-    s.dpi_cap = l.dpi.capability(&mut l.dev, 0).ok();
-    s.rate = l.rate.get(&mut l.dev).unwrap_or(0);
-    s.rates = l.rate.supported(&mut l.dev).unwrap_or_default();
-    s.profile_count = l.profiles.info.profile_count;
-    s.button_count = l.profiles.info.button_count;
-    s.active_profile = l.profiles.current(&mut l.dev).unwrap_or(0);
-    s.mode = l.profiles.mode(&mut l.dev).unwrap_or(0);
-    s.zones = l
-        .leds
-        .zones
-        .iter()
-        .map(|z| ZoneInfo {
-            index: z.index,
-            location: z.location_name().to_string(),
-            modes: z.modes.clone(),
-            live_modes: l.leds.live_modes(z.index),
-        })
-        .collect();
-    for i in 0..s.profile_count {
-        if let Ok(blob) = l.profiles.read_sector(&mut l.dev, i as u16 + 1, None) {
-            if let Ok(p) = Profile::parse(&blob) {
-                s.profiles.push(p);
-            }
+        if !out.is_empty() {
+            into.profiles = out;
         }
     }
-    s
+    l.profiles = Some(p);
 }
 
 fn worker(
@@ -262,9 +303,10 @@ fn worker(
         if live.is_none() && effect.is_none() {
             match connect() {
                 Ok(mut l) => {
-                    let snap = read_snapshot(&mut l);
                     if let Ok(mut g) = shared.lock() {
-                        *g = snap;
+                        *g = Snapshot::default();
+                        read_state(&mut l, &mut g);
+                        read_profiles(&mut l, &mut g);
                     }
                     live = Some(l);
                 }
@@ -304,6 +346,7 @@ fn worker(
             continue;
         };
 
+        let name_for_backup = l.name.clone();
         let wrote_flash = matches!(
             cmd,
             Cmd::PersistLighting { .. }
@@ -313,63 +356,78 @@ fn worker(
         );
         let result: crate::hidpp::Result<Option<String>> = match cmd {
             Cmd::Refresh => Ok(None),
-            Cmd::SetDpi(v) => l.dpi.set(&mut l.dev, v, 0).map(|got| {
-                Some(if got == v { format!("DPI {got}") } else { format!("DPI snapped to {got}") })
+            Cmd::SetDpi(v) => feat!(l, dpi, "adjustable DPI").and_then(|(d, dev)| {
+                d.set(dev, v, 0).map(|got| {
+                    Some(if got == v {
+                        format!("DPI {got}")
+                    } else {
+                        format!("DPI snapped to {got}")
+                    })
+                })
             }),
-            Cmd::SetRate(hz) => l.rate.set(&mut l.dev, hz).map(|_| Some(format!("{hz} Hz"))),
-            Cmd::SetMode(m) => l
-                .profiles
-                .set_mode(&mut l.dev, m)
-                .map(|_| Some(format!("mode: {}", crate::profiles::mode_name(m)))),
-            Cmd::SetProfile(i) => {
-                l.profiles.set_current(&mut l.dev, i).map(|_| Some(format!("profile {i}")))
-            }
+            Cmd::SetRate(hz) => feat!(l, rate, "adjustable report rate")
+                .and_then(|(r, dev)| r.set(dev, hz).map(|_| Some(format!("{hz} Hz")))),
+            Cmd::SetMode(m) => feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                p.set_mode(dev, m)
+                    .map(|_| Some(format!("mode: {}", crate::profiles::mode_name(m))))
+            }),
+            Cmd::SetProfile(i) => feat!(l, profiles, "onboard profiles")
+                .and_then(|(p, dev)| p.set_current(dev, i).map(|_| Some(format!("profile {i}")))),
             Cmd::LedFixed { zone, color } => ensure_host(l)
-                .and_then(|_| l.leds.fixed(&mut l.dev, zone, color))
+                .and_then(|_| feat!(l, leds, "RGB lighting"))
+                .and_then(|(leds, dev)| leds.fixed(dev, zone, color))
                 .map(|_| Some("lighting applied live".into())),
             Cmd::LedBreathing { zone, color, period, waveform, intensity } => ensure_host(l)
-                .and_then(|_| {
-                    l.leds.breathing(&mut l.dev, zone, color, period, waveform, intensity)
+                .and_then(|_| feat!(l, leds, "RGB lighting"))
+                .and_then(|(leds, dev)| {
+                    leds.breathing(dev, zone, color, period, waveform, intensity)
                 })
                 .map(|_| Some("breathing applied live".into())),
             Cmd::LedCycle { zone, period, intensity } => ensure_host(l)
-                .and_then(|_| l.leds.cycle(&mut l.dev, zone, period, intensity))
+                .and_then(|_| feat!(l, leds, "RGB lighting"))
+                .and_then(|(leds, dev)| leds.cycle(dev, zone, period, intensity))
                 .map(|_| Some("cycle applied live".into())),
             Cmd::LedOff { zone } => ensure_host(l)
-                .and_then(|_| l.leds.off(&mut l.dev, zone))
+                .and_then(|_| feat!(l, leds, "RGB lighting"))
+                .and_then(|(leds, dev)| leds.off(dev, zone))
                 .map(|_| Some("lighting off".into())),
-            Cmd::PersistLighting { leds } => {
-                let idx = l.profiles.current(&mut l.dev).unwrap_or(0);
-                l.profiles
-                    .read_sector(&mut l.dev, idx as u16 + 1, None)
-                    .and_then(|blob| {
-                        let mut p = Profile::parse(&blob)
-                            .map_err(crate::hidpp::Error::Protocol)?;
-                        p.leds = leds;
-                        p.alt_leds = leds;
-                        profile_io::write_profile(&mut l.dev, &l.profiles, idx, &p)
-                    })
-                    .and_then(|_| l.profiles.set_mode(&mut l.dev, MODE_ONBOARD))
-                    .map(|_| Some("stored to onboard profile (survives unplug)".into()))
+            Cmd::PersistLighting { leds: recs } => {
+                feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                    let idx = p.current(dev).unwrap_or(0);
+                    let blob = p.read_sector(dev, idx as u16 + 1, None)?;
+                    let mut prof =
+                        Profile::parse(&blob).map_err(crate::hidpp::Error::Protocol)?;
+                    prof.leds = recs;
+                    prof.alt_leds = recs;
+                    profile_io::write_profile(dev, p, idx, &prof)?;
+                    p.set_mode(dev, MODE_ONBOARD)?;
+                    Ok(Some("stored to onboard profile (survives unplug)".into()))
+                })
             }
             Cmd::SetButton { index, button, binding } => {
-                profile_io::set_button(&mut l.dev, &l.profiles, index, button, binding)
-                    .map(|_| Some(format!(
-                        "button {button} -> {} (profile {index}, flash)",
-                        binding.describe()
-                    )))
+                feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                    profile_io::set_button(dev, p, index, button, binding).map(|_| {
+                        Some(format!(
+                            "button {button} -> {} (profile {index}, flash)",
+                            binding.describe()
+                        ))
+                    })
+                })
             }
             Cmd::WriteProfile { index, profile } => {
-                profile_io::write_profile(&mut l.dev, &l.profiles, index, &profile)
-                    .map(|_| Some(format!("profile {index} written to flash")))
+                feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                    profile_io::write_profile(dev, p, index, &profile)
+                        .map(|_| Some(format!("profile {index} written to flash")))
+                })
             }
             Cmd::Backup(path) => {
-                let dump = profile_io::dump_all(&mut l.dev, &l.profiles);
-                let json = profile_io::dump_to_json(l.model, &dump);
-                match std::fs::write(&path, json) {
-                    Ok(()) => Ok(Some(format!("backup written to {path}"))),
-                    Err(e) => Err(crate::hidpp::Error::Io(e)),
-                }
+                feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                    let dump = profile_io::dump_all(dev, p);
+                    let json = profile_io::dump_to_json(&name_for_backup, &dump);
+                    std::fs::write(&path, json)
+                        .map(|_| Some(format!("backup written to {path}")))
+                        .map_err(crate::hidpp::Error::Io)
+                })
             }
             Cmd::StartEffect { name, color, period_ms } => {
                 match effects::start(name.clone(), color, period_ms) {

@@ -4,6 +4,8 @@
 //! from a shell.
 
 mod appwatch;
+mod capabilities;
+mod deviceinfo;
 mod device;
 mod discover;
 mod dpi;
@@ -23,6 +25,7 @@ const USAGE: &str = "\
 g502 — control a Logitech G502 HERO over HID++ 2.0
 
   g502                        open the graphical app
+  g502 devices                every Logitech HID++ device, and what it can do
   g502 info                   capabilities and current state
   g502 dpi [<n>]              show or set DPI (continuous, snapped to the step)
   g502 rate [<hz>] [--live]   show or set the report rate; persists to the
@@ -43,6 +46,8 @@ g502 — control a Logitech G502 HERO over HID++ 2.0
   g502 --help
 
 Colours take hex (ff0066, #ff0066) or a name (red, cyan, purple...).
+With more than one Logitech device attached, pick one with G502_DEVICE,
+e.g. G502_DEVICE=046d:c08b g502 info
 ";
 
 fn main() -> std::process::ExitCode {
@@ -100,9 +105,10 @@ impl From<Error> for CliError {
     }
 }
 
-fn open() -> Result<(Device, &'static str), CliError> {
-    let f = discover::open_device()?;
-    Ok((f.device, f.model))
+/// Open the device named by $G502_DEVICE (e.g. "046d:c08b"), or the only one.
+fn open() -> Result<discover::Found, CliError> {
+    let want = std::env::var("G502_DEVICE").ok();
+    Ok(discover::open_device_matching(want.as_deref())?)
 }
 
 fn run(args: &[String]) -> Result<(), CliError> {
@@ -111,6 +117,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
             print!("{USAGE}");
             Ok(())
         }
+        "devices" | "list" => cmd_devices(),
         "info" => cmd_info(),
         "dpi" => cmd_dpi(args.get(1)),
         "rate" => cmd_rate(&args[1..]),
@@ -132,10 +139,46 @@ fn run(args: &[String]) -> Result<(), CliError> {
     }
 }
 
+fn cmd_devices() -> Result<(), CliError> {
+    let found = discover::list_devices();
+    if found.is_empty() {
+        println!("No Logitech HID++ device found.");
+        println!();
+        println!("A plain mouse with no configurable features does not speak HID++ and");
+        println!("will not appear here. If you expected one, check permissions:");
+        println!("  ls -l /dev/hidraw*    (the device's nodes should be group plugdev)");
+        return Ok(());
+    }
+    for f in &found {
+        println!("{}  {}", f.id(), f.name);
+        println!("    type      : {}", f.kind);
+        println!("    endpoint  : {}", f.device.path);
+        println!("    HID++     : {}.{}", f.protocol.0, f.protocol.1);
+        println!("    features  : {} ({} total)", f.caps.summary(), f.caps.features.len());
+        if !f.caps.restricted.is_empty() {
+            let ids: Vec<String> =
+                f.caps.restricted.iter().map(|i| format!("0x{i:04x}")).collect();
+            println!("    restricted: {} (not touched)", ids.join(" "));
+        }
+        println!();
+    }
+    if found.len() > 1 {
+        println!("Pick one with G502_DEVICE=<id>, e.g. G502_DEVICE={}", found[0].id());
+    }
+    Ok(())
+}
+
 fn cmd_info() -> Result<(), CliError> {
-    let (mut dev, model) = open()?;
+    let mut f = open()?;
+    let model = f.name.clone();
+    let kind = f.kind.clone();
+    let id = f.id();
+    let path = f.device.path.clone();
+    let caps = f.caps.clone();
+    let dev = &mut f.device;
     println!("device   : {model}");
-    println!("endpoint : {}", dev.path);
+    println!("type     : {kind}  ({id})");
+    println!("endpoint : {path}");
     if let Ok((a, b)) = dev.protocol_version() {
         println!("HID++    : {a}.{b}");
     }
@@ -159,27 +202,34 @@ fn cmd_info() -> Result<(), CliError> {
         }
     }
 
-    if let Ok(d) = dpi::Dpi::new(&mut dev) {
+    println!();
+    println!("supported: {}", caps.summary());
+    if !caps.restricted.is_empty() {
+        let ids: Vec<String> = caps.restricted.iter().map(|i| format!("0x{i:04x}")).collect();
+        println!("restricted (not touched): {}", ids.join(" "));
+    }
+
+    if let Ok(d) = dpi::Dpi::new(dev) {
         println!("\nsensor:");
-        match d.capability(&mut dev, 0) {
+        match d.capability(dev, 0) {
             Ok(dpi::Capability::Range { min, max, step }) => {
                 println!("  range    : {min}-{max} dpi, step {step}")
             }
             Ok(dpi::Capability::List(v)) => println!("  stages   : {v:?}"),
             Err(e) => println!("  range    : unavailable ({e})"),
         }
-        if let Ok(v) = d.get(&mut dev, 0) {
+        if let Ok(v) = d.get(dev, 0) {
             println!("  current  : {v} dpi");
         }
     }
 
-    if let Ok(r) = rate::ReportRate::new(&mut dev) {
-        if let (Ok(cur), Ok(all)) = (r.get(&mut dev), r.supported(&mut dev)) {
+    if let Ok(r) = rate::ReportRate::new(dev) {
+        if let (Ok(cur), Ok(all)) = (r.get(dev), r.supported(dev)) {
             println!("\nreport rate: {cur} Hz (supported: {all:?})");
         }
     }
 
-    if let Ok(l) = led::Leds::new(&mut dev) {
+    if let Ok(l) = led::Leds::new(dev) {
         println!("\nlighting: {} zones, ext_caps 0x{:04x}", l.zone_count, l.ext_caps);
         if !l.can_read_back() {
             println!("  (getZoneEffect unimplemented: a zero readback means nothing)");
@@ -190,15 +240,15 @@ fn cmd_info() -> Result<(), CliError> {
         }
     }
 
-    if let Ok(p) = profiles::OnboardProfiles::new(&mut dev) {
+    if let Ok(p) = profiles::OnboardProfiles::new(dev) {
         let i = p.info;
         println!("\nonboard profiles:");
         println!("  {} profiles (+{} rom), {} buttons", i.profile_count, i.profile_count_oob, i.button_count);
         println!("  {} sectors x {} bytes, profile format {}", i.sector_count, i.sector_size, i.profile_format_id);
-        if let Ok(m) = p.mode(&mut dev) {
+        if let Ok(m) = p.mode(dev) {
             println!("  mode     : {m} ({})", profiles::mode_name(m));
         }
-        if let Ok(a) = p.current(&mut dev) {
+        if let Ok(a) = p.current(dev) {
             println!("  active   : profile {a}");
         }
     }
@@ -206,16 +256,17 @@ fn cmd_info() -> Result<(), CliError> {
 }
 
 fn cmd_dpi(arg: Option<&String>) -> Result<(), CliError> {
-    let (mut dev, _) = open()?;
-    let d = dpi::Dpi::new(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let d = dpi::Dpi::new(dev)?;
     match arg {
         None => {
-            println!("{}", d.get(&mut dev, 0)?);
+            println!("{}", d.get(dev, 0)?);
             Ok(())
         }
         Some(v) => {
             let want: u16 = v.parse().map_err(|_| CliError::Usage(format!("bad dpi {v:?}")))?;
-            let got = d.set(&mut dev, want, 0)?;
+            let got = d.set(dev, want, 0)?;
             if got != want {
                 println!("{got} (snapped from {want})");
             } else {
@@ -227,31 +278,32 @@ fn cmd_dpi(arg: Option<&String>) -> Result<(), CliError> {
 }
 
 fn cmd_rate(args: &[String]) -> Result<(), CliError> {
-    let (mut dev, _) = open()?;
-    let r = rate::ReportRate::new(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let r = rate::ReportRate::new(dev)?;
     let live = args.iter().any(|a| a == "--live");
     let value = args.iter().find(|a| !a.starts_with("--"));
     match value {
         None => {
-            println!("{}", r.get(&mut dev)?);
+            println!("{}", r.get(dev)?);
             Ok(())
         }
         Some(v) => {
             let hz: u16 = v.parse().map_err(|_| CliError::Usage(format!("bad rate {v:?}")))?;
-            let ok = r.supported(&mut dev)?;
+            let ok = r.supported(dev)?;
             if !ok.contains(&hz) {
                 return Err(CliError::Usage(format!("{hz} Hz unsupported; have {ok:?}")));
             }
             if live {
                 // 0x8060 is rejected in onboard mode, so take host mode first.
-                let p = profiles::OnboardProfiles::new(&mut dev)?;
-                p.set_mode(&mut dev, profiles::MODE_HOST)?;
-                r.set(&mut dev, hz)?;
+                let p = profiles::OnboardProfiles::new(dev)?;
+                p.set_mode(dev, profiles::MODE_HOST)?;
+                r.set(dev, hz)?;
                 println!("{hz} (live; host mode, lost when the mouse returns to onboard)");
             } else {
-                let p = profiles::OnboardProfiles::new(&mut dev)?;
-                let idx = p.current(&mut dev)?;
-                profile_io::set_report_rate(&mut dev, &p, idx, hz)?;
+                let p = profiles::OnboardProfiles::new(dev)?;
+                let idx = p.current(dev)?;
+                profile_io::set_report_rate(dev, &p, idx, hz)?;
                 println!("{hz} (written to onboard profile {idx})");
             }
             Ok(())
@@ -260,21 +312,22 @@ fn cmd_rate(args: &[String]) -> Result<(), CliError> {
 }
 
 fn cmd_mode(arg: Option<&String>) -> Result<(), CliError> {
-    let (mut dev, _) = open()?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let p = profiles::OnboardProfiles::new(dev)?;
     match arg.map(|s| s.as_str()) {
         None => {
-            let m = p.mode(&mut dev)?;
+            let m = p.mode(dev)?;
             println!("{m} ({})", profiles::mode_name(m));
             Ok(())
         }
         Some("onboard") => {
-            p.set_mode(&mut dev, profiles::MODE_ONBOARD)?;
+            p.set_mode(dev, profiles::MODE_ONBOARD)?;
             println!("onboard: the mouse drives itself from its stored profile");
             Ok(())
         }
         Some("host") => {
-            p.set_mode(&mut dev, profiles::MODE_HOST)?;
+            p.set_mode(dev, profiles::MODE_HOST)?;
             println!("host: live lighting works; the stored profile is not applied");
             Ok(())
         }
@@ -283,11 +336,12 @@ fn cmd_mode(arg: Option<&String>) -> Result<(), CliError> {
 }
 
 fn cmd_button(args: &[String]) -> Result<(), CliError> {
-    let (mut dev, _) = open()?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
-    let idx = p.current(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let p = profiles::OnboardProfiles::new(dev)?;
+    let idx = p.current(dev)?;
     if args.is_empty() {
-        let blob = p.read_sector(&mut dev, idx as u16 + 1, None)?;
+        let blob = p.read_sector(dev, idx as u16 + 1, None)?;
         let prof = profile_blob::Profile::parse(&blob).map_err(CliError::Failed)?;
         println!("profile {idx}:");
         for (i, b) in prof.buttons.iter().take(p.info.button_count as usize).enumerate() {
@@ -320,17 +374,18 @@ fn cmd_button(args: &[String]) -> Result<(), CliError> {
             ))
         })?,
     };
-    profile_io::set_button(&mut dev, &p, idx, n, binding)?;
+    profile_io::set_button(dev, &p, idx, n, binding)?;
     println!("button {n} -> {} (profile {idx}, written to flash)", binding.describe());
     Ok(())
 }
 
 fn cmd_profile(args: &[String]) -> Result<(), CliError> {
-    let (mut dev, _) = open()?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let p = profiles::OnboardProfiles::new(dev)?;
     match args.first().map(|s| s.as_str()) {
         None => {
-            println!("{}", p.current(&mut dev)?);
+            println!("{}", p.current(dev)?);
             Ok(())
         }
         Some("show") => {
@@ -345,7 +400,7 @@ fn cmd_profile(args: &[String]) -> Result<(), CliError> {
                     p.info.profile_count - 1
                 )));
             }
-            let blob = p.read_sector(&mut dev, n as u16 + 1, None)?;
+            let blob = p.read_sector(dev, n as u16 + 1, None)?;
             let prof = profile_blob::Profile::parse(&blob)
                 .map_err(CliError::Failed)?;
             println!("{}", prof.describe(p.info.button_count as usize));
@@ -356,7 +411,7 @@ fn cmd_profile(args: &[String]) -> Result<(), CliError> {
         }
         Some(v) => {
             let n: u8 = v.parse().map_err(|_| CliError::Usage(format!("bad profile {v:?}")))?;
-            p.set_current(&mut dev, n)?;
+            p.set_current(dev, n)?;
             println!("{n}");
             Ok(())
         }
@@ -367,29 +422,30 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         return Err(CliError::Usage("led needs a spec: off | <colour> | breathing <colour> | cycle".into()));
     }
-    let (mut dev, _) = open()?;
-    let l = led::Leds::new(&mut dev)?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let l = led::Leds::new(dev)?;
+    let p = profiles::OnboardProfiles::new(dev)?;
     // Live lighting is inert in onboard mode, so take host mode first.
-    p.set_mode(&mut dev, profiles::MODE_HOST)?;
+    p.set_mode(dev, profiles::MODE_HOST)?;
 
     let r = (|| -> hidpp::Result<()> {
         match args[0].as_str() {
-            "off" => l.all_off(&mut dev),
+            "off" => l.all_off(dev),
             "cycle" => {
                 // Returns a message explaining the two working routes.
-                l.cycle(&mut dev, 0, 8000, 100)
+                l.cycle(dev, 0, 8000, 100)
             }
             "breathing" => {
                 let c = led::parse_color(args.get(1).map(|s| s.as_str()).unwrap_or("cyan"))?;
                 for z in 0..l.zone_count {
-                    l.breathing(&mut dev, z, c, 4000, 0, 100)?;
+                    l.breathing(dev, z, c, 4000, 0, 100)?;
                 }
                 Ok(())
             }
             spec => {
                 let c = led::parse_color(spec)?;
-                l.all_fixed(&mut dev, c)
+                l.all_fixed(dev, c)
             }
         }
     })();
@@ -482,9 +538,11 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
         )));
     }
 
-    let (mut dev, model) = open()?;
-    let profiles = profiles::OnboardProfiles::new(&mut dev)?;
-    let dpi = dpi::Dpi::new(&mut dev).ok();
+    let mut f = open()?;
+    let model = f.name.clone();
+    let dev = &mut f.device;
+    let profiles = profiles::OnboardProfiles::new(dev)?;
+    let dpi = dpi::Dpi::new(dev).ok();
 
     // A rule naming a profile the device does not have would fail silently
     // every time it matched, so say so once at startup instead.
@@ -514,13 +572,13 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
                 println!("{}{}", if dry { "would apply " } else { "applying " }, msg);
             }
             if !dry {
-                if let Err(e) = profiles.set_current(&mut dev, *profile) {
+                if let Err(e) = profiles.set_current(dev, *profile) {
                     eprintln!("g502: switching to profile {profile}: {e}");
                     // Let the next match try again rather than believing it stuck.
                     watcher.invalidate();
                 }
                 if let (Some(d), Some(v)) = (dpi.as_ref(), want) {
-                    if let Err(e) = d.set(&mut dev, *v, 0) {
+                    if let Err(e) = d.set(dev, *v, 0) {
                         eprintln!("g502: setting {v} dpi: {e}");
                     }
                 }
@@ -533,11 +591,13 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
 }
 
 fn cmd_backup(path: &str) -> Result<(), CliError> {
-    let (mut dev, model) = open()?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
-    let dump = profile_io::dump_all(&mut dev, &p);
+    let mut f = open()?;
+    let model = f.name.clone();
+    let dev = &mut f.device;
+    let p = profiles::OnboardProfiles::new(dev)?;
+    let dump = profile_io::dump_all(dev, &p);
     let readable = dump.iter().filter(|(_, d)| d.is_some()).count();
-    std::fs::write(path, profile_io::dump_to_json(model, &dump))
+    std::fs::write(path, profile_io::dump_to_json(&model, &dump))
         .map_err(|e| CliError::Failed(format!("writing {path}: {e}")))?;
     println!("{readable}/{} sectors written to {path}", dump.len());
     Ok(())
@@ -547,9 +607,10 @@ fn cmd_restore(path: &str) -> Result<(), CliError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| CliError::Failed(format!("reading {path}: {e}")))?;
     let backup = profile_io::dump_from_json(&text)?;
-    let (mut dev, _) = open()?;
-    let p = profiles::OnboardProfiles::new(&mut dev)?;
-    let n = profile_io::restore_all(&mut dev, &p, &backup)?;
+    let mut f = open()?;
+    let dev = &mut f.device;
+    let p = profiles::OnboardProfiles::new(dev)?;
+    let n = profile_io::restore_all(dev, &p, &backup)?;
     println!("{n} sector(s) written; the rest already matched");
     Ok(())
 }

@@ -174,7 +174,7 @@ impl App {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::RAISED)
                     .inner_margin(egui::Margin::symmetric(14, 16)),
             )
             .show(ctx, |ui| {
@@ -186,7 +186,7 @@ impl App {
                     ui.label(
                         egui::RichText::new(self.snap.model.replace(" Gaming Mouse", ""))
                             .size(11.5)
-                            .color(theme::MUTED),
+                            .color(theme::DIM),
                     );
                     ui.add_space(9.0);
                     ui.horizontal_wrapped(|ui| {
@@ -195,7 +195,7 @@ impl App {
                         let c = if self.snap.mode == crate::profiles::MODE_HOST {
                             theme::WARN
                         } else {
-                            theme::MUTED
+                            theme::DIM
                         };
                         theme::pill(ui, m, c);
                     });
@@ -215,7 +215,7 @@ impl App {
                     let on = self.tab == t;
                     let txt = egui::RichText::new(label)
                         .size(14.5)
-                        .color(if on { theme::TEXT } else { theme::MUTED });
+                        .color(if on { theme::TEXT } else { theme::DIM });
                     let resp = ui.add_sized(
                         egui::vec2(ui.available_width(), 32.0),
                         egui::SelectableLabel::new(on, txt),
@@ -259,7 +259,7 @@ impl App {
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new("MEMORY MODE")
-                            .color(theme::MUTED)
+                            .color(theme::DIM)
                             .size(11.0)
                             .strong(),
                     );
@@ -271,7 +271,7 @@ impl App {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::SURFACE)
+                    .fill(theme::RAISED)
                     .inner_margin(egui::Margin::symmetric(16, 8)),
             )
             .show(ctx, |ui| {
@@ -283,7 +283,7 @@ impl App {
                         ui.label(egui::RichText::new("OK").color(theme::GOOD).size(12.0).strong());
                         ui.label(egui::RichText::new(n).size(12.5));
                     } else {
-                        ui.label(egui::RichText::new("Ready").color(theme::MUTED).size(12.5));
+                        ui.label(egui::RichText::new("Ready").color(theme::DIM).size(12.5));
                     }
                     if let Some(r) = &self.snap.effect_running {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -297,7 +297,7 @@ impl App {
     fn draw_disconnected(&mut self, ui: &mut egui::Ui) {
         ui.add_space(40.0);
         let err = self.snap.error.clone().unwrap_or_default();
-        theme::card(ui, "", |ui| {
+        theme::card(ui, |ui| {
             ui.label(egui::RichText::new("No G502 found").size(18.0).strong());
             ui.add_space(10.0);
             if err.contains("permission") {
@@ -326,6 +326,10 @@ impl App {
     }
 
     fn draw_sensor(&mut self, ui: &mut egui::Ui) {
+        if !self.snap.has_dpi && !self.snap.has_rate {
+            theme::unsupported(ui, "an adjustable sensor");
+            return;
+        }
         let (min, max, step) = match self.snap.dpi_cap {
             Some(Capability::Range { min, max, step }) => (min, max, step),
             _ => (100, 25600, 50),
@@ -334,17 +338,12 @@ impl App {
             self.dpi = self.snap.dpi;
         }
 
-        theme::card(ui, "Sensor", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(format!("{}", self.snap.dpi))
-                        .size(34.0)
-                        .strong()
-                        .color(theme::ACCENT),
-                );
-                ui.label(egui::RichText::new("DPI").size(13.0).color(theme::MUTED));
-            });
-            ui.add_space(8.0);
+        if !self.snap.has_dpi {
+            theme::section(ui, "Sensor", |ui| theme::unsupported(ui, "adjustable DPI"));
+        } else {
+        theme::section(ui, "Sensor", |ui| {
+            theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+            ui.add_space(10.0);
             let resp = ui.add(
                 egui::Slider::new(&mut self.dpi, min..=max)
                     .step_by(step as f64)
@@ -376,9 +375,17 @@ impl App {
                 &format!("Continuous: {min}-{max} in steps of {step}. Not fixed stages."),
             );
         });
+        }
 
-        ui.add_space(14.0);
-        theme::card(ui, "Report rate", |ui| {
+        if !self.snap.has_rate {
+            theme::section(ui, "Report rate", |ui| {
+                theme::unsupported(ui, "an adjustable report rate")
+            });
+            return;
+        }
+        theme::section(ui, "Report rate", |ui| {
+            theme::value(ui, &self.snap.rate.to_string(), "Hz");
+            ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 for hz in self.snap.rates.clone() {
                     if ui
@@ -399,12 +406,16 @@ impl App {
     }
 
     fn draw_lighting(&mut self, ui: &mut egui::Ui) {
+        if !self.snap.has_leds {
+            theme::unsupported(ui, "RGB lighting");
+            return;
+        }
         let zones = self.snap.zones.clone();
         let live_ok = |m: u8| {
             zones.first().map(|z| z.live_modes.contains(&m)).unwrap_or(false) || m == led::OFF
         };
 
-        theme::card(ui, "Zone", |ui| {
+        theme::section(ui, "Zone", |ui| {
             ui.horizontal_wrapped(|ui| {
                 if ui.selectable_label(self.all_zones, "Both").clicked() {
                     self.all_zones = true;
@@ -420,7 +431,7 @@ impl App {
         });
 
         ui.add_space(14.0);
-        theme::card(ui, "Mode", |ui| {
+        theme::section(ui, "Mode", |ui| {
             let available: Vec<u8> = zones
                 .first()
                 .map(|z| z.modes.clone())
@@ -471,7 +482,7 @@ impl App {
             if self.mode == led::BREATHING {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("waveform").color(theme::MUTED).size(12.5));
+                    ui.label(egui::RichText::new("waveform").color(theme::DIM).size(12.5));
                     egui::ComboBox::from_id_salt("wf")
                         .selected_text(led::WAVEFORMS[self.waveform].0)
                         .show_ui(ui, |ui| {
@@ -533,7 +544,7 @@ impl App {
         });
 
         ui.add_space(14.0);
-        theme::card(ui, "Effects", |ui| {
+        theme::section(ui, "Effects", |ui| {
             ui.horizontal(|ui| {
                 egui::ComboBox::from_id_salt("fx")
                     .selected_text(crate::effects::EFFECTS[self.effect].0)
@@ -577,7 +588,21 @@ impl App {
     }
 
     fn draw_profiles(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui, "Active profile", |ui| {
+        if !self.snap.has_profiles {
+            theme::unsupported(ui, "onboard profiles");
+            return;
+        }
+        if self.snap.profile_format != 2 && self.snap.profiles.is_empty() {
+            theme::section(ui, "Active profile", |ui| {
+                theme::hint(ui, &format!(
+                    "This device stores profiles in format {}, which this app cannot \
+                     decode. Switching between them still works; their contents are \
+                     not shown, and nothing is written.",
+                    self.snap.profile_format
+                ));
+            });
+        }
+        theme::section(ui, "Active profile", |ui| {
             ui.horizontal_wrapped(|ui| {
                 for i in 0..self.snap.profile_count {
                     let on = self.snap.active_profile == i;
@@ -600,7 +625,7 @@ impl App {
         if !self.snap.profiles.is_empty() {
             ui.add_space(14.0);
             self.profile_sel = self.profile_sel.min(self.snap.profiles.len() - 1);
-            theme::card(ui, "Contents", |ui| {
+            theme::section(ui, "Contents", |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for i in 0..self.snap.profiles.len() {
                         if ui
@@ -628,7 +653,7 @@ impl App {
         }
 
         ui.add_space(14.0);
-        theme::card(ui, "Backup", |ui| {
+        theme::section(ui, "Backup", |ui| {
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 90.0).max(160.0);
                 ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
@@ -646,15 +671,19 @@ impl App {
     }
 
     fn draw_buttons(&mut self, ui: &mut egui::Ui) {
+        if !self.snap.has_profiles {
+            theme::unsupported(ui, "onboard profiles, so bindings cannot be read");
+            return;
+        }
         if self.snap.profiles.is_empty() {
-            theme::card(ui, "Buttons", |ui| {
+            theme::section(ui, "Buttons", |ui| {
                 theme::hint(ui, "No profile read yet. Press Refresh.");
             });
             return;
         }
         let idx = self.snap.active_profile;
         let Some(p) = self.snap.profiles.get(idx as usize).cloned() else {
-            theme::card(ui, "Buttons", |ui| {
+            theme::section(ui, "Buttons", |ui| {
                 theme::hint(ui, "Active profile not readable.");
             });
             return;
@@ -669,7 +698,7 @@ impl App {
         let n_buttons = self.snap.button_count;
         let mut pending: Option<(u8, Button)> = None;
 
-        theme::card(ui, &format!("Buttons — profile {idx}"), |ui| {
+        theme::section(ui, &format!("Buttons, profile {idx}"), |ui| {
             egui::Grid::new("btns")
                 .num_columns(4)
                 .spacing(egui::vec2(14.0, 8.0))
@@ -677,7 +706,7 @@ impl App {
                     for i in 0..n_buttons {
                         let cur = p.buttons.get(i as usize).copied().unwrap_or(Button::disabled());
                         let cur_desc = cur.describe();
-                        ui.label(egui::RichText::new(format!("{i}")).color(theme::MUTED).size(12.5));
+                        ui.label(egui::RichText::new(format!("{i}")).color(theme::DIM).size(12.5));
                         ui.label(egui::RichText::new(&cur_desc).size(13.0));
 
                         let sel = self
@@ -720,14 +749,14 @@ impl App {
     }
 
     fn draw_about(&mut self, ui: &mut egui::Ui) {
-        theme::card(ui, "Device", |ui| {
+        theme::section(ui, "Device", |ui| {
             theme::row(ui, "model", &self.snap.model);
             theme::row(ui, "node", &self.snap.path);
             theme::row(ui, "HID++", &self.snap.protocol);
             theme::row(ui, "mode", crate::profiles::mode_name(self.snap.mode));
         });
         ui.add_space(14.0);
-        theme::card(ui, "What this hardware can and cannot do", |ui| {
+        theme::section(ui, "What this hardware can and cannot do", |ui| {
             for line in [
                 "The firmware implements four lighting modes: off, fixed, breathing, cycle.",
                 "Wave, starlight, ripple and frame streaming are in HID++ but absent here.",

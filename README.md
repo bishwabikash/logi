@@ -1,7 +1,7 @@
 # g502
 
-A driver and management app for the Logitech G502 HERO on Linux, written from
-scratch against the device's HID++ 2.0 protocol. One native binary with a
+A driver and management app for Logitech mice on Linux, written from scratch
+against the HID++ 2.0 protocol. One native binary with a
 graphical app and a command line in it; no daemon, no Python, no runtime
 dependencies beyond the system's own graphics libraries.
 
@@ -30,11 +30,27 @@ protocol reference than anything Logitech publishes. See
 
 ## Hardware
 
-Verified on **046d:c08b** (G502 HERO / SE HERO), firmware `U1 v27.03`,
-HID++ 4.2.
+There is no model whitelist. Any Logitech device whose hidraw node answers the
+HID++ root feature is usable, and what it can do is read from its own feature
+table — so a device nobody has tested gets exactly the controls it reports and
+nothing else. `g502 devices` lists what is attached:
 
-Also matched but **untested**, because there was no hardware to try: `c08d`
-(LIGHTSPEED, wired), `c332` (Proteus Spectrum), `c07d` (Proteus Core).
+```
+046d:c08b  G502 HERO Gaming Mouse
+    type      : mouse
+    features  : dpi, rate, rgb, profiles, buttons (19 total)
+    restricted: 0x18a1 0x1e00 0x1e22 0x1eb0 ... (not touched)
+```
+
+The name comes from the device itself (feature `0x0005`), not a table here.
+With more than one attached, pick one with `G502_DEVICE=046d:c08b`.
+
+**Verified on 046d:c08b** (G502 HERO), firmware `U1 v27.03`, HID++ 4.2. Other
+models should work to the extent their feature tables overlap, but nothing
+else has been tried, and one limit is known in advance: the 256-byte profile
+sector decoder handles `profile_format_id` 2 only. On a device reporting a
+different format, profile switching still works while the contents are not
+decoded and nothing is written to flash.
 
 ## Build and install
 
