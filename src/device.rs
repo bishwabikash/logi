@@ -23,6 +23,7 @@ pub enum Cmd {
     SetDpi(u16),
     SetRate(u16),
     SetProfile(u8),
+    SetMode(u8),
     LedFixed { zone: u8, color: [u8; 3] },
     LedBreathing { zone: u8, color: [u8; 3], period: u16, waveform: u8, intensity: u8 },
     LedCycle { zone: u8, period: u16, intensity: u8 },
@@ -65,7 +66,10 @@ pub struct Snapshot {
 pub struct ZoneInfo {
     pub index: u8,
     pub location: String,
+    /// Every mode the zone has an effect record for.
     pub modes: Vec<u8>,
+    /// The subset this firmware will actually set over the live path.
+    pub live_modes: Vec<u8>,
 }
 
 pub struct Handle {
@@ -96,6 +100,15 @@ pub fn spawn() -> Handle {
     Handle { tx, snapshot }
 }
 
+/// Take host mode only if we are not already in it. Each switch costs a
+/// 150ms settle, which is very noticeable when it happens on every click.
+fn ensure_host(l: &mut Live) -> crate::hidpp::Result<()> {
+    if l.profiles.mode(&mut l.dev).unwrap_or(0) == crate::profiles::MODE_HOST {
+        return Ok(());
+    }
+    l.profiles.set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+}
+
 struct Live {
     dev: Device,
     model: &'static str,
@@ -113,6 +126,61 @@ fn connect() -> Result<Live, String> {
     let rate = ReportRate::new(&mut dev).map_err(|e| e.to_string())?;
     let profiles = OnboardProfiles::new(&mut dev).map_err(|e| e.to_string())?;
     Ok(Live { dev, model: found.model, leds, dpi, rate, profiles })
+}
+
+/// Cheap state: about seven HID++ round trips.
+///
+/// Kept separate from the profile sectors deliberately. Reading all five
+/// profiles is 80 round trips, which is over a second of latency; doing that
+/// after every click made the UI feel hung.
+fn read_state(l: &mut Live, into: &mut Snapshot) {
+    into.connected = true;
+    into.model = l.model.to_string();
+    into.path = l.dev.path.clone();
+    if let Ok((a, b)) = l.dev.protocol_version() {
+        into.protocol = format!("{a}.{b}");
+    }
+    into.dpi = l.dpi.get(&mut l.dev, 0).unwrap_or(into.dpi);
+    if into.dpi_cap.is_none() {
+        into.dpi_cap = l.dpi.capability(&mut l.dev, 0).ok();
+    }
+    into.rate = l.rate.get(&mut l.dev).unwrap_or(into.rate);
+    if into.rates.is_empty() {
+        into.rates = l.rate.supported(&mut l.dev).unwrap_or_default();
+    }
+    into.profile_count = l.profiles.info.profile_count;
+    into.button_count = l.profiles.info.button_count;
+    into.active_profile = l.profiles.current(&mut l.dev).unwrap_or(into.active_profile);
+    into.mode = l.profiles.mode(&mut l.dev).unwrap_or(into.mode);
+    if into.zones.is_empty() {
+        into.zones = l
+            .leds
+            .zones
+            .iter()
+            .map(|z| ZoneInfo {
+                index: z.index,
+                location: z.location_name().to_string(),
+                modes: z.modes.clone(),
+                live_modes: l.leds.live_modes(z.index),
+            })
+            .collect();
+    }
+}
+
+/// The expensive part: every profile sector, 80 round trips. Only worth doing
+/// on an explicit refresh or after something wrote flash.
+fn read_profiles(l: &mut Live, into: &mut Snapshot) {
+    let mut out = Vec::new();
+    for i in 0..into.profile_count {
+        if let Ok(blob) = l.profiles.read_sector(&mut l.dev, i as u16 + 1, None) {
+            if let Ok(p) = Profile::parse(&blob) {
+                out.push(p);
+            }
+        }
+    }
+    if !out.is_empty() {
+        into.profiles = out;
+    }
 }
 
 fn read_snapshot(l: &mut Live) -> Snapshot {
@@ -141,6 +209,7 @@ fn read_snapshot(l: &mut Live) -> Snapshot {
             index: z.index,
             location: z.location_name().to_string(),
             modes: z.modes.clone(),
+            live_modes: l.leds.live_modes(z.index),
         })
         .collect();
     for i in 0..s.profile_count {
@@ -156,6 +225,7 @@ fn read_snapshot(l: &mut Live) -> Snapshot {
 fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
     let mut live: Option<Live> = None;
     let mut effect: Option<effects::Running> = None;
+    let mut pending: std::collections::VecDeque<Cmd> = std::collections::VecDeque::new();
 
     loop {
         // Reconnect lazily so unplug/replug is handled without crashing.
@@ -179,10 +249,14 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
             }
         }
 
-        let cmd = match rx.recv_timeout(Duration::from_millis(400)) {
-            Ok(c) => c,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        // Anything queued by the previous iteration runs before we block.
+        let cmd = match pending.pop_front() {
+            Some(c) => c,
+            None => match rx.recv_timeout(Duration::from_millis(400)) {
+                Ok(c) => c,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            },
         };
 
         // Any command other than StopEffect ends a running effect first: the
@@ -200,35 +274,38 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
             continue;
         };
 
+        let wrote_flash = matches!(
+            cmd,
+            Cmd::PersistLighting { .. }
+                | Cmd::WriteProfile { .. }
+                | Cmd::SetButton { .. }
+                | Cmd::Refresh
+        );
         let result: crate::hidpp::Result<Option<String>> = match cmd {
             Cmd::Refresh => Ok(None),
             Cmd::SetDpi(v) => l.dpi.set(&mut l.dev, v, 0).map(|got| {
                 Some(if got == v { format!("DPI {got}") } else { format!("DPI snapped to {got}") })
             }),
             Cmd::SetRate(hz) => l.rate.set(&mut l.dev, hz).map(|_| Some(format!("{hz} Hz"))),
+            Cmd::SetMode(m) => l
+                .profiles
+                .set_mode(&mut l.dev, m)
+                .map(|_| Some(format!("mode: {}", crate::profiles::mode_name(m)))),
             Cmd::SetProfile(i) => {
                 l.profiles.set_current(&mut l.dev, i).map(|_| Some(format!("profile {i}")))
             }
-            Cmd::LedFixed { zone, color } => l
-                .profiles
-                .set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+            Cmd::LedFixed { zone, color } => ensure_host(l)
                 .and_then(|_| l.leds.fixed(&mut l.dev, zone, color))
-                .map(|_| Some("lighting set (live, host mode)".into())),
-            Cmd::LedBreathing { zone, color, period, waveform, intensity } => l
-                .profiles
-                .set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+                .map(|_| Some("lighting applied live".into())),
+            Cmd::LedBreathing { zone, color, period, waveform, intensity } => ensure_host(l)
                 .and_then(|_| {
                     l.leds.breathing(&mut l.dev, zone, color, period, waveform, intensity)
                 })
-                .map(|_| Some("breathing set (live, host mode)".into())),
-            Cmd::LedCycle { zone, period, intensity } => l
-                .profiles
-                .set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+                .map(|_| Some("breathing applied live".into())),
+            Cmd::LedCycle { zone, period, intensity } => ensure_host(l)
                 .and_then(|_| l.leds.cycle(&mut l.dev, zone, period, intensity))
-                .map(|_| Some("cycle set (live, host mode)".into())),
-            Cmd::LedOff { zone } => l
-                .profiles
-                .set_mode(&mut l.dev, crate::profiles::MODE_HOST)
+                .map(|_| Some("cycle applied live".into())),
+            Cmd::LedOff { zone } => ensure_host(l)
                 .and_then(|_| l.leds.off(&mut l.dev, zone))
                 .map(|_| Some("lighting off".into())),
             Cmd::PersistLighting { leds } => {
@@ -293,12 +370,13 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
 
         match result {
             Ok(notice) => {
-                let snap = read_snapshot(l);
                 if let Ok(mut g) = shared.lock() {
-                    let keep = g.effect_running.clone();
-                    *g = snap;
-                    g.effect_running = keep;
+                    read_state(l, &mut g);
+                    if wrote_flash || g.profiles.is_empty() {
+                        read_profiles(l, &mut g);
+                    }
                     g.notice = notice;
+                    g.error = None;
                 }
             }
             Err(e) => {
@@ -316,12 +394,15 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
             }
         }
 
-        // Drain any backlog so a burst of slider events does not queue up.
-        loop {
-            match rx.try_recv() {
-                Ok(Cmd::Refresh) => continue,
-                Ok(_) | Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        // Collapse a run of queued Refreshes, but never drop a real command:
+        // the previous version matched Ok(_) and broke, which silently threw
+        // away whatever it had just received. Two quick clicks lost the second.
+        while let Ok(next) = rx.try_recv() {
+            if matches!(next, Cmd::Refresh) {
+                continue;
             }
+            pending.push_back(next);
+            break;
         }
     }
 }
