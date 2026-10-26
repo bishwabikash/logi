@@ -288,7 +288,7 @@ impl Leds {
         Err(Error::Protocol(
             "this device will not set hardware cycling live (effect index 3 is \
              rejected). Store it into an onboard profile instead, or stream \
-             `g502 effect rainbow` from the host."
+             `logi effect rainbow` from the host."
                 .into(),
         ))
     }

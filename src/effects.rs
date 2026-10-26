@@ -116,10 +116,10 @@ pub fn start(name: String, color: [u8; 3], period_ms: u32) -> Result<Running, St
     let stop = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stop);
     let handle = std::thread::Builder::new()
-        .name("g502-effect".into())
+        .name("logi-effect".into())
         .spawn(move || {
             if let Err(e) = run(&name, color, period_ms, &flag) {
-                eprintln!("g502: effect stopped: {e}");
+                eprintln!("logi: effect stopped: {e}");
             }
         })
         .map_err(|e| e.to_string())?;

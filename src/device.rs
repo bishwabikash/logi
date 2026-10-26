@@ -13,7 +13,7 @@ use crate::profiles::{OnboardProfiles, MODE_ONBOARD};
 use crate::rate::ReportRate;
 use crate::{discover, effects, profile_io};
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -127,7 +127,7 @@ pub fn spawn() -> Handle {
     let host_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let held = Arc::clone(&host_held);
     std::thread::Builder::new()
-        .name("g502-device".into())
+        .name("logi-device".into())
         .spawn(move || worker(rx, shared, held))
         .expect("spawn device thread");
     Handle { tx, snapshot, host_held }

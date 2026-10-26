@@ -19,39 +19,39 @@ mod profile_io;
 mod profiles;
 mod rate;
 
-use hidpp::{Device, Error};
+use hidpp::Error;
 
 const USAGE: &str = "\
-g502 — control a Logitech G502 HERO over HID++ 2.0
+logi — control a Logitech mouse over HID++ 2.0
 
-  g502                        open the graphical app
-  g502 devices                every Logitech HID++ device, and what it can do
-  g502 info                   capabilities and current state
-  g502 dpi [<n>]              show or set DPI (continuous, snapped to the step)
-  g502 rate [<hz>] [--live]   show or set the report rate; persists to the
+  logi                        open the graphical app
+  logi devices                every Logitech HID++ device, and what it can do
+  logi info                   capabilities and current state
+  logi dpi [<n>]              show or set DPI (continuous, snapped to the step)
+  logi rate [<hz>] [--live]   show or set the report rate; persists to the
                               active profile unless --live is given
-  g502 button [<n> <action>]   show or rebind buttons (writes flash)
-  g502 mode [onboard|host]    show or set who drives the mouse. Live lighting
+  logi button [<n> <action>]   show or rebind buttons (writes flash)
+  logi mode [onboard|host]    show or set who drives the mouse. Live lighting
                               needs host; onboard hands it back so its stored
                               profile applies with nothing running.
-  g502 profile [<n>]          show or switch the active onboard profile
-  g502 profile show <n>       decode one stored profile
-  g502 led <spec>             lighting, live (needs host mode)
+  logi profile [<n>]          show or switch the active onboard profile
+  logi profile show <n>       decode one stored profile
+  logi led <spec>             lighting, live (needs host mode)
                                 off | <colour> | breathing <colour> | cycle
-  g502 effect [list|<name>]   stream a host-side animation until Ctrl-C
-  g502 watch [--dry-run]      switch profiles per running application, from
-                              ~/.config/g502/rules.conf
-  g502 backup <file>          dump every sector to JSON
-  g502 restore <file>         write a backup back to flash
-  g502 --help
+  logi effect [list|<name>]   stream a host-side animation until Ctrl-C
+  logi watch [--dry-run]      switch profiles per running application, from
+                              ~/.config/logi/rules.conf
+  logi backup <file>          dump every sector to JSON
+  logi restore <file>         write a backup back to flash
+  logi --help
 
 Colours take hex (ff0066, #ff0066) or a name (red, cyan, purple...).
 With more than one Logitech device attached, pick one with G502_DEVICE,
-e.g. G502_DEVICE=046d:c08b g502 info
+e.g. G502_DEVICE=046d:c08b logi info
 ";
 
 fn main() -> std::process::ExitCode {
-    // Rust masks SIGPIPE, so `g502 info | head` makes println! panic on EPIPE
+    // Rust masks SIGPIPE, so `logi info | head` makes println! panic on EPIPE
     // instead of exiting quietly. Restore the default so piping behaves.
     // SAFETY: restoring a signal's default disposition before any threads or
     // output exist.
@@ -64,8 +64,8 @@ fn main() -> std::process::ExitCode {
         return match gui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("g502: could not start the GUI: {e}");
-                eprintln!("      run `g502 info` for the command line instead.");
+                eprintln!("logi: could not start the GUI: {e}");
+                eprintln!("      run `logi info` for the command line instead.");
                 std::process::ExitCode::FAILURE
             }
         };
@@ -73,11 +73,11 @@ fn main() -> std::process::ExitCode {
     match run(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(CliError::Usage(m)) => {
-            eprintln!("g502: {m}\n\n{USAGE}");
+            eprintln!("logi: {m}\n\n{USAGE}");
             std::process::ExitCode::from(2)
         }
         Err(CliError::Failed(m)) => {
-            eprintln!("g502: {m}");
+            eprintln!("logi: {m}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -98,7 +98,7 @@ impl From<Error> for CliError {
                  \x20   packaging/install.sh\n\
                  \n\
                  The rule tags the node with uaccess, so your logged-in session gets\n\
-                 access and sudo is no longer needed. As a one-off: sudo g502 ..."
+                 access and sudo is no longer needed. As a one-off: sudo logi ..."
             )),
             other => CliError::Failed(other.to_string()),
         }
@@ -125,6 +125,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "button" => cmd_button(&args[1..]),
         "mode" => cmd_mode(args.get(1)),
         "watch" => cmd_watch(&args[1..]),
+        "serve" => cmd_serve(),
         "led" => cmd_led(&args[1..]),
         "effect" => cmd_effect(&args[1..]),
         "backup" => {
@@ -347,7 +348,7 @@ fn cmd_button(args: &[String]) -> Result<(), CliError> {
         for (i, b) in prof.buttons.iter().take(p.info.button_count as usize).enumerate() {
             println!("  {i:2}  {}", b.describe());
         }
-        println!("\nbind with: g502 button <n> <action>");
+        println!("\nbind with: logi button <n> <action>");
         println!("actions: button <1-16> | {} | disabled",
                  profile_blob::SPECIALS.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "));
         return Ok(());
@@ -452,7 +453,7 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
     r?;
     println!("applied (live, host mode).");
     println!("This is lost on unplug, and the mouse stays in host mode until you run");
-    println!("`g502 mode onboard`. To make lighting persist instead, store it into the");
+    println!("`logi mode onboard`. To make lighting persist instead, store it into the");
     println!("onboard profile from the GUI's Lighting tab.");
     Ok(())
 }
@@ -509,6 +510,99 @@ fn install_interrupt_handler() {
     }
 }
 
+/// The background service.
+///
+/// Deliberately tolerant: with no rule file, or no device attached, it idles
+/// rather than exiting. A service that quits because its config is missing
+/// just flaps under systemd's restart policy and buries the real reason.
+fn cmd_serve() -> Result<(), CliError> {
+    install_interrupt_handler();
+    eprintln!("logi: service starting");
+
+    let path = appwatch::config_path();
+    loop {
+        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let rules = std::fs::read_to_string(&path).ok();
+        match rules {
+            None => {
+                eprintln!(
+                    "logi: no rules at {}; idling. Run `logi watch` once to write an example.",
+                    path.display()
+                );
+                // Nothing to do, so wait rather than spin or exit.
+                for _ in 0..60 {
+                    if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                }
+            }
+            Some(text) => {
+                let (cfg, problems) = appwatch::parse_rules(&text);
+                for p in &problems {
+                    eprintln!("logi: {}: {p}", path.display());
+                }
+                if cfg.rules.is_empty() && cfg.fallback.is_none() {
+                    eprintln!("logi: {} has no rules yet; idling", path.display());
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    continue;
+                }
+                if let Err(e) = serve_once(cfg) {
+                    // A missing or unplugged device is normal, not fatal.
+                    eprintln!("logi: {e}; retrying in 10s");
+                    for _ in 0..10 {
+                        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+                            return Ok(());
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("logi: service stopping");
+    Ok(())
+}
+
+/// One connected run of the watcher. Returns when the device goes away or the
+/// service is asked to stop, so the caller can retry.
+fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
+    let mut f = discover::open_device()?;
+    let dev = &mut f.device;
+    let profiles = profiles::OnboardProfiles::new(dev)?;
+    let dpi_feat = dpi::Dpi::new(dev).ok();
+    eprintln!("logi: watching {} with {} rule(s)", f.name, cfg.rules.len());
+
+    let have = profiles.info.profile_count;
+    for p in appwatch::referenced_profiles(&cfg) {
+        if p >= have {
+            eprintln!("logi: rules name profile {p}, device has 0..{}", have - 1);
+        }
+    }
+
+    let poll = cfg.poll;
+    let mut watcher = appwatch::Watcher::new(cfg);
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        let procs = appwatch::scan_processes();
+        let decision = watcher.tick(&procs, std::time::Instant::now());
+        if let appwatch::Decision::Switch { profile, dpi: want, .. } = &decision {
+            if let Some(msg) = appwatch::describe(&decision) {
+                eprintln!("logi: applying {msg}");
+            }
+            profiles.set_current(dev, *profile)?;
+            if let (Some(d), Some(v)) = (dpi_feat.as_ref(), want) {
+                if let Err(e) = d.set(dev, *v, 0) {
+                    eprintln!("logi: setting {v} dpi: {e}");
+                }
+            }
+        }
+        std::thread::sleep(poll);
+    }
+    Ok(())
+}
+
 fn cmd_watch(args: &[String]) -> Result<(), CliError> {
     let dry = args.iter().any(|a| a == "--dry-run");
     let path = appwatch::config_path();
@@ -522,14 +616,14 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
             std::fs::write(&path, appwatch::EXAMPLE_RULES)
                 .map_err(|e| CliError::Failed(format!("writing {}: {e}", path.display())))?;
             println!("Wrote an example rule file to {}.", path.display());
-            println!("Edit it, then run `g502 watch` again. Nothing to do until it has rules.");
+            println!("Edit it, then run `logi watch` again. Nothing to do until it has rules.");
             return Ok(());
         }
         Err(e) => return Err(CliError::Failed(format!("reading {}: {e}", path.display()))),
     };
     let (cfg, problems) = appwatch::parse_rules(&text);
     for p in &problems {
-        eprintln!("g502: {}: {p}", path.display());
+        eprintln!("logi: {}: {p}", path.display());
     }
     if cfg.rules.is_empty() && cfg.fallback.is_none() {
         return Err(CliError::Failed(format!(
@@ -549,7 +643,7 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
     let have = profiles.info.profile_count;
     for p in appwatch::referenced_profiles(&cfg) {
         if p >= have {
-            eprintln!("g502: warning: rules reference profile {p}, device has 0..{}", have - 1);
+            eprintln!("logi: warning: rules reference profile {p}, device has 0..{}", have - 1);
         }
     }
 
@@ -573,13 +667,13 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
             }
             if !dry {
                 if let Err(e) = profiles.set_current(dev, *profile) {
-                    eprintln!("g502: switching to profile {profile}: {e}");
+                    eprintln!("logi: switching to profile {profile}: {e}");
                     // Let the next match try again rather than believing it stuck.
                     watcher.invalidate();
                 }
                 if let (Some(d), Some(v)) = (dpi.as_ref(), want) {
                     if let Err(e) = d.set(dev, *v, 0) {
-                        eprintln!("g502: setting {v} dpi: {e}");
+                        eprintln!("logi: setting {v} dpi: {e}");
                     }
                 }
             }

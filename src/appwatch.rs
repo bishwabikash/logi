@@ -232,11 +232,11 @@ pub fn config_path() -> std::path::PathBuf {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("{}/.config", std::env::var("HOME").unwrap_or_default()));
-    std::path::PathBuf::from(base).join("g502/rules.conf")
+    std::path::PathBuf::from(base).join("logi/rules.conf")
 }
 
 pub const EXAMPLE_RULES: &str = "\
-# g502 per-application profile rules.
+# logi per-application profile rules.
 #
 # One `pattern = profile[,dpi]` per line. The pattern is matched
 # case-insensitively against each running process's name and command line, and

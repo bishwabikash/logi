@@ -1,0 +1,48 @@
+# systemd *user* unit for the logi background service.
+#
+# A user unit, not a system one. The service watches /proc for the processes
+# *you* are running to switch profiles, and binding a button to a keystroke
+# means injecting input into your session. A system service would see neither,
+# and would need root on the device nodes instead of the udev rules.
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now logi
+#   journalctl --user -u logi -f
+
+[Unit]
+Description=Logitech mouse service (per-application profiles, button bindings)
+Documentation=man:logi(1)
+# Ordering only. Profile switching needs nothing but /proc, so the service is
+# useful without a graphical session; button bindings and effects want one.
+After=graphical-session.target
+# Stop with the session, so logging out hands the mouse back to onboard mode
+# rather than leaving a daemon holding it.
+PartOf=graphical-session.target
+# Repeated failure is a configuration problem, not something to retry forever.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment="LOGI_LOG=info"
+ExecStart=@BIN@ serve
+ExecReload=/bin/kill -HUP $MAINPID
+# Exits 0 only on SIGTERM/SIGINT, so on-failure covers crashes without
+# fighting a deliberate stop.
+Restart=on-failure
+RestartSec=5
+# Needs time to put the device back into onboard mode and restore the button
+# remapping table; both are a few HID++ round trips.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# Do NOT add PrivateDevices=true: it replaces /dev with a minimal set carrying
+# no /dev/hidraw* and no /dev/uinput, and the service would find neither.
+
+[Install]
+WantedBy=default.target

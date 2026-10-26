@@ -1,14 +1,14 @@
 [package]
-name = "g502"
+name = "logi"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.82"
-description = "Driver and management app for the Logitech G502 HERO, speaking HID++ 2.0"
+description = "Driver and management app for Logitech mice, speaking HID++ 2.0"
 license = "MIT"
-default-run = "g502"
+default-run = "logi"
 
 [[bin]]
-name = "g502"
+name = "logi"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-# g502
+# logi
 
 A driver and management app for Logitech mice on Linux, written from scratch
 against the HID++ 2.0 protocol. One native binary with a
@@ -33,7 +33,7 @@ protocol reference than anything Logitech publishes. See
 There is no model whitelist. Any Logitech device whose hidraw node answers the
 HID++ root feature is usable, and what it can do is read from its own feature
 table — so a device nobody has tested gets exactly the controls it reports and
-nothing else. `g502 devices` lists what is attached:
+nothing else. `logi devices` lists what is attached:
 
 ```
 046d:c08b  G502 HERO Gaming Mouse
@@ -71,27 +71,27 @@ actually grants access.
 `--no-bin`: it installs the udev rule to `/etc/udev/rules.d` (this is the only
 step needing sudo), and copies the binary plus a desktop entry under `PREFIX`,
 which defaults to `~/.local`. You do not have to install anything to use the
-project — `./target/release/g502` runs from the build directory.
+project — `./target/release/logi` runs from the build directory.
 
 ## Command line
 
 ```
-g502 info                   capabilities and current state
-g502 dpi 1600               set DPI; snapped to the nearest step and reported
-g502 rate 1000              125/250/500/1000 Hz, written to the active profile
-g502 rate 1000 --live       set it live instead (host mode, not persistent)
-g502 mode onboard           hand the mouse back after live lighting
-g502 button                 list bindings
-g502 button 10 dpi-cycle    rebind a button (writes flash)
-g502 watch                  per-application profile switching
-g502 profile 2              switch the active onboard profile
-g502 profile show 0         decode a stored profile, buttons and all
-g502 led cyan               solid colour, both zones
-g502 led breathing ff0066   breathing
-g502 led off
-g502 effect rainbow         stream an animation until Ctrl-C
-g502 backup mouse.json      dump all 16 sectors
-g502 restore mouse.json
+logi info                   capabilities and current state
+logi dpi 1600               set DPI; snapped to the nearest step and reported
+logi rate 1000              125/250/500/1000 Hz, written to the active profile
+logi rate 1000 --live       set it live instead (host mode, not persistent)
+logi mode onboard           hand the mouse back after live lighting
+logi button                 list bindings
+logi button 10 dpi-cycle    rebind a button (writes flash)
+logi watch                  per-application profile switching
+logi profile 2              switch the active onboard profile
+logi profile show 0         decode a stored profile, buttons and all
+logi led cyan               solid colour, both zones
+logi led breathing ff0066   breathing
+logi led off
+logi effect rainbow         stream an animation until Ctrl-C
+logi backup mouse.json      dump all 16 sectors
+logi restore mouse.json
 ```
 
 ## What each module does
@@ -126,7 +126,7 @@ validated reference the Rust was ported from, not something you need to run.
 
 ### Per-application rules
 
-`g502 watch` reads `~/.config/g502/rules.conf` and writes an annotated example
+`logi watch` reads `~/.config/logi/rules.conf` and writes an annotated example
 there on first run. One `pattern = profile[,dpi]` per line; the first match
 wins, so put specific patterns first.
 
@@ -163,7 +163,7 @@ These are properties of the hardware, not things left to do.
   which uses mode ids rather than indices — two number spaces that are easy to
   conflate.
 * **The report rate cannot be set live in onboard mode** — the device answers
-  `invalid argument`. `g502 rate` therefore writes it into the active profile,
+  `invalid argument`. `logi rate` therefore writes it into the active profile,
   which is also the only way to make it persist. `--live` takes host mode
   instead.
 * **Per-application switching matches running processes, not the focused

@@ -110,7 +110,7 @@ fn action_to_button(label: &str) -> Option<Button> {
 
 fn default_backup_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    format!("{home}/g502-backup.json")
+    format!("{home}/logi-backup.json")
 }
 
 impl eframe::App for App {
@@ -179,7 +179,7 @@ impl App {
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("G502").size(21.0).strong().color(theme::TEXT));
+                    ui.label(egui::RichText::new("Logi").size(21.0).strong().color(theme::TEXT));
                 });
                 ui.add_space(2.0);
                 if self.snap.connected {
@@ -780,8 +780,8 @@ pub fn run() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([940.0, 700.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("G502"),
+            .with_title("Logi"),
         ..Default::default()
     };
-    eframe::run_native("g502", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("logi", options, Box::new(|_cc| Ok(Box::new(App::new()))))
 }
