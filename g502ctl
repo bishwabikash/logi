@@ -63,7 +63,7 @@ def _udev_hint() -> str:
         f"  Install the udev rule, then re-plug the mouse:\n"
         f"      sudo install -m 0644 packaging/{name} /etc/udev/rules.d/{name}\n"
         f"      sudo udevadm control --reload-rules && sudo udevadm trigger\n"
-        f"  (or run packaging/install.sh udev, which does both)\n"
+        f"  (or run packaging/install.sh, which does both)\n"
         f"  The rule tags the node with uaccess, so your logged-in session\n"
         f"  gets access and sudo is no longer needed. As a one-off: sudo g502ctl ..."
     )
@@ -844,7 +844,7 @@ def cmd_daemon_status(args) -> int:
                      f"active={unit['active']} ({unit['sub']})"
                      + (f" pid {unit['main_pid']}" if unit["main_pid"] else ""))
         if unit["load"] == "not-found":
-            lines.append("            install it with: ./install.sh service")
+            lines.append("            install it with: packaging/install.sh")
     else:
         lines.append(f"unit      : not queried ({unit['reason']})")
     for p in procs:

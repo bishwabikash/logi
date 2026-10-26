@@ -89,19 +89,33 @@ Requirements:
   everything else is unaffected.
 
 ```
-./install.sh all          # udev rule + g502ctl
-./install.sh udev         # just the udev rule
-./install.sh bin          # just g502ctl (+ the g502/ package)
-./install.sh service      # optional: the per-app switching user unit
+packaging/install.sh                 # udev rule (needs sudo) + g502d user service
+packaging/install.sh --no-service    # just the udev rule
+packaging/install.sh --no-udev       # just the user service
+packaging/install.sh --force         # overwrite a unit file you have edited
 ```
 
-`install.sh bin` copies the package to `$PREFIX/lib/g502` and the launcher to
-`$PREFIX/bin/g502ctl` (`PREFIX` defaults to `/usr/local`).
+It is safe to re-run: identical files are left alone, and anything you have
+edited is never overwritten — a `.new` copy is written beside it instead.
+`G502_ROOT` overrides where the `g502/` package lives (autodetected by
+default); `PREFIX` sets the system-wide install prefix (default `/usr/local`).
 
-**udev.** `packaging/70-g502.rules` tags the device's hidraw nodes with
-`uaccess`, which hands the node to the active local session via
-systemd-logind, so the device itself needs no root. Replug the mouse (or
-re-login) once after installing the rule.
+You do not have to install anything to use the project — `./g502ctl` runs from
+the checkout. The udev rule is what removes the need for `sudo`.
+
+**udev.** `packaging/99-logitech-g502.rules` tags the device's hidraw nodes
+with `uaccess`, handing the node to the active local session via
+systemd-logind, and also sets group `plugdev` for the cases uaccess does not
+cover (ssh sessions, system services). After installing the rule you must
+**unplug and replug the mouse** — `udevadm trigger` re-runs the rules, but a
+node that is already open keeps its old permissions.
+
+The rule matches on vendor and product only, which grants both of the G502's
+hidraw nodes rather than just the HID++ one. That is deliberate and explained
+in the rule file: udev requires every `ATTRS{}` key in a rule to resolve on the
+same parent device, and `bInterfaceNumber` lives on the usb_interface while
+`idVendor`/`idProduct` live on the usb_device, so an interface-narrowed rule
+silently matches nothing.
 
 **systemd user unit.** `packaging/g502-watch.service` runs
 `g502ctl watch --quiet` in your session:

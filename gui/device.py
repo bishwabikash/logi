@@ -21,7 +21,7 @@ from gi.repository import GLib, GObject
 from . import optional
 
 UDEV_HINT = ("The mouse is there but this user cannot open it. Install the "
-             "udev rule and replug:\n\n    sudo ./install.sh udev")
+             "udev rule and replug:\n\n    packaging/install.sh")
 MISSING_HINT = ("Plug in a supported Logitech mouse (G502 HERO, 046d:c08b). "
                 "If it is plugged in, check that it is not claimed by "
                 "another process.")
