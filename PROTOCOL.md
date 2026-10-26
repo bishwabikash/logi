@@ -145,3 +145,37 @@ bootstrappers (`burn.pdb`), one is `logi_installer_shared.dll`, and one is
 speaks to the device (`lghub_agent.exe`) is fetched at install time from
 Logitech's build pipeline and is not in the installer. Reverse engineering it
 requires obtaining that binary separately.
+
+### Why the agent binary is hard to obtain
+
+The three `.wixburn` bundles inside the installer are **Microsoft Visual C++
+2022 Runtime 14.42.34438** redistributables (x86/x64/arm64) plus the KB2999226
+Universal CRT CABs — bundled dependencies, not G HUB. Their Burn manifests
+carry **zero `DownloadUrl` attributes**, so the vcredists are fully embedded
+and nothing is fetched from them. The G HUB installer is itself not a Burn
+bundle, so WiX's `/layout` download-without-install flag does not apply; its
+only flags are `/install /repair /uninstall /quiet /passive /norestart /?`.
+
+`lghub_agent.exe` is pulled at install time from Logitech's "pipeline" depot:
+
+    pipeline://core/LGHUB/lghub_software_manager.exe
+
+Hosts referenced by `logi_installer_shared.dll`: `pipeline.logitech.io`
+(resolves to RFC1918 addresses — not publicly routable),
+`updates.ghub.logitechg.com` (CloudFront → S3), `2pipeline.s3.amazonaws.com`.
+Endpoints `/pipeline/v2/access/`, `/details.json`, `/content.json`,
+`/update.json`, `/updates/channel`.
+
+The S3 bucket denies `ListBucket` and returns a blanket `AccessDenied` for
+every key including bogus ones, so `NoSuchKey` is masked and response codes
+cannot be used to confirm a path. Blind key guessing is not viable. Even with
+a correct key, fetching is not a plain download: the DLL implements AWS
+SigV4-signed requests (`Authorization: …4-HMAC-SHA256 Credential=…`), RSA
+depot verification (`depot_verifier_rsa`), key rotation (`keymaster`,
+`keys_refresh_download_group`), encryption at rest (`DecryptedStream`,
+`CapsuleResourceProtectedStream`) and protobuf schemas
+`logi.protocol.updates.{Depot,Signature,KeyStatus,ContentRequest}`.
+
+The remaining practical route is to let the installer do the download itself
+inside a throwaway Wine prefix. On this host that is blocked on i386 multiarch
+(`wine32` missing), which is a system-level change.
