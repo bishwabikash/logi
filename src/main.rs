@@ -46,6 +46,14 @@ Colours take hex (ff0066, #ff0066) or a name (red, cyan, purple...).
 ";
 
 fn main() -> std::process::ExitCode {
+    // Rust masks SIGPIPE, so `g502 info | head` makes println! panic on EPIPE
+    // instead of exiting quietly. Restore the default so piping behaves.
+    // SAFETY: restoring a signal's default disposition before any threads or
+    // output exist.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         return match gui::run() {
