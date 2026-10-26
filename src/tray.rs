@@ -43,7 +43,7 @@ pub enum Event {
 
 /// Everything the icon and its menu render. The GUI builds one of these from
 /// its snapshot and the service state, and hands it to [`Tray::update`].
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Status {
     /// Model name, `None` when no device is attached.
     pub device: Option<String>,
@@ -52,6 +52,28 @@ pub struct Status {
     pub profile_count: u8,
     pub dpi: u16,
     pub dpi_presets: Vec<u16>,
+}
+
+impl Default for Status {
+    /// Not derived.
+    ///
+    /// `service::State`'s own `Default` is `NoSystemd`, and the GUI registers
+    /// the tray with `Status::default()` before the service watcher has
+    /// polled. Deriving it would have the first icon the user ever sees say
+    /// there is no systemd user session on a machine that has one, and grey
+    /// the start/stop items with it. `service::Watcher` uses `Inactive` as its
+    /// own pre-poll placeholder for that reason; match it, so the worst the
+    /// tray says before the first answer is "stopped".
+    fn default() -> Self {
+        Status {
+            device: None,
+            service: State::Inactive,
+            active_profile: 0,
+            profile_count: 0,
+            dpi: 0,
+            dpi_presets: Vec::new(),
+        }
+    }
 }
 
 /// Which of the three looks the icon wears. Named, because "the icon encodes
@@ -87,7 +109,7 @@ impl Status {
 
     /// The service state in words.
     pub fn service_label(&self) -> String {
-        format!("Service: {}", service_words(&self.service))
+        format!("Service: {}", crate::service::label(self.service))
     }
 
     /// Label for the single start/stop item, which flips rather than showing
@@ -102,8 +124,12 @@ impl Status {
 
     /// False where starting or stopping could not work, so those items are
     /// shown greyed instead of erroring when clicked.
+    ///
+    /// Deferred to `service` rather than restated: the Service panel greys the
+    /// same two controls from the same predicate, and a second copy of the
+    /// list of states would drift from it.
     pub fn service_controls_enabled(&self) -> bool {
-        matches!(self.service, State::Active | State::Inactive | State::Failed)
+        crate::service::can_control(self.service)
     }
 
     /// What to do about an unhappy service, said in the menu so the user is
@@ -112,14 +138,20 @@ impl Status {
         match self.service {
             State::NotInstalled => Some("Install it from the Service panel in the app."),
             State::Failed => Some("Read the log in the Service panel in the app."),
-            State::NoSystemd => Some("systemd did not answer. Open the Service panel."),
+            State::NoSystemd => {
+                Some("No systemd user session: start logi from your desktop session.")
+            }
             State::Active | State::Inactive => None,
         }
     }
 
-    /// Profile menu labels, one per onboard profile. Empty when the device has
-    /// no profiles, in which case the submenu is left out entirely.
+    /// Profile menu labels, one per onboard profile. Empty when there is no
+    /// device or it has no profiles, in which case the submenu is left out
+    /// entirely rather than shown dead.
     pub fn profile_labels(&self) -> Vec<String> {
+        if !self.present() {
+            return Vec::new();
+        }
         // Shown 1-based: "Profile 0" reads as a bug to anyone who has used
         // Logitech's own software. The wire index stays 0-based.
         (0..self.profile_count).map(|i| format!("Profile {}", i + 1)).collect()
@@ -135,7 +167,14 @@ impl Status {
         }
     }
 
+    /// DPI menu labels. Empty with no device attached, whatever presets the
+    /// caller passed: the presets are the app's own list, not the device's, so
+    /// without this the menu offers five settings that go nowhere and report
+    /// nothing when clicked.
     pub fn dpi_labels(&self) -> Vec<String> {
+        if !self.present() {
+            return Vec::new();
+        }
         self.dpi_presets.iter().map(|d| format!("{d} DPI")).collect()
     }
 
@@ -220,18 +259,6 @@ impl Status {
     }
 }
 
-/// The service state in words. The one place this module looks inside
-/// `service::State`.
-fn service_words(s: &State) -> &'static str {
-    match s {
-        State::Active => "running",
-        State::Inactive => "stopped",
-        State::Failed => "failed",
-        State::NotInstalled => "not installed",
-        State::NoSystemd => "unknown",
-    }
-}
-
 /// The ksni side: holds the status it renders and a way back to the GUI.
 struct Model {
     status: Status,
@@ -285,10 +312,12 @@ impl ksni::Tray for Model {
         icons(shape, tint(shape))
     }
 
-    /// Worn only in the NeedsAttention state above.
+    /// Worn only in the NeedsAttention state above. The same glyph as the
+    /// plain icon, only red: a failed service with no mouse attached must not
+    /// grow a mouse because it went red.
     fn attention_icon_pixmap(&self) -> Vec<Icon> {
         let [r, g, b, _] = theme::BAD.to_array();
-        icons(Shape::Idle, [r, g, b])
+        icons(self.status.shape(), [r, g, b])
     }
 
     fn tool_tip(&self) -> ToolTip {
@@ -418,6 +447,13 @@ impl Tray {
     ///
     /// `Err` when there is no tray host, which is the normal case on a plain
     /// GNOME install. The caller must stay usable without one.
+    ///
+    /// **This call blocks.** It opens the session bus and makes a round trip
+    /// to the watcher, and where the watcher name is bus-activatable but does
+    /// not come up it blocks for the D-Bus reply timeout, which is 25 seconds.
+    /// Call it once, before the frame loop starts or on a thread of your own;
+    /// never from a paint pass. Everything after it ([`Tray::update`],
+    /// [`Tray::poll`]) is non-blocking and safe on the frame loop.
     pub fn spawn(initial: Status) -> Result<Self, String> {
         let (ev_tx, ev_rx) = mpsc::channel();
         let model = Model { status: initial.clone(), events: ev_tx };
@@ -437,7 +473,10 @@ impl Tray {
                         break; // the tray service is gone
                     }
                 }
-                handle.shutdown();
+                // Waited on, not dropped: `shutdown` only posts the request,
+                // and returning from this thread before the service has
+                // unregistered leaves a dead icon in the panel.
+                handle.shutdown().wait();
             })
             .map_err(|e| format!("could not start the tray thread: {e}"))?;
 
@@ -623,11 +662,38 @@ mod tests {
         assert!(base.differs_from(&s));
     }
 
+    /// The GUI calls `Tray::spawn(Status::default())` on its first frame,
+    /// before the service watcher has polled, so the default must not assert
+    /// anything about systemd. `service::State`'s own default does.
+    #[test]
+    fn the_default_status_claims_nothing_about_systemd() {
+        let s = Status::default();
+        assert_ne!(s.service, State::NoSystemd);
+        // The same placeholder `service::Watcher` starts from, so the tray and
+        // the window say the same thing before the first poll lands.
+        assert_eq!(s.service, State::Inactive);
+        assert_eq!(s.service_note(), None);
+        assert_eq!(s.shape(), Shape::Absent);
+    }
+
+    #[test]
+    fn no_systemd_says_there_is_none_rather_than_that_it_is_unknown() {
+        let s = Status { service: State::NoSystemd, ..g502() };
+        let out = s.menu_outline();
+        // "unknown" was this module's old word for it, from a `State::Unknown`
+        // that does not exist. The two are different claims.
+        assert!(!out.iter().any(|l| l.to_lowercase().contains("unknown")), "{out:?}");
+        assert!(s.service_note().is_some_and(|n| n.contains("systemd")));
+        // Nothing to start or stop without a systemd session.
+        assert!(!s.service_controls_enabled());
+        assert!(out.contains(&"Start service (disabled)".to_string()));
+    }
+
     #[test]
     fn menu_names_the_device_and_the_live_values() {
         let out = g502().menu_outline();
         assert_eq!(out[0], "G502 HERO");
-        assert!(out.contains(&"Service: running".to_string()));
+        assert!(out.contains(&"Service: Running".to_string()));
         assert!(out.contains(&"Stop service".to_string()));
         assert!(out.contains(&"  Profile 2 [*]".to_string()));
         assert!(out.contains(&"  1600 DPI [*]".to_string()));
@@ -653,9 +719,11 @@ mod tests {
     fn a_failed_service_says_so_and_says_where_to_look() {
         let s = Status { service: State::Failed, ..g502() };
         let out = s.menu_outline();
-        assert!(out.contains(&"Service: failed".to_string()));
+        assert!(out.contains(&"Service: Failed".to_string()));
         assert!(out.contains(&"Start service".to_string()));
         assert!(out.contains(&"Read the log in the Service panel in the app.".to_string()));
+        // The words are service's own, so the panel and the tray agree.
+        assert!(out.contains(&format!("Service: {}", crate::service::label(State::Failed))));
         // Failed is still a device present but not running: the idle look.
         assert_eq!(s.shape(), Shape::Idle);
     }
@@ -667,6 +735,22 @@ mod tests {
         assert!(out.contains(&"Start service (disabled)".to_string()));
         assert!(out.contains(&"Restart service (disabled)".to_string()));
         assert!(out.contains(&"Install it from the Service panel in the app.".to_string()));
+    }
+
+    /// The preset list comes from the app, not the mouse, so it is there even
+    /// with nothing plugged in. The menu must not be.
+    #[test]
+    fn no_device_offers_nothing_to_send_to_it() {
+        let s = Status { device: None, ..g502() };
+        assert!(s.dpi_labels().is_empty());
+        assert!(s.profile_labels().is_empty());
+        let out = s.menu_outline();
+        assert!(!out.iter().any(|l| l.starts_with("DPI >")), "{out:?}");
+        assert!(!out.iter().any(|l| l.starts_with("Profile >")), "{out:?}");
+        // An empty model name is the same as no device.
+        let blank = Status { device: Some(String::new()), ..g502() };
+        assert!(blank.dpi_labels().is_empty());
+        assert_eq!(blank.shape(), Shape::Absent);
     }
 
     #[test]
@@ -731,13 +815,20 @@ mod tests {
 
     #[test]
     fn the_glyph_stays_inside_its_box() {
-        let i = render(Shape::Live, [255, 255, 255], 22);
-        let at = |x: usize, y: usize| i.data[(y * 22 + x) * 4];
-        for n in 0..22 {
-            assert_eq!(at(n, 0), 0, "top edge at {n}");
-            assert_eq!(at(n, 21), 0, "bottom edge at {n}");
-            assert_eq!(at(0, n), 0, "left edge at {n}");
-            assert_eq!(at(21, n), 0, "right edge at {n}");
+        // All three: the outline and the slash reach further than the solid
+        // body does, and a panel clips whatever touches the edge.
+        for shape in [Shape::Live, Shape::Idle, Shape::Absent] {
+            for size in [22usize, 44] {
+                let i = render(shape, [255, 255, 255], size as i32);
+                let at = |x: usize, y: usize| i.data[(y * size + x) * 4];
+                let last = size - 1;
+                for n in 0..size {
+                    assert_eq!(at(n, 0), 0, "{shape:?} {size} top edge at {n}");
+                    assert_eq!(at(n, last), 0, "{shape:?} {size} bottom edge at {n}");
+                    assert_eq!(at(0, n), 0, "{shape:?} {size} left edge at {n}");
+                    assert_eq!(at(last, n), 0, "{shape:?} {size} right edge at {n}");
+                }
+            }
         }
     }
 

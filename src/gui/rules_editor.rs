@@ -20,12 +20,17 @@ use crate::device::Snapshot;
 use crate::dpi::Capability;
 use crate::gui::theme;
 use eframe::egui;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// `appwatch::parse_rules` clamps `poll_ms` to this, so the editor has to as
 /// well or a save would not round-trip.
 pub const POLL_FLOOR_MS: u64 = 100;
+/// As far as the slider goes. A file may hold more; see `check`.
+pub const POLL_CEILING_MS: u64 = 10_000;
 pub const DEFAULT_POLL_MS: u64 = 1000;
 
 /// DPI used when a rule's optional DPI is first switched on and the device
@@ -113,7 +118,7 @@ impl Model {
         let mut kept = Vec::new();
         let mut notes = Vec::new();
         for p in &problems {
-            match problem_line(p).and_then(|n| lines.get(n - 1)) {
+            match problem_line(p).and_then(|n| n.checked_sub(1)).and_then(|i| lines.get(i)) {
                 Some(raw) if line_is_lost(raw) => {
                     kept.push(Kept { raw: (*raw).to_string(), problem: p.clone() });
                 }
@@ -251,6 +256,15 @@ impl Model {
                         .to_string(),
                 );
             }
+            if pat.contains('\n') || pat.contains('\r') {
+                push(
+                    Severity::Error,
+                    "A pattern cannot contain a line break. The file is one rule per line, \
+                     so this would be written out as two lines, neither of them the rule \
+                     you meant."
+                        .to_string(),
+                );
+            }
             if pat.contains('#') {
                 push(
                     Severity::Error,
@@ -304,19 +318,32 @@ impl Model {
                 }
             }
             if let (Some(d), Some(cap)) = (r.dpi, dpi) {
-                if cap.snap(d).is_err() {
-                    let detail = match cap {
-                        Capability::Range { min, max, step } => {
-                            format!("{min} to {max} in steps of {step}")
-                        }
-                        Capability::List(v) => {
-                            v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
-                        }
-                    };
-                    push(
+                // `snap` rejects what is out of range and rounds what is merely
+                // between two steps, so both get said, and differently: the
+                // second one still works, it just does not do exactly this.
+                match cap.snap(d) {
+                    Err(_) => {
+                        let detail = match cap {
+                            Capability::Range { min, max, step } => {
+                                format!("{min} to {max} in steps of {step}")
+                            }
+                            Capability::List(v) => {
+                                v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ")
+                            }
+                        };
+                        push(
+                            Severity::Warning,
+                            format!("{d} DPI is not a value this mouse accepts ({detail})."),
+                        );
+                    }
+                    Ok(snapped) if snapped != d => push(
                         Severity::Warning,
-                        format!("{d} DPI is not a value this mouse accepts ({detail})."),
-                    );
+                        format!(
+                            "{d} DPI falls between two steps of this sensor, so the rule \
+                             will set {snapped} instead."
+                        ),
+                    ),
+                    Ok(_) => {}
                 }
             }
         }
@@ -333,6 +360,17 @@ impl Model {
                     ),
                 });
             }
+        }
+        if self.poll_ms > POLL_CEILING_MS {
+            out.push(Problem {
+                row: None,
+                severity: Severity::Warning,
+                text: format!(
+                    "The poll interval is {} ms, further than the slider reaches \
+                     ({POLL_CEILING_MS} ms). It is kept as it is until you move the slider.",
+                    self.poll_ms
+                ),
+            });
         }
         if self.poll_ms < POLL_FLOOR_MS {
             out.push(Problem {
@@ -445,6 +483,67 @@ fn self_comm() -> String {
         .unwrap_or_default()
 }
 
+#[derive(Default)]
+struct ScanShared {
+    procs: Vec<Proc>,
+    me: String,
+    /// Bumped on every completed scan, so `ui` can tell a new result from the
+    /// one it already copied without comparing a few hundred strings.
+    rev: u64,
+}
+
+/// The /proc scan, moved off the paint pass.
+///
+/// `scan_processes` reads two files for every process on the machine, several
+/// hundred of them. Doing that inside `ui()` stalled the frame it happened on,
+/// which is a visible hitch every couple of seconds while this tab is open. So
+/// a thread does it on request and `ui()` only ever reads the last result.
+///
+/// The thread parks in `recv` between requests and ends when the editor is
+/// dropped and the sender goes with it, so nothing keeps scanning for a tab
+/// the user is not looking at.
+struct Scanner {
+    shared: Arc<Mutex<ScanShared>>,
+    req: Sender<()>,
+}
+
+impl Scanner {
+    /// `Builder`, not `thread::spawn`: a process that cannot make another
+    /// thread must lose the picker, not the window.
+    fn start() -> Option<Scanner> {
+        let (req, rx) = mpsc::channel::<()>();
+        let shared: Arc<Mutex<ScanShared>> = Arc::new(Mutex::new(ScanShared::default()));
+        let mine = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("logi-procscan".into())
+            .spawn(move || {
+                let me = self_comm();
+                while rx.recv().is_ok() {
+                    // Coalesce anything that queued up while we scanned.
+                    while rx.try_recv().is_ok() {}
+                    let procs = appwatch::scan_processes();
+                    let Ok(mut s) = mine.lock() else { return };
+                    s.procs = procs;
+                    s.me = me.clone();
+                    s.rev = s.rev.wrapping_add(1);
+                }
+            })
+            .ok()?;
+        Some(Scanner { shared, req })
+    }
+
+    fn request(&self) {
+        // A dead thread means a stale list, not a broken panel.
+        let _ = self.req.send(());
+    }
+
+    /// The newest scan, if it is newer than `seen`.
+    fn newer_than(&self, seen: u64) -> Option<(Vec<Proc>, String, u64)> {
+        let s = self.shared.lock().ok()?;
+        (s.rev != seen && s.rev != 0).then(|| (s.procs.clone(), s.me.clone(), s.rev))
+    }
+}
+
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -456,8 +555,33 @@ fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
     // Write beside the target and rename, so a crash mid-write cannot leave a
     // truncated config behind.
     let tmp = path.with_file_name(format!(".{name}.new"));
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    match write_then_rename(&tmp, path, text) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Leaving a half-written dotfile next to the config would be read
+            // as part of it by nothing, but it would still be litter the user
+            // has to find and delete.
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_then_rename(tmp: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    {
+        let mut f = std::fs::File::create(tmp)?;
+        // Keep whatever mode the config already had: the rename replaces the
+        // inode, so without this a file the user had locked down to 0600 comes
+        // back at the umask default.
+        if let Ok(meta) = std::fs::metadata(path) {
+            let _ = f.set_permissions(meta.permissions());
+        }
+        f.write_all(text.as_bytes())?;
+        // The rename is atomic against another reader, but only a flushed
+        // temp file is atomic against the power going out.
+        f.sync_all()?;
+    }
+    std::fs::rename(tmp, path)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,11 +604,19 @@ pub struct RulesEditor {
     notes: Vec<String>,
     status: Status,
     loaded_once: bool,
+    /// logi's own process name, from the scanning thread.
+    me: String,
 
     filter: String,
+    /// The last scan the background thread handed over.
     procs: Vec<Proc>,
-    last_scan: Option<Instant>,
-    me: String,
+    procs_rev: u64,
+    scanned: bool,
+    scanner: Option<Scanner>,
+    /// Set once if the thread could not be started; the picker then says so
+    /// rather than scanning /proc from inside the paint pass instead.
+    no_scanner: bool,
+    requested: Option<Instant>,
 }
 
 impl Default for RulesEditor {
@@ -510,10 +642,14 @@ impl RulesEditor {
             notes: Vec::new(),
             status: Status::Quiet,
             loaded_once: false,
+            me: String::new(),
             filter: String::new(),
             procs: Vec::new(),
-            last_scan: None,
-            me: String::new(),
+            procs_rev: 0,
+            scanned: false,
+            scanner: None,
+            no_scanner: false,
+            requested: None,
         }
     }
 
@@ -601,19 +737,40 @@ impl RulesEditor {
         }
     }
 
-    /// Rescan /proc at most every couple of seconds, so the picker looks live
-    /// without reading a few hundred files every frame.
+    /// Collect the last scan and ask for another if it is getting old.
+    ///
+    /// Nothing here touches the disk: the asking is a channel send and the
+    /// collecting is a mutex that the scanning thread only holds while it
+    /// swaps its result in.
     fn maybe_scan(&mut self) {
-        let stale = self
-            .last_scan
+        if self.scanner.is_none() {
+            if self.no_scanner {
+                return;
+            }
+            match Scanner::start() {
+                Some(s) => self.scanner = Some(s),
+                None => {
+                    self.no_scanner = true;
+                    return;
+                }
+            }
+        }
+        let fresh = self.scanner.as_ref().and_then(|s| s.newer_than(self.procs_rev));
+        if let Some((procs, me, rev)) = fresh {
+            self.procs = procs;
+            self.me = me;
+            self.procs_rev = rev;
+            self.scanned = true;
+        }
+        let due = self
+            .requested
             .map(|t| t.elapsed() > Duration::from_secs(2))
             .unwrap_or(true);
-        if stale {
-            if self.me.is_empty() {
-                self.me = self_comm();
+        if due {
+            if let Some(s) = &self.scanner {
+                s.request();
             }
-            self.procs = appwatch::scan_processes();
-            self.last_scan = Some(Instant::now());
+            self.requested = Some(Instant::now());
         }
     }
 
@@ -722,9 +879,17 @@ impl RulesEditor {
                             egui::TextEdit::singleline(&mut row.pattern)
                                 .hint_text("program name"),
                         );
+                        // `clamp_existing_to_range(false)` matters: egui
+                        // otherwise writes the clamped value straight back
+                        // through the borrow, so merely painting this panel
+                        // would rewrite a hand-written `csgo = 7` to the
+                        // attached mouse's last profile. The device's count is
+                        // advisory here; `check` says so in words instead.
                         ui.add_sized(
                             egui::vec2(54.0, 26.0),
-                            egui::DragValue::new(&mut row.profile).range(0..=limit),
+                            egui::DragValue::new(&mut row.profile)
+                                .range(0..=limit)
+                                .clamp_existing_to_range(false),
                         );
                         let mut on = row.dpi.is_some();
                         if ui.checkbox(&mut on, "").changed() {
@@ -734,7 +899,10 @@ impl RulesEditor {
                             Some(d) => {
                                 ui.add_sized(
                                     egui::vec2(66.0, 26.0),
-                                    egui::DragValue::new(d).range(100..=25600).speed(25.0),
+                                    egui::DragValue::new(d)
+                                        .range(100..=25600)
+                                        .speed(25.0)
+                                        .clamp_existing_to_range(false),
                                 );
                             }
                             None => {
@@ -817,7 +985,11 @@ impl RulesEditor {
                     self.model.fallback = on.then_some(0);
                 }
                 if let Some(f) = self.model.fallback.as_mut() {
-                    ui.add(egui::DragValue::new(f).range(0..=limit));
+                    ui.add(
+                        egui::DragValue::new(f)
+                            .range(0..=limit)
+                            .clamp_existing_to_range(false),
+                    );
                 }
             });
             theme::hint(
@@ -826,8 +998,13 @@ impl RulesEditor {
             );
             ui.add_space(10.0);
             ui.horizontal(|ui| {
+                // Same reason as the profile DragValue: the default
+                // `SliderClamping::Always` would quietly pull a `poll_ms =
+                // 30000` from the file down to the end of the slider on the
+                // first frame the panel is painted.
                 ui.add(
-                    egui::Slider::new(&mut self.model.poll_ms, POLL_FLOOR_MS..=10_000)
+                    egui::Slider::new(&mut self.model.poll_ms, POLL_FLOOR_MS..=POLL_CEILING_MS)
+                        .clamping(egui::SliderClamping::Edits)
                         .suffix(" ms")
                         .text("Check for programs every"),
                 );
@@ -872,7 +1049,12 @@ impl RulesEditor {
             if list.is_empty() {
                 theme::hint(
                     ui,
-                    if self.filter.trim().is_empty() {
+                    if self.no_scanner {
+                        "The process list is unavailable: logi could not start the thread \
+                         that reads it. Type a program name into a rule above instead."
+                    } else if !self.scanned {
+                        "Reading the process list..."
+                    } else if self.filter.trim().is_empty() {
                         "Nothing to show. The list excludes kernel threads and logi itself."
                     } else {
                         "No running program matches that filter."
@@ -922,10 +1104,15 @@ impl RulesEditor {
                 &format!(
                     "{} program(s) running, {} shown. Clicking one adds a rule for its name \
                      at the bottom of the list, matching profile {}. Kernel threads and logi \
-                     itself are left out. Refreshed every couple of seconds.",
+                     itself are left out. {}",
                     list.len(),
                     shown,
-                    snap.active_profile
+                    snap.active_profile,
+                    if self.no_scanner {
+                        "The list is not being refreshed."
+                    } else {
+                        "Refreshed every couple of seconds, in the background."
+                    }
                 ),
             );
 
@@ -1440,6 +1627,130 @@ poll_ms = 500
         assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("this line is nonsense"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_break_in_a_pattern_is_an_error() {
+        // The TextEdit is single-line, but a paste can still carry one, and a
+        // pattern written over two lines would be saved as two broken rules.
+        let m = model(vec![row("csgo\nblender", 0, None)]);
+        assert_eq!(errors(&m.check(None, None)).len(), 1);
+        round_trip(&m).expect_err("and it must not be written either");
+    }
+
+    #[test]
+    fn a_dpi_between_two_steps_is_flagged_as_the_value_it_will_become() {
+        let cap = Capability::Range { min: 100, max: 25600, step: 50 };
+        let m = model(vec![row("csgo", 0, Some(825))]);
+        let checked = m.check(None, Some(&cap));
+        let w = warnings(&checked);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("850"), "{w:?}");
+    }
+
+    #[test]
+    fn a_poll_interval_past_the_slider_is_flagged_but_kept() {
+        let m = Model { poll_ms: 30_000, ..Model::default() };
+        assert_eq!(warnings(&m.check(None, None)).len(), 1);
+        assert_eq!(m.normalized().poll_ms, 30_000, "advisory, not a clamp");
+        assert!(m.render().contains("poll_ms = 30000"));
+    }
+
+    // ---- the paint pass -------------------------------------------------
+
+    /// The one that actually bit: egui's `DragValue::range` and `Slider`
+    /// write a clamped value straight back through the borrow they are given,
+    /// so a panel whose ranges came from the attached device rewrote the
+    /// user's file-loaded values on the first frame it was painted, with no
+    /// click involved. Validation against the device has to be advisory.
+    #[test]
+    fn painting_the_panel_never_rewrites_a_value_from_the_file() {
+        use std::cell::RefCell;
+
+        let ed = RefCell::new(RulesEditor::with_path(PathBuf::from(
+            "/nonexistent/logi-must-not-be-touched/rules.conf",
+        )));
+        {
+            let mut e = ed.borrow_mut();
+            e.model = Model {
+                rows: vec![row("csgo", 7, Some(30_000))],
+                fallback: Some(9),
+                poll_ms: 30_000,
+                kept: Vec::new(),
+            };
+            e.disk = e.model.clone();
+            e.loaded_once = true;
+        }
+
+        // A mouse with three profiles: every value above is out of its range.
+        let snap = Snapshot { profile_count: 3, active_profile: 1, ..Snapshot::default() };
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            let problems = e.model.check(Some(3), None);
+            e.rules_section(ui, &problems, Some(3), &snap);
+            e.settings_section(ui, &problems, Some(3));
+        });
+
+        let e = ed.borrow();
+        assert_eq!(e.model.rows[0].profile, 7, "the rule's profile was rewritten");
+        assert_eq!(e.model.rows[0].dpi, Some(30_000), "the rule's dpi was rewritten");
+        assert_eq!(e.model.fallback, Some(9), "the fallback was rewritten");
+        assert_eq!(e.model.poll_ms, 30_000, "the poll interval was rewritten");
+        assert!(!e.dirty(), "painting must not make the editor think it has edits");
+    }
+
+    // ---- writing --------------------------------------------------------
+
+    #[test]
+    fn a_save_that_cannot_round_trip_leaves_the_file_exactly_as_it_was() {
+        let dir = temp_dir("refuse");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.rows[0].pattern = "fallback".to_string();
+        ed.save();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "csgo = 1\n",
+            "a refused save must not have touched the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_keeps_the_mode_the_config_already_had() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the rename must not widen the file's mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_into_somewhere_unwritable_is_reported_not_a_panic() {
+        let dir = temp_dir("unwritable");
+        // A file where the config's directory would have to be.
+        let blocker = dir.join("blocked");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let mut ed = RulesEditor::with_path(blocker.join("rules.conf"));
+        ed.load();
+        ed.model.add("csgo", 1);
+        ed.save();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert!(ed.dirty(), "the edit is still unsaved, so it is still dirty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

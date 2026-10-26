@@ -562,6 +562,36 @@ impl BindingsEditor {
                     ui.add_space(6.0);
                 }
             }
+
+            // The file can bind a button this mouse does not have: the count
+            // comes from the device, hand editing does not. Those rows get no
+            // row above, which would make them invisible state — still written
+            // back out on save, and a Replace among them makes the device side
+            // refuse the whole set, since buttonspy only accepts 1..count.
+            let hidden: Vec<String> = self
+                .rows
+                .iter()
+                .filter(|r| r.button > count && r.is_set())
+                .map(|r| r.button.to_string())
+                .collect();
+            if !hidden.is_empty() {
+                ui.add_space(12.0);
+                theme::hint(
+                    ui,
+                    &format!(
+                        "The file also binds button {} — this mouse has {count}, so \
+                         there is no row for that above. It stays in the file as it is; \
+                         a Replace among these stops the whole set being applied.",
+                        hidden.join(", ")
+                    ),
+                );
+                ui.add_space(6.0);
+                if ui.button("Forget those bindings").clicked() {
+                    for r in self.rows.iter_mut().filter(|r| r.button > count) {
+                        *r = Row::blank(r.button);
+                    }
+                }
+            }
         });
     }
 
@@ -759,26 +789,39 @@ impl BindingsEditor {
             });
         }
 
-        if silence.is_empty() {
-            return;
-        }
-
+        // Deliberately not gated on there being a Replace row. The rows are
+        // this app's staged edit; the mouse's remapping table is whatever was
+        // last written to it, and it survives unplugging. Someone whose
+        // buttons are silenced and who then reloads the file, discards edits,
+        // or starts the app fresh sees no Replace at all — and that is exactly
+        // the person who needs Restore and the terminal command in front of
+        // them.
+        let silenced = !silence.is_empty();
         theme::section(ui, "Replace safety", |ui| {
-            let list: Vec<String> = silence.iter().map(|b| b.to_string()).collect();
-            theme::row(ui, "silenced", &list.join(", "));
-            ui.add_space(8.0);
-            theme::hint(
-                ui,
-                "These buttons stop working physically once the bindings are applied. \
-                 Every other button is put back to its own function at the same time.",
-            );
+            if silenced {
+                let list: Vec<String> = silence.iter().map(|b| b.to_string()).collect();
+                theme::row(ui, "silenced", &list.join(", "));
+                ui.add_space(8.0);
+                theme::hint(
+                    ui,
+                    "These buttons stop working physically once the bindings are applied. \
+                     Every other button is put back to its own function at the same time.",
+                );
+            } else {
+                theme::hint(
+                    ui,
+                    "Nothing above is set to Replace, so these bindings silence no \
+                     button. If a button was silenced earlier, it is still silenced in \
+                     the mouse: Restore below is what puts it back.",
+                );
+            }
 
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui.button("Restore physical buttons").clicked() {
                     self.requests.push(Request::RestoreIdentity);
                 }
-                if !self.backed_up {
+                if silenced && !self.backed_up {
                     theme::pill(ui, "no backup taken", theme::WARN);
                 }
             });
@@ -787,30 +830,33 @@ impl BindingsEditor {
                 ui,
                 &format!(
                     "Restore writes the factory remapping table, so every button clicks \
-                     again. It is also {RESTORE_CLI} from a terminal, for a mouse too \
-                     dead to press this button with."
+                     again. It is also `{RESTORE_CLI}` from a terminal, which is the one \
+                     to remember: a mouse whose left click is silenced cannot press the \
+                     button above."
                 ),
             );
 
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                let w = (ui.available_width() - 90.0).max(160.0);
-                ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
-                if ui
-                    .add_enabled(snap.has_profiles, egui::Button::new("Back up"))
-                    .clicked()
-                {
-                    cmds.push(Cmd::Backup(self.backup_path.clone()));
-                    self.backed_up = true;
-                }
-            });
-            ui.add_space(6.0);
-            theme::hint(
-                ui,
-                "A backup covers the stored profiles, which is what a mis-set binding \
-                 is most likely to send you back to. The remapping table is not in it; \
-                 Restore above is that one's escape.",
-            );
+            if silenced {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    let w = (ui.available_width() - 90.0).max(160.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
+                    if ui
+                        .add_enabled(snap.has_profiles, egui::Button::new("Back up"))
+                        .clicked()
+                    {
+                        cmds.push(Cmd::Backup(self.backup_path.clone()));
+                        self.backed_up = true;
+                    }
+                });
+                ui.add_space(6.0);
+                theme::hint(
+                    ui,
+                    "A backup covers the stored profiles, which is what a mis-set binding \
+                     is most likely to send you back to. The remapping table is not in it; \
+                     Restore above is that one's escape.",
+                );
+            }
         });
     }
 
@@ -826,12 +872,30 @@ impl BindingsEditor {
                     match self.save(count) {
                         Ok(silence) => {
                             let n = silence.len();
-                            self.requests.push(Request::ApplyBindings { silence });
+                            let path = actions::config_path();
+                            // Only ask the device layer for anything when the
+                            // mouse can actually report button presses. A
+                            // Replace silences the physical button; doing that
+                            // to a mouse that cannot tell us it was pressed
+                            // leaves a button that does nothing at all, and it
+                            // stays that way across unplugging. This is also
+                            // what the hint at the bottom of the section
+                            // promises, so the two must not drift apart.
+                            let apply = snap.connected && snap.has_button_spy;
                             self.status = Some((
-                                format!(
-                                    "saved to {}; {n} button(s) to silence",
-                                    actions::config_path().display()
-                                ),
+                                if apply {
+                                    self.requests.push(Request::ApplyBindings { silence });
+                                    format!(
+                                        "saved to {}; {n} button(s) to silence",
+                                        path.display()
+                                    )
+                                } else {
+                                    format!(
+                                        "saved to {}; not applied, because no connected \
+                                         mouse can report button presses",
+                                        path.display()
+                                    )
+                                },
                                 true,
                             ));
                         }
@@ -1041,6 +1105,35 @@ mod tests {
         e.set_replace(5);
         assert!(all_replaced(&e.rows, 5));
         assert!(e.save(5).is_err());
+    }
+
+    /// The refusal is about the mouse in your hand, not about the editor's
+    /// row list. There is one row per *possible* button, so counting rows
+    /// always yields MAX_BUTTON and the refusal would never fire on a mouse
+    /// with fewer buttons than that — which is every mouse this app has seen.
+    #[test]
+    fn the_all_replaced_refusal_counts_the_device_s_buttons_not_the_rows() {
+        let mut e = editor("");
+        // A five-button mouse with four of them already replaced.
+        for b in 1..=4 {
+            e.set_replace(b);
+        }
+        e.want_replace(5, 5);
+        assert!(e.refused.is_some(), "the fifth of five must be refused");
+        assert_eq!(
+            e.rows.iter().find(|r| r.button == 5).unwrap().mode,
+            BindMode::Augment
+        );
+
+        // The same state measured against MAX_BUTTON is not refused at all:
+        // that is what the UI used to pass in, and the bug it caused.
+        assert!(!all_replaced(&e.rows, MAX_BUTTON));
+        e.refused = None;
+        e.want_replace(5, MAX_BUTTON);
+        assert!(
+            e.refused.is_none(),
+            "documents the wrong-count behaviour the UI must not have"
+        );
     }
 
     #[test]

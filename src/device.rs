@@ -36,6 +36,12 @@ pub enum Cmd {
     Backup(String),
     WriteProfile { index: u8, profile: Box<Profile> },
     SetButton { index: u8, button: u8, binding: crate::profile_blob::Button },
+    /// Silence exactly these physical buttons and un-silence every other one.
+    /// Empty means "silence nothing", which is how Replace is undone.
+    ApplyBindings { silence: Vec<u8> },
+    /// Write the factory identity remapping table. The recovery path for a
+    /// mouse whose buttons were silenced with nothing listening.
+    RestoreIdentity,
 }
 
 /// A snapshot of device state for the UI to render. Cheap to clone.
@@ -414,6 +420,30 @@ fn worker(
                     })
                 })
             }
+            Cmd::ApplyBindings { silence } => {
+                // Only the table is written here. Acting on the presses is the
+                // background service's job, so say so rather than implying the
+                // bindings are live.
+                match crate::buttonspy::ButtonSpy::new(&mut l.dev) {
+                    Err(e) => Err(e),
+                    Ok(spy) => spy.silence(&mut l.dev, &silence).map(|_| {
+                        Some(if silence.is_empty() {
+                            "all physical buttons restored".to_string()
+                        } else {
+                            format!(
+                                "{} button(s) silenced; the service acts on them",
+                                silence.len()
+                            )
+                        })
+                    }),
+                }
+            }
+            Cmd::RestoreIdentity => match crate::buttonspy::ButtonSpy::new(&mut l.dev) {
+                Err(e) => Err(e),
+                Ok(spy) => spy
+                    .restore_identity(&mut l.dev)
+                    .map(|_| Some("factory button mapping restored".into())),
+            },
             Cmd::WriteProfile { index, profile } => {
                 feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
                     profile_io::write_profile(dev, p, index, &profile)

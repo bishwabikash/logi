@@ -92,11 +92,15 @@ pub fn snap_stage(cap: Option<&Capability>, v: u16) -> u16 {
         return 0;
     }
     match cap {
-        Some(Capability::Range { min, max, step }) => {
-            let step = (*step).max(1);
-            let v = v.clamp(*min, *max);
-            let steps = ((v - min) as f32 / step as f32).round() as u16;
-            (min + steps * step).min(*max)
+        Some(Capability::Range { min, max, step }) if *min <= *max => {
+            // In u32 throughout: the capability comes off the wire, and
+            // `min + steps * step` overflows a u16 for a device that reports a
+            // large step near the top of the range.
+            let step = (*step).max(1) as u32;
+            let v = v.clamp(*min, *max) as u32;
+            let min = *min as u32;
+            let steps = ((v - min) as f32 / step as f32).round() as u32;
+            (min + steps * step).min(*max as u32) as u16
         }
         Some(Capability::List(list)) if !list.is_empty() => *list
             .iter()
@@ -108,10 +112,19 @@ pub fn snap_stage(cap: Option<&Capability>, v: u16) -> u16 {
 
 /// Report rates to offer, in Hz. The device's own list when we have it.
 fn rate_options(snap: &Snapshot, current_ms: u8) -> Vec<u16> {
-    let mut v = if snap.rates.is_empty() {
+    let mut v: Vec<u16> = if snap.rates.is_empty() {
         vec![125, 250, 500, 1000]
     } else {
-        snap.rates.clone()
+        // The device's list comes from an interval bitmask, so it can hold
+        // rates that are not a whole number of milliseconds: bit 2 means 3 ms,
+        // which is 333 Hz. Byte 0 of the sector is an interval in whole
+        // milliseconds, so such a rate cannot be stored, and offering it gave
+        // a button that silently did nothing.
+        snap.rates
+            .iter()
+            .copied()
+            .filter(|hz| ReportRate::interval_ms(*hz).is_ok())
+            .collect()
     };
     // Never hide the value already stored: the user has to be able to see
     // where the profile currently sits even if the list disagrees.
@@ -298,8 +311,11 @@ impl Draft {
         p.name = truncate_name(&self.name);
         p.report_rate_ms = self.rate_ms;
         p.dpi = self.dpi;
-        p.default_dpi = self.default_dpi;
-        p.shift_dpi = self.shift_dpi;
+        // Never write an index that names a disabled stage, even one that came
+        // off the device that way: that is how a profile ends up booting at 0
+        // DPI, and the checkbox path is not the only way one gets here.
+        p.default_dpi = self.valid_index(self.default_dpi);
+        p.shift_dpi = self.valid_index(self.shift_dpi);
         for (i, l) in self.leds.iter().enumerate() {
             p.leds[i] = l.to_led();
             // The second-mode record gets the same value, so holding the
@@ -319,18 +335,24 @@ impl Draft {
         (0..N_DPI).filter(|i| self.dpi[*i] != 0).collect()
     }
 
+    /// `i` if it names an enabled stage, otherwise the first enabled one.
+    ///
+    /// Left alone when every stage is disabled: there is no index to pick, and
+    /// that profile is refused by the save gate anyway.
+    fn valid_index(&self, i: u8) -> u8 {
+        let on = self.enabled_stages();
+        match on.first() {
+            Some(&first) if !on.contains(&(i as usize)) => first as u8,
+            _ => i,
+        }
+    }
+
     /// Keep the default and shift indices pointing at a stage that exists.
     /// A disabled stage as the default is how a profile ends up booting at
     /// 0 DPI.
     pub fn fix_indices(&mut self) {
-        let on = self.enabled_stages();
-        let Some(&first) = on.first() else { return };
-        if !on.contains(&(self.default_dpi as usize)) {
-            self.default_dpi = first as u8;
-        }
-        if !on.contains(&(self.shift_dpi as usize)) {
-            self.shift_dpi = first as u8;
-        }
+        self.default_dpi = self.valid_index(self.default_dpi);
+        self.shift_dpi = self.valid_index(self.shift_dpi);
     }
 
     /// A profile with no left click leaves a mouse that cannot click.
@@ -480,19 +502,16 @@ impl ProfileEditor {
 
         let n_buttons = (snap.button_count as usize).min(original.buttons.len());
         let base = Draft::from_profile(original, n_buttons);
-        let mut st = match self.staged.remove(&index) {
-            // Nothing staged and the device has moved on: adopt the reading.
-            Some(s) if !s.dirty() && s.base != base => Staged::new(base.clone()),
-            Some(s) => s,
-            None => Staged::new(base.clone()),
-        };
 
         // The write marker clears itself; a failed write shows up as an error
-        // in the status bar, which the host owns.
+        // in the status bar, which the host owns. Cleared before the staged
+        // entry is chosen, because a write still in flight decides which one
+        // stands.
         if self.writing.map(|(_, t)| t.elapsed() > WRITE_SETTLE).unwrap_or(false) {
             self.writing = None;
         }
         let writing = self.writing.map(|(i, _)| i) == Some(index);
+        let mut st = stage_for(self.staged.remove(&index), &base, writing);
 
         self.draw_header(ui, &st, index, writing);
         self.draw_identity(ui, &mut st.draft, &base);
@@ -501,11 +520,21 @@ impl ProfileEditor {
         self.draw_lighting(ui, &mut st.draft, snap);
         self.draw_buttons(ui, &mut st.draft, &base, n_buttons);
         self.draw_copy_from(ui, &mut st.draft, snap, index, n_buttons);
-        let committed = self.draw_save(ui, &st, original, index, &mut cmds);
+        let reverted = self.draw_save(ui, &mut st, original, index, &mut cmds);
 
-        // A committed profile drops out of the staging map: the device is the
-        // source of truth, and the worker re-reads every sector after a write.
-        if !committed && (st.dirty() || st.base != base) {
+        // The sector now reads back as what was written, so the marker goes
+        // now rather than sitting out the settle timer.
+        if writing && !st.dirty() && st.base == base {
+            self.writing = None;
+        }
+
+        // Reverting drops the entry, which is what makes the device's own
+        // reading show again. A saved one is kept, now matching what was
+        // written, until the worker's re-read confirms or corrects it: the
+        // device is the source of truth, but it is a second behind, and
+        // showing the pre-write values in the meantime reads as a lost edit
+        // and invites a second flash write.
+        if !reverted && (st.dirty() || st.base != base) {
             self.staged.insert(index, st);
         }
         cmds
@@ -869,7 +898,9 @@ impl ProfileEditor {
                             });
 
                         if current != was {
-                            theme::pill(ui, &format!("was {}", was.describe()), theme::ACCENT);
+                            // Staged, not selected and not live, so it takes
+                            // the warning colour rather than the accent.
+                            theme::pill(ui, &format!("was {}", was.describe()), theme::WARN);
                         } else {
                             ui.label("");
                         }
@@ -944,38 +975,50 @@ impl ProfileEditor {
         });
     }
 
-    /// Returns true if a write was dispatched for this profile.
+    /// Returns true if the staged edits were reverted and should be dropped.
     fn draw_save(
         &mut self,
         ui: &mut egui::Ui,
-        st: &Staged,
+        st: &mut Staged,
         original: &Profile,
         index: u8,
         cmds: &mut Vec<Cmd>,
     ) -> bool {
         let dirty = st.dirty();
-        let blocked = !st.draft.has_left_click() || st.draft.enabled_stages().is_empty();
-        let mut committed = false;
+        // With no editable buttons the editor never touches the remapping
+        // table — it is written back exactly as read — so there is nothing to
+        // refuse, and refusing left the save button dead with no way out.
+        let no_click = st.draft.editable > 0 && !st.draft.has_left_click();
+        let blocked = no_click || st.draft.enabled_stages().is_empty();
+        let mut reverted = false;
 
         theme::section(ui, "Save", |ui| {
-            if !self.backup_asked {
-                theme::hint(
-                    ui,
+            theme::hint(
+                ui,
+                if self.backup_asked {
+                    "A backup was asked for this session. Taking another overwrites the \
+                     file named below, so point it somewhere else to keep both."
+                } else {
                     "Take a backup before the first write of this session. It dumps every \
                      sector, the profile directory included, so a bad profile can be put \
-                     back.",
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    let w = (ui.available_width() - 130.0).max(160.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
-                    if ui.button("Save backup").clicked() {
-                        cmds.push(Cmd::Backup(self.backup_path.clone()));
-                        self.backup_asked = true;
-                    }
-                });
-                ui.add_space(12.0);
-            }
+                     back."
+                },
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - 130.0).max(160.0);
+                ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
+                // Kept available after the first click: the write happens on
+                // the device thread, so a failure to write the file shows up
+                // in the status bar afterwards, and hiding the control left no
+                // way to retry the one thing that makes a bad write
+                // recoverable.
+                if ui.button("Save backup").clicked() {
+                    cmds.push(Cmd::Backup(self.backup_path.clone()));
+                    self.backup_asked = true;
+                }
+            });
+            ui.add_space(12.0);
 
             ui.horizontal(|ui| {
                 if ui
@@ -987,10 +1030,14 @@ impl ProfileEditor {
                         profile: Box::new(st.draft.build(original)),
                     });
                     self.writing = Some((index, Instant::now()));
-                    committed = true;
+                    // The draft is now what the mouse is being told to hold,
+                    // so it stops reading as unsaved without being thrown
+                    // away: the re-read a second from now either confirms it
+                    // or replaces it with what the device actually stored.
+                    st.base = st.draft.clone();
                 }
                 if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
-                    committed = true; // dropping the staged entry is the revert
+                    reverted = true; // dropping the staged entry is the revert
                 }
             });
 
@@ -1012,7 +1059,23 @@ impl ProfileEditor {
                 );
             }
         });
-        committed
+        reverted
+    }
+}
+
+/// Which staged entry to draw this frame.
+///
+/// `writing` means a write for this profile is still in flight. The worker
+/// re-reads every sector after a write, but that is about a second away, so
+/// until it lands `base` is still the pre-write content and adopting it would
+/// put the old values back under the user's nose — which reads as a lost edit
+/// and invites a second flash write.
+fn stage_for(prev: Option<Staged>, base: &Draft, writing: bool) -> Staged {
+    match prev {
+        // Nothing staged and the device has moved on: adopt the reading.
+        Some(s) if !s.dirty() && !writing && s.base != *base => Staged::new(base.clone()),
+        Some(s) => s,
+        None => Staged::new(base.clone()),
     }
 }
 
@@ -1320,5 +1383,95 @@ mod tests {
         assert!(rate_options(&snap, 3).contains(&333));
         snap.rates.clear();
         assert_eq!(rate_options(&snap, 0), vec![125, 250, 500, 1000]);
+    }
+
+    #[test]
+    fn a_rate_the_sector_cannot_store_is_not_offered() {
+        // A device whose interval bitmask has bit 2 reports 333 Hz, which is
+        // 3 ms: storable as a byte, but the control used to do nothing when
+        // 1000/hz was not whole, so it must not be offered.
+        let snap = Snapshot { rates: vec![125, 142, 166, 250, 333, 500, 1000], ..Default::default() };
+        let offered = rate_options(&snap, 1);
+        for hz in [333, 166, 142] {
+            assert!(!offered.contains(&hz), "{hz} Hz is not a whole-ms interval");
+        }
+        assert_eq!(offered, vec![125, 250, 500, 1000]);
+        for hz in &offered {
+            assert!(ReportRate::interval_ms(*hz).is_ok());
+        }
+    }
+
+    #[test]
+    fn snapping_survives_a_capability_that_would_overflow_a_u16() {
+        // Straight off the wire, so the arithmetic has to hold for values no
+        // sensor would really report.
+        let cap = Capability::Range { min: 1000, max: 65535, step: 8191 };
+        assert_eq!(snap_stage(Some(&cap), 65535), 65535);
+        assert_eq!(snap_stage(Some(&cap), 60000), 58337);
+        // An inverted range is passed through rather than clamped backwards.
+        let bad = Capability::Range { min: 25600, max: 100, step: 50 };
+        assert_eq!(snap_stage(Some(&bad), 1600), 1600);
+    }
+
+    #[test]
+    fn a_startup_index_on_a_disabled_stage_is_not_written() {
+        let p = profile();
+        let mut d = draft();
+        // Stage 4 is disabled in the fixture; the device can hand us a profile
+        // already pointing at it.
+        d.default_dpi = 4;
+        d.shift_dpi = 4;
+        let back = Profile::parse(&d.build(&p).serialize()).unwrap();
+        assert_eq!(back.default_dpi, 0);
+        assert_eq!(back.shift_dpi, 0);
+        assert_ne!(back.dpi[back.default_dpi as usize], 0);
+        // With nothing enabled there is no index to pick, and the save gate
+        // refuses that profile instead.
+        let mut empty = draft();
+        empty.dpi = [0; N_DPI];
+        empty.default_dpi = 2;
+        assert_eq!(empty.build(&p).default_dpi, 2);
+        assert!(empty.enabled_stages().is_empty());
+    }
+
+    #[test]
+    fn a_saved_draft_is_held_until_the_device_catches_up() {
+        let base = draft();
+        let mut st = Staged::new(base.clone());
+        st.draft.name = "Gaming".into();
+        // What draw_save does on the click: the write is in flight, so the
+        // draft stops reading as unsaved but is not thrown away.
+        st.base = st.draft.clone();
+        assert!(!st.dirty());
+
+        // While the write is in flight the pre-write reading must not come
+        // back: that looked like a lost edit and invited a second write.
+        let held = stage_for(Some(st.clone()), &base, true);
+        assert_eq!(held.draft.name, "Gaming");
+
+        // Once the worker has re-read the sector, the device's own reading is
+        // what stands.
+        let mut after = base.clone();
+        after.name = "Gaming".into();
+        let settled = stage_for(Some(st.clone()), &after, false);
+        assert_eq!(settled.draft.name, "Gaming");
+        assert!(!settled.dirty());
+        // And if the write did not land, the truth replaces the draft.
+        let failed = stage_for(Some(st), &base, false);
+        assert_eq!(failed.draft.name, base.name);
+    }
+
+    #[test]
+    fn unsaved_edits_are_kept_while_a_write_to_another_profile_runs() {
+        let base = draft();
+        let mut st = Staged::new(base.clone());
+        st.draft.rate_ms = 4;
+        assert!(st.dirty());
+        // Dirty entries are never adopted away, write in flight or not.
+        for writing in [false, true] {
+            let kept = stage_for(Some(st.clone()), &base, writing);
+            assert_eq!(kept.draft.rate_ms, 4);
+            assert!(kept.dirty());
+        }
     }
 }

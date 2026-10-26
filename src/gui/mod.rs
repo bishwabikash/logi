@@ -206,9 +206,32 @@ impl App {
     fn sync_tray(&mut self, ctx: &egui::Context) {
         use crate::tray::{Event, Status};
 
+        // Build the real status first: registering with Status::default()
+        // made the first icon claim a service state nothing had looked at yet.
+        let status = Status {
+            device: self.snap.connected.then(|| self.snap.model.clone()),
+            service: self.service.state(),
+            active_profile: self.snap.active_profile,
+            profile_count: self.snap.profile_count,
+            dpi: self.snap.dpi,
+            // The device's own range, not a fixed list: with no mouse attached
+            // there is nothing to offer, and offering it anyway produced a DPI
+            // menu that could not work.
+            dpi_presets: match (self.snap.connected, &self.snap.dpi_cap) {
+                (true, Some(Capability::Range { min, max, .. })) => {
+                    [400u16, 800, 1600, 3200, 6400]
+                        .into_iter()
+                        .filter(|p| p >= min && p <= max)
+                        .collect()
+                }
+                (true, Some(Capability::List(v))) => v.clone(),
+                _ => Vec::new(),
+            },
+        };
+
         if !self.tray_tried {
             self.tray_tried = true;
-            match crate::tray::Tray::spawn(Status::default()) {
+            match crate::tray::Tray::spawn(status.clone()) {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => eprintln!("logi: no tray icon: {e}"),
             }
@@ -216,14 +239,7 @@ impl App {
         let Some(tray) = &self.tray else { return };
 
         // update() is a no-op when nothing changed, so this is cheap per frame.
-        tray.update(Status {
-            device: self.snap.connected.then(|| self.snap.model.clone()),
-            service: self.service.state(),
-            active_profile: self.snap.active_profile,
-            profile_count: self.snap.profile_count,
-            dpi: self.snap.dpi,
-            dpi_presets: vec![400, 800, 1600, 3200, 6400],
-        });
+        tray.update(status);
 
         for ev in tray.poll() {
             match ev {
@@ -766,6 +782,16 @@ impl App {
         let snap = self.snap.clone();
         for cmd in self.bindings.ui(ui, &snap) {
             self.dev.send(cmd);
+        }
+        // The editor also queues things Cmd could not express when it was
+        // written. Draining this is what makes Save actually reach the device.
+        for req in self.bindings.take_requests() {
+            self.dev.send(match req {
+                bindings_editor::Request::ApplyBindings { silence } => {
+                    Cmd::ApplyBindings { silence }
+                }
+                bindings_editor::Request::RestoreIdentity => Cmd::RestoreIdentity,
+            });
         }
         ui.add_space(18.0);
         if !self.snap.has_profiles {
