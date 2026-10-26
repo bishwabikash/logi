@@ -24,6 +24,10 @@ eframe = { version = "0.33", default-features = false, features = [
     "glow", "wayland", "x11", "default_fonts",
 ] }
 
+# StatusNotifierItem tray icon. GNOME shows these through the appindicator
+# extension, which is installed here and already hosts org.kde.StatusNotifierWatcher.
+ksni = "0.3"
+
 [profile.release]
 opt-level = "s"
 lto = true
