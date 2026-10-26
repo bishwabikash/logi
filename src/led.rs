@@ -3,9 +3,16 @@
 //! Byte layouts follow libratbag's implementation of this device; see
 //! PROTOCOL.md. The subtleties that bite:
 //!
-//!   * setZoneEffect payload is `[zone, mode, <10 param bytes>]`.
-//!   * CYCLE has five unused bytes before its period. Omitting them is the
-//!     usual reason a hand-built cycling write returns "invalid argument".
+//!   * setZoneEffect payload is `[zone, effect_index, <10 param bytes>]`,
+//!     twelve bytes in total. Byte 1 is the zone's **effect index**, not the
+//!     mode id. They coincide for FIXED (both 1) and differ for everything
+//!     else: BREATHING is mode 0x0a at index 2. Sending the mode id gets
+//!     "invalid argument". Resolve the index from the zone's effect list.
+//!   * Only FIXED and BREATHING are settable live on this device. Indices 0
+//!     (off) and 3 (cycle) are rejected under every parameter layout tested.
+//!     Live "off" is therefore a fixed black, and live cycling has to be
+//!     streamed from the host. Both modes ARE storable in a profile sector,
+//!     which uses mode ids rather than indices.
 //!   * This device reports ext_caps 0x0000, so HAS_ZONE_EFFECT is clear and
 //!     getZoneEffect is unimplemented: it answers with zeros rather than an
 //!     error. Never infer a failed write from a zero readback.
@@ -188,17 +195,28 @@ impl Leds {
             .unwrap_or(false)
     }
 
-    fn payload(zone: u8, mode: u8, params: &[u8]) -> Vec<u8> {
-        let mut p = vec![0u8; 11];
+    /// The zone's index for a mode id. setZoneEffect wants this, not the id.
+    pub fn effect_index(&self, zone: u8, mode: u8) -> Option<u8> {
+        self.zones
+            .get(zone as usize)?
+            .modes
+            .iter()
+            .position(|m| *m == mode)
+            .map(|i| i as u8)
+    }
+
+    /// `[zone, effect_index, 10 param bytes]` — twelve bytes.
+    fn payload(zone: u8, effect_index: u8, params: &[u8]) -> Vec<u8> {
+        let mut p = vec![0u8; 12];
         p[0] = zone;
-        p[1] = mode;
-        let n = params.len().min(9);
+        p[1] = effect_index;
+        let n = params.len().min(10);
         p[2..2 + n].copy_from_slice(&params[..n]);
         p
     }
 
     fn set(&self, dev: &mut Device, zone: u8, mode: u8, params: &[u8]) -> Result<()> {
-        if !self.supports(zone, mode) {
+        let Some(ei) = self.effect_index(zone, mode) else {
             let have: Vec<&str> = self
                 .zones
                 .get(zone as usize)
@@ -209,13 +227,18 @@ impl Leds {
                 mode_name(mode),
                 have.join(",")
             )));
-        }
-        dev.call(self.idx, SET_ZONE_EFFECT, &Self::payload(zone, mode, params))?;
+        };
+        dev.call(self.idx, SET_ZONE_EFFECT, &Self::payload(zone, ei, params))?;
         Ok(())
     }
 
+    /// Live "off".
+    ///
+    /// Effect index 0 is rejected by this firmware, so this is a fixed black
+    /// instead. Visually identical; to store a real off mode in a profile,
+    /// write `profile_blob::Led::off()` to flash.
     pub fn off(&self, dev: &mut Device, zone: u8) -> Result<()> {
-        self.set(dev, zone, OFF, &[])
+        self.fixed(dev, zone, [0, 0, 0])
     }
 
     pub fn fixed(&self, dev: &mut Device, zone: u8, c: [u8; 3]) -> Result<()> {
@@ -224,13 +247,13 @@ impl Leds {
 
     /// Fire-and-forget solid colour. The primitive the animation engine drives.
     pub fn fixed_nowait(&self, dev: &mut Device, zone: u8, c: [u8; 3]) -> Result<()> {
-        if !self.supports(zone, FIXED) {
+        let Some(ei) = self.effect_index(zone, FIXED) else {
             return Err(Error::Protocol(format!("zone {zone} has no fixed mode")));
-        }
+        };
         dev.send_nowait(
             self.idx,
             SET_ZONE_EFFECT,
-            &Self::payload(zone, FIXED, &[c[0], c[1], c[2], 0x00]),
+            &Self::payload(zone, ei, &[c[0], c[1], c[2], 0x00]),
         )
     }
 
@@ -256,18 +279,18 @@ impl Leds {
         )
     }
 
-    pub fn cycle(&self, dev: &mut Device, zone: u8, period_ms: u16, intensity: u8) -> Result<()> {
-        // Five unused bytes come before the period here.
-        self.set(
-            dev,
-            zone,
-            CYCLE,
-            &[
-                0, 0, 0, 0, 0,
-                (period_ms >> 8) as u8, (period_ms & 0xFF) as u8,
-                if intensity >= 100 { 0 } else { intensity.max(1) },
-            ],
-        )
+    /// Hardware cycling, which this firmware will not set live.
+    ///
+    /// Every parameter layout at effect index 3 is answered with "invalid
+    /// argument", so rather than emit a confusing protocol error this says
+    /// what to do instead. Cycling IS storable in a profile sector.
+    pub fn cycle(&self, _dev: &mut Device, _zone: u8, _period_ms: u16, _intensity: u8) -> Result<()> {
+        Err(Error::Protocol(
+            "this device will not set hardware cycling live (effect index 3 is \
+             rejected). Store it into an onboard profile instead, or stream \
+             `g502 effect rainbow` from the host."
+                .into(),
+        ))
     }
 
     pub fn all_fixed(&self, dev: &mut Device, c: [u8; 3]) -> Result<()> {
@@ -282,5 +305,16 @@ impl Leds {
             self.off(dev, z)?;
         }
         Ok(())
+    }
+
+    /// Modes this firmware accepts over the live path, as opposed to modes it
+    /// merely has an effect record for.
+    pub fn live_modes(&self, zone: u8) -> Vec<u8> {
+        self.zones
+            .get(zone as usize)
+            .map(|z| {
+                z.modes.iter().copied().filter(|m| *m == FIXED || *m == BREATHING).collect()
+            })
+            .unwrap_or_default()
     }
 }

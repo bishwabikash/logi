@@ -87,8 +87,10 @@ impl OnboardProfiles {
             return Err(Error::Protocol("mode must be onboard(1) or host(2)".into()));
         }
         dev.call(self.idx, SET_MODE, &[mode])?;
-        // The firmware needs a moment before it honours writes in the new mode.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // The firmware needs a moment before it honours writes in the new
+        // mode. 50ms was marginal: a lighting write issued immediately after
+        // the switch intermittently came back "invalid argument".
+        std::thread::sleep(std::time::Duration::from_millis(150));
         Ok(())
     }
 

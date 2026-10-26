@@ -4,7 +4,7 @@
 use crate::device::{self, Cmd, Snapshot};
 use crate::dpi::Capability;
 use crate::led;
-use crate::profile_blob::Led;
+use crate::profile_blob::{Button, Led, SPECIALS};
 use eframe::egui;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -39,6 +39,9 @@ pub struct App {
 
     profile_sel: usize,
     backup_path: String,
+
+    /// Pending button edits, keyed by button index, applied on click.
+    btn_action: std::collections::HashMap<u8, String>,
 }
 
 impl App {
@@ -59,6 +62,7 @@ impl App {
             effect_period_ms: 4000,
             profile_sel: 0,
             backup_path: default_backup_path(),
+            btn_action: std::collections::HashMap::new(),
         }
     }
 
@@ -81,6 +85,18 @@ impl App {
                 .unwrap_or_default()
         }
     }
+}
+
+/// Map a menu label back to a binding. Labels come from the same tables that
+/// produced them, so an unknown one means a bug rather than user input.
+fn action_to_button(label: &str) -> Option<Button> {
+    if label == "disabled" {
+        return Some(Button::disabled());
+    }
+    if let Some(rest) = label.strip_prefix("button ") {
+        return rest.trim().parse::<u8>().ok().map(Button::mouse);
+    }
+    Button::special(label)
 }
 
 fn default_backup_path() -> String {
@@ -258,19 +274,27 @@ impl App {
             }
         });
 
-        // Only offer modes the firmware actually implements.
+        // The firmware has effect records for four modes but only accepts two
+        // over the live path, so the picker says which is which rather than
+        // offering a button that always errors.
         let available: Vec<u8> = self
             .snap
             .zones
             .first()
             .map(|z| z.modes.clone())
             .unwrap_or_else(|| vec![led::OFF, led::FIXED, led::BREATHING, led::CYCLE]);
+        let live_ok = |m: u8| m == led::FIXED || m == led::BREATHING || m == led::OFF;
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.label("Mode:");
             for m in &available {
-                if ui.selectable_label(self.mode == *m, led::mode_name(*m)).clicked() {
+                let label = if live_ok(*m) {
+                    led::mode_name(*m).to_string()
+                } else {
+                    format!("{} (store only)", led::mode_name(*m))
+                };
+                if ui.selectable_label(self.mode == *m, label).clicked() {
                     self.mode = *m;
                 }
             }
@@ -301,8 +325,19 @@ impl App {
         }
 
         ui.add_space(10.0);
+        if !live_ok(self.mode) {
+            ui.label(
+                egui::RichText::new(
+                    "This firmware will not set cycling live. Use \"Store to onboard \
+                     profile\" so the mouse runs it itself, or stream the rainbow \
+                     effect below.",
+                )
+                .color(egui::Color32::from_rgb(230, 180, 90)),
+            );
+            ui.add_space(6.0);
+        }
         ui.horizontal(|ui| {
-            if ui.button("Apply (live)").clicked() {
+            if ui.add_enabled(live_ok(self.mode), egui::Button::new("Apply (live)")).clicked() {
                 let c = self.rgb();
                 let wf = led::WAVEFORMS[self.waveform].1;
                 for z in self.zones() {
@@ -440,46 +475,80 @@ impl App {
             ui.label("No profile read yet.");
             return;
         }
-        let idx = self.snap.active_profile as usize;
-        let Some(p) = self.snap.profiles.get(idx) else {
+        let idx = self.snap.active_profile;
+        let Some(p) = self.snap.profiles.get(idx as usize).cloned() else {
             ui.label("Active profile not readable.");
             return;
         };
         ui.label(
             egui::RichText::new(format!(
-                "Profile {idx}, {} buttons, decoded from onboard flash.",
-                self.snap.button_count
+                "Profile {idx}, decoded from onboard flash. Changing a binding writes \
+                 flash, so it persists with nothing running — take a backup first from \
+                 the Profiles tab."
             ))
             .weak(),
         );
         ui.add_space(8.0);
-        egui::Grid::new("btns").striped(true).show(ui, |ui| {
+
+        // Actions offered: the eleven special actions, the five mouse buttons,
+        // and disabled. Anything the codec can encode and the device accepts.
+        let mut choices: Vec<String> = SPECIALS.iter().map(|(_, n)| n.to_string()).collect();
+        for n in 1..=5u8 {
+            choices.push(format!("button {n}"));
+        }
+        choices.push("disabled".to_string());
+
+        let n_buttons = self.snap.button_count;
+        let mut pending: Option<(u8, Button)> = None;
+
+        egui::Grid::new("btns").striped(true).num_columns(4).show(ui, |ui| {
             ui.label(egui::RichText::new("#").strong());
-            ui.label(egui::RichText::new("bound to").strong());
-            ui.label(egui::RichText::new("raw").strong());
+            ui.label(egui::RichText::new("current").strong());
+            ui.label(egui::RichText::new("change to").strong());
+            ui.label("");
             ui.end_row();
-            for (i, b) in p.buttons.iter().take(self.snap.button_count as usize).enumerate() {
+
+            for i in 0..n_buttons {
+                let cur = p.buttons.get(i as usize).copied().unwrap_or(Button::disabled());
+                let cur_desc = cur.describe();
                 ui.label(i.to_string());
-                ui.label(b.describe());
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{:02x} {:02x} {:02x} {:02x}",
-                        b.0[0], b.0[1], b.0[2], b.0[3]
-                    ))
-                    .monospace()
-                    .weak(),
-                );
+                ui.label(&cur_desc);
+
+                let sel = self
+                    .btn_action
+                    .entry(i)
+                    .or_insert_with(|| cur_desc.clone())
+                    .clone();
+                egui::ComboBox::from_id_salt(("btn", i))
+                    .selected_text(&sel)
+                    .show_ui(ui, |ui| {
+                        for c in &choices {
+                            let mut s = sel.clone();
+                            if ui.selectable_value(&mut s, c.clone(), c).clicked() {
+                                self.btn_action.insert(i, c.clone());
+                            }
+                        }
+                    });
+
+                let changed = sel != cur_desc;
+                if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
+                    if let Some(b) = action_to_button(&sel) {
+                        pending = Some((i, b));
+                    }
+                }
                 ui.end_row();
             }
         });
+
+        if let Some((button, binding)) = pending {
+            self.dev.send(Cmd::SetButton { index: idx, button, binding });
+            self.btn_action.remove(&button);
+        }
+
         ui.add_space(10.0);
-        ui.label(
-            egui::RichText::new(
-                "Rebinding writes to onboard flash. Not wired into this view yet; \
-                 use the CLI, and take a backup first.",
-            )
-            .weak(),
-        );
+        if ui.button("Reset pending changes").clicked() {
+            self.btn_action.clear();
+        }
     }
 
     fn draw_about(&mut self, ui: &mut egui::Ui) {

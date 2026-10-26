@@ -1,4 +1,10 @@
 //! 0x8060 REPORT_RATE.
+//!
+//! `set` only works in host mode. In onboard mode the rate is taken from the
+//! active profile and the device answers setReportRate with "invalid
+//! argument" (verified on a real G502 HERO). A rate set live is also lost when
+//! the device returns to onboard mode, so to make one stick you write byte
+//! 0x00 of the profile sector instead — see `profile_io::set_report_rate`.
 
 use crate::features;
 use crate::hidpp::{Device, Error, Result};
@@ -32,6 +38,7 @@ impl ReportRate {
         Ok(if ms == 0 { 0 } else { 1000 / ms as u16 })
     }
 
+    /// Set the live rate. Requires host mode; see the module note.
     pub fn set(&self, dev: &mut Device, hz: u16) -> Result<()> {
         let ok = self.supported(dev)?;
         if !ok.contains(&hz) {
@@ -39,5 +46,12 @@ impl ReportRate {
         }
         dev.call(self.idx, SET_RATE, &[(1000 / hz) as u8])?;
         Ok(())
+    }
+
+    pub fn interval_ms(hz: u16) -> Result<u8> {
+        if hz == 0 || 1000 % hz != 0 {
+            return Err(Error::Protocol(format!("{hz} Hz is not a whole-ms interval")));
+        }
+        Ok((1000 / hz) as u8)
     }
 }

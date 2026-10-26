@@ -62,7 +62,12 @@ project — `./target/release/g502` runs from the build directory.
 ```
 g502 info                   capabilities and current state
 g502 dpi 1600               set DPI; snapped to the nearest step and reported
-g502 rate 1000              125, 250, 500 or 1000 Hz
+g502 rate 1000              125/250/500/1000 Hz, written to the active profile
+g502 rate 1000 --live       set it live instead (host mode, not persistent)
+g502 mode onboard           hand the mouse back after live lighting
+g502 button                 list bindings
+g502 button 10 dpi-cycle    rebind a button (writes flash)
+g502 watch                  per-application profile switching
 g502 profile 2              switch the active onboard profile
 g502 profile show 0         decode a stored profile, buttons and all
 g502 led cyan               solid colour, both zones
@@ -87,6 +92,7 @@ g502 restore mouse.json
 | `src/profile_blob.rs` | The 256-byte profile sector codec and its CRC |
 | `src/profile_io.rs` | Flash writes with readback verification, backup and restore |
 | `src/effects.rs` | Host-side animation |
+| `src/appwatch.rs` | Per-application profile rules, debounced, /proc based |
 | `src/device.rs` | Worker thread owning the device, so the UI never blocks on I/O |
 | `src/gui/` | egui front end |
 
@@ -94,8 +100,26 @@ g502 restore mouse.json
 probed from the device or taken from libratbag. Start there rather than reading
 the code if you want to port this elsewhere.
 
+Everything above the protocol layer has been exercised against a real G502
+HERO: reads, DPI and rate changes, profile switching, live lighting, host-side
+effects, button rebinding and profile flash writes, each reverted afterwards
+and confirmed byte-identical to a backup taken first.
+
 `python-reference/` holds the original Python implementation. It is the
 validated reference the Rust was ported from, not something you need to run.
+
+### Per-application rules
+
+`g502 watch` reads `~/.config/g502/rules.conf` and writes an annotated example
+there on first run. One `pattern = profile[,dpi]` per line; the first match
+wins, so put specific patterns first.
+
+```
+csgo     = 1, 800
+blender  = 2
+fallback = 0
+poll_ms  = 1000
+```
 
 ## Limitations
 
@@ -115,6 +139,20 @@ These are properties of the hardware, not things left to do.
 * **`getZoneEffect` is not implemented** on this device (`ext_caps` 0x0000). It
   answers with zeros rather than an error, so a zero readback says nothing
   about whether a write landed. Confirm lighting by eye.
+* **Only fixed and breathing can be set live.** `setZoneEffect` addresses
+  effects by the zone's *effect index*, not the mode id, and this firmware
+  rejects index 0 (off) and index 3 (cycle) under every parameter layout
+  tested. Live "off" is therefore a fixed black, and live cycling has to be
+  streamed from the host. Both modes are still storable in a profile sector,
+  which uses mode ids rather than indices — two number spaces that are easy to
+  conflate.
+* **The report rate cannot be set live in onboard mode** — the device answers
+  `invalid argument`. `g502 rate` therefore writes it into the active profile,
+  which is also the only way to make it persist. `--live` takes host mode
+  instead.
+* **Per-application switching matches running processes, not the focused
+  window.** Wayland does not let an ordinary process see the active window, so
+  a rule means "while this program is open".
 * **Surface tuning, lift-off distance and angle snapping are out of scope.**
   They are not standalone HID++ features here — G HUB drives them through the
   `engineering`-flagged `TDE_ACCESS` (0x1eb0) and `SPI_DIRECT_ACCESS` (0x1e22),
@@ -134,8 +172,8 @@ These are properties of the hardware, not things left to do.
 | Lighting: off, fixed, breathing, cycle, both zones | working |
 | Host-streamed effects | working |
 | Profile decode, backup, restore | working |
-| Profile flash writes | implemented, readback-verified |
+| Profile flash writes | working, readback-verified on hardware |
 | GUI: sensor, lighting, profiles, buttons | working |
-| Button rebinding from the GUI | not implemented |
-| Per-application profile switching | in `python-reference/`, not yet ported |
+| Button rebinding, CLI and GUI | working |
+| Per-application profile switching | working |
 | Surface tuning / lift-off / DFU | out of scope, see above |

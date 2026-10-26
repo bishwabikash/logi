@@ -34,6 +34,7 @@ pub enum Cmd {
     StopEffect,
     Backup(String),
     WriteProfile { index: u8, profile: Box<Profile> },
+    SetButton { index: u8, button: u8, binding: crate::profile_blob::Button },
 }
 
 /// A snapshot of device state for the UI to render. Cheap to clone.
@@ -243,6 +244,13 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
                     })
                     .and_then(|_| l.profiles.set_mode(&mut l.dev, MODE_ONBOARD))
                     .map(|_| Some("stored to onboard profile (survives unplug)".into()))
+            }
+            Cmd::SetButton { index, button, binding } => {
+                profile_io::set_button(&mut l.dev, &l.profiles, index, button, binding)
+                    .map(|_| Some(format!(
+                        "button {button} -> {} (profile {index}, flash)",
+                        binding.describe()
+                    )))
             }
             Cmd::WriteProfile { index, profile } => {
                 profile_io::write_profile(&mut l.dev, &l.profiles, index, &profile)

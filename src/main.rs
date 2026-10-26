@@ -3,6 +3,7 @@
 //! Run with no arguments to open the GUI; subcommands give the same control
 //! from a shell.
 
+mod appwatch;
 mod device;
 mod discover;
 mod dpi;
@@ -24,12 +25,19 @@ g502 — control a Logitech G502 HERO over HID++ 2.0
   g502                        open the graphical app
   g502 info                   capabilities and current state
   g502 dpi [<n>]              show or set DPI (continuous, snapped to the step)
-  g502 rate [<hz>]            show or set the report rate
+  g502 rate [<hz>] [--live]   show or set the report rate; persists to the
+                              active profile unless --live is given
+  g502 button [<n> <action>]   show or rebind buttons (writes flash)
+  g502 mode [onboard|host]    show or set who drives the mouse. Live lighting
+                              needs host; onboard hands it back so its stored
+                              profile applies with nothing running.
   g502 profile [<n>]          show or switch the active onboard profile
   g502 profile show <n>       decode one stored profile
   g502 led <spec>             lighting, live (needs host mode)
                                 off | <colour> | breathing <colour> | cycle
   g502 effect [list|<name>]   stream a host-side animation until Ctrl-C
+  g502 watch [--dry-run]      switch profiles per running application, from
+                              ~/.config/g502/rules.conf
   g502 backup <file>          dump every sector to JSON
   g502 restore <file>         write a backup back to flash
   g502 --help
@@ -97,8 +105,11 @@ fn run(args: &[String]) -> Result<(), CliError> {
         }
         "info" => cmd_info(),
         "dpi" => cmd_dpi(args.get(1)),
-        "rate" => cmd_rate(args.get(1)),
+        "rate" => cmd_rate(&args[1..]),
         "profile" => cmd_profile(&args[1..]),
+        "button" => cmd_button(&args[1..]),
+        "mode" => cmd_mode(args.get(1)),
+        "watch" => cmd_watch(&args[1..]),
         "led" => cmd_led(&args[1..]),
         "effect" => cmd_effect(&args[1..]),
         "backup" => {
@@ -207,21 +218,103 @@ fn cmd_dpi(arg: Option<&String>) -> Result<(), CliError> {
     }
 }
 
-fn cmd_rate(arg: Option<&String>) -> Result<(), CliError> {
+fn cmd_rate(args: &[String]) -> Result<(), CliError> {
     let (mut dev, _) = open()?;
     let r = rate::ReportRate::new(&mut dev)?;
-    match arg {
+    let live = args.iter().any(|a| a == "--live");
+    let value = args.iter().find(|a| !a.starts_with("--"));
+    match value {
         None => {
             println!("{}", r.get(&mut dev)?);
             Ok(())
         }
         Some(v) => {
             let hz: u16 = v.parse().map_err(|_| CliError::Usage(format!("bad rate {v:?}")))?;
-            r.set(&mut dev, hz)?;
-            println!("{hz}");
+            let ok = r.supported(&mut dev)?;
+            if !ok.contains(&hz) {
+                return Err(CliError::Usage(format!("{hz} Hz unsupported; have {ok:?}")));
+            }
+            if live {
+                // 0x8060 is rejected in onboard mode, so take host mode first.
+                let p = profiles::OnboardProfiles::new(&mut dev)?;
+                p.set_mode(&mut dev, profiles::MODE_HOST)?;
+                r.set(&mut dev, hz)?;
+                println!("{hz} (live; host mode, lost when the mouse returns to onboard)");
+            } else {
+                let p = profiles::OnboardProfiles::new(&mut dev)?;
+                let idx = p.current(&mut dev)?;
+                profile_io::set_report_rate(&mut dev, &p, idx, hz)?;
+                println!("{hz} (written to onboard profile {idx})");
+            }
             Ok(())
         }
     }
+}
+
+fn cmd_mode(arg: Option<&String>) -> Result<(), CliError> {
+    let (mut dev, _) = open()?;
+    let p = profiles::OnboardProfiles::new(&mut dev)?;
+    match arg.map(|s| s.as_str()) {
+        None => {
+            let m = p.mode(&mut dev)?;
+            println!("{m} ({})", profiles::mode_name(m));
+            Ok(())
+        }
+        Some("onboard") => {
+            p.set_mode(&mut dev, profiles::MODE_ONBOARD)?;
+            println!("onboard: the mouse drives itself from its stored profile");
+            Ok(())
+        }
+        Some("host") => {
+            p.set_mode(&mut dev, profiles::MODE_HOST)?;
+            println!("host: live lighting works; the stored profile is not applied");
+            Ok(())
+        }
+        Some(o) => Err(CliError::Usage(format!("mode must be onboard or host, got {o:?}"))),
+    }
+}
+
+fn cmd_button(args: &[String]) -> Result<(), CliError> {
+    let (mut dev, _) = open()?;
+    let p = profiles::OnboardProfiles::new(&mut dev)?;
+    let idx = p.current(&mut dev)?;
+    if args.is_empty() {
+        let blob = p.read_sector(&mut dev, idx as u16 + 1, None)?;
+        let prof = profile_blob::Profile::parse(&blob).map_err(CliError::Failed)?;
+        println!("profile {idx}:");
+        for (i, b) in prof.buttons.iter().take(p.info.button_count as usize).enumerate() {
+            println!("  {i:2}  {}", b.describe());
+        }
+        println!("\nbind with: g502 button <n> <action>");
+        println!("actions: button <1-16> | {} | disabled",
+                 profile_blob::SPECIALS.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | "));
+        return Ok(());
+    }
+    let n: u8 = args[0].parse().map_err(|_| CliError::Usage("button needs an index".into()))?;
+    let action = args.get(1).ok_or_else(|| CliError::Usage("button needs an action".into()))?;
+    let binding = match action.as_str() {
+        "disabled" | "none" => profile_blob::Button::disabled(),
+        "button" => {
+            let m: u8 = args
+                .get(2)
+                .ok_or_else(|| CliError::Usage("button <n> button <1-16>".into()))?
+                .parse()
+                .map_err(|_| CliError::Usage("bad mouse button number".into()))?;
+            if !(1..=16).contains(&m) {
+                return Err(CliError::Usage("mouse button must be 1-16".into()));
+            }
+            profile_blob::Button::mouse(m)
+        }
+        special => profile_blob::Button::special(special).ok_or_else(|| {
+            CliError::Usage(format!(
+                "unknown action {special:?}; have: {} | button <n> | disabled",
+                profile_blob::SPECIALS.iter().map(|(_, n)| *n).collect::<Vec<_>>().join(" | ")
+            ))
+        })?,
+    };
+    profile_io::set_button(&mut dev, &p, idx, n, binding)?;
+    println!("button {n} -> {} (profile {idx}, written to flash)", binding.describe());
+    Ok(())
 }
 
 fn cmd_profile(args: &[String]) -> Result<(), CliError> {
@@ -276,10 +369,8 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
         match args[0].as_str() {
             "off" => l.all_off(&mut dev),
             "cycle" => {
-                for z in 0..l.zone_count {
-                    l.cycle(&mut dev, z, 8000, 100)?;
-                }
-                Ok(())
+                // Returns a message explaining the two working routes.
+                l.cycle(&mut dev, 0, 8000, 100)
             }
             "breathing" => {
                 let c = led::parse_color(args.get(1).map(|s| s.as_str()).unwrap_or("cyan"))?;
@@ -295,8 +386,10 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
         }
     })();
     r?;
-    println!("applied (live; host mode). It is lost on unplug — use the GUI's");
-    println!("\"Store to onboard profile\" to make it persist.");
+    println!("applied (live, host mode).");
+    println!("This is lost on unplug, and the mouse stays in host mode until you run");
+    println!("`g502 mode onboard`. To make lighting persist instead, store it into the");
+    println!("onboard profile from the GUI's Lighting tab.");
     Ok(())
 }
 
@@ -350,6 +443,85 @@ fn install_interrupt_handler() {
         libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_interrupt as *const () as libc::sighandler_t);
     }
+}
+
+fn cmd_watch(args: &[String]) -> Result<(), CliError> {
+    let dry = args.iter().any(|a| a == "--dry-run");
+    let path = appwatch::config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| CliError::Failed(format!("creating {}: {e}", dir.display())))?;
+            }
+            std::fs::write(&path, appwatch::EXAMPLE_RULES)
+                .map_err(|e| CliError::Failed(format!("writing {}: {e}", path.display())))?;
+            println!("Wrote an example rule file to {}.", path.display());
+            println!("Edit it, then run `g502 watch` again. Nothing to do until it has rules.");
+            return Ok(());
+        }
+        Err(e) => return Err(CliError::Failed(format!("reading {}: {e}", path.display()))),
+    };
+    let (cfg, problems) = appwatch::parse_rules(&text);
+    for p in &problems {
+        eprintln!("g502: {}: {p}", path.display());
+    }
+    if cfg.rules.is_empty() && cfg.fallback.is_none() {
+        return Err(CliError::Failed(format!(
+            "{} has no rules yet; edit it and try again",
+            path.display()
+        )));
+    }
+
+    let (mut dev, model) = open()?;
+    let profiles = profiles::OnboardProfiles::new(&mut dev)?;
+    let dpi = dpi::Dpi::new(&mut dev).ok();
+
+    // A rule naming a profile the device does not have would fail silently
+    // every time it matched, so say so once at startup instead.
+    let have = profiles.info.profile_count;
+    for p in appwatch::referenced_profiles(&cfg) {
+        if p >= have {
+            eprintln!("g502: warning: rules reference profile {p}, device has 0..{}", have - 1);
+        }
+    }
+
+    println!("watching {model}: {} rule(s), poll {:?}{}",
+             cfg.rules.len(), cfg.poll, if dry { ", dry run" } else { "" });
+    for r in &cfg.rules {
+        println!("  {:<24} -> profile {}{}", r.pattern, r.profile,
+                 r.dpi.map(|d| format!(" + {d} dpi")).unwrap_or_default());
+    }
+    println!("Ctrl-C to stop.");
+
+    install_interrupt_handler();
+    let poll = cfg.poll;
+    let mut watcher = appwatch::Watcher::new(cfg);
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        let procs = appwatch::scan_processes();
+        let decision = watcher.tick(&procs, std::time::Instant::now());
+        if let appwatch::Decision::Switch { profile, dpi: want, .. } = &decision {
+            if let Some(msg) = appwatch::describe(&decision) {
+                println!("{}{}", if dry { "would apply " } else { "applying " }, msg);
+            }
+            if !dry {
+                if let Err(e) = profiles.set_current(&mut dev, *profile) {
+                    eprintln!("g502: switching to profile {profile}: {e}");
+                    // Let the next match try again rather than believing it stuck.
+                    watcher.invalidate();
+                }
+                if let (Some(d), Some(v)) = (dpi.as_ref(), want) {
+                    if let Err(e) = d.set(&mut dev, *v, 0) {
+                        eprintln!("g502: setting {v} dpi: {e}");
+                    }
+                }
+            }
+        }
+        std::thread::sleep(poll);
+    }
+    println!("\nstopped");
+    Ok(())
 }
 
 fn cmd_backup(path: &str) -> Result<(), CliError> {

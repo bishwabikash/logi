@@ -53,6 +53,12 @@ Note libratbag only exposes 5 discrete stages; the hardware accepts any
 This device: **125 / 250 / 500 / 1000 Hz**. `getReportRate`/`setReportRate`
 take the interval in ms, not Hz.
 
+**`setReportRate` only works in host mode.** In onboard mode the rate comes
+from the active profile and the device answers `invalid argument`. A rate set
+live is also lost when the device returns to onboard mode, so to make one
+stick you write byte 0x00 of the profile sector instead. Verified both ways on
+the hardware. **[probed]**
+
 ## 0x8070 COLOR_LED_EFFECTS
 
 Functions: 0 getInfo, 1 getZoneInfo, 2 getZoneEffectInfo,
@@ -78,9 +84,39 @@ Only four effects are implemented in firmware — `off`, `fixed`, `breathing`,
 `cycling`. `WAVE`, `STARLIGHT`, `RIPPLE` and **`CUSTOM` (direct frame
 streaming)** are defined in the protocol but **absent on this device**. **[probed]**
 
-### setZoneEffect payload **[libratbag]**
+### setZoneEffect payload
 
-`[zone_index, mode, …10 bytes]` where `mode` is the effect id:
+`[zone_index, effect_index, …10 bytes]` — **twelve bytes total**. **[probed]**
+
+Byte 1 is the zone's **effect index**, not the mode id. This is easy to miss
+because they coincide for `FIXED` (index 1, id 1) and diverge for everything
+else: `BREATHING` is id `0x0a` at **index 2**. Sending the id returns
+`invalid argument`. Resolve the index from the zone's effect list
+(`getZoneEffectInfo`), which on this device is:
+
+| index | mode id | mode |
+|---|---|---|
+| 0 | 0x00 | off |
+| 1 | 0x01 | fixed |
+| 2 | 0x0a | breathing |
+| 3 | 0x03 | cycle |
+
+**Only indices 1 and 2 are settable live.** Index 0 (off) and index 3 (cycle)
+are rejected with `invalid argument` under every parameter layout tried —
+period big- and little-endian, 992/2000/4000/8000 ms, intensity 0/50/100, and
+the period at four different offsets. So live "off" has to be a fixed black,
+and live cycling has to be streamed from the host. **[probed]**
+
+Both modes are nonetheless storable in a profile sector, which uses **mode
+ids**, not indices: writing `0x03` into an LED record and reading it back
+works and the device honours it. The two number spaces are easy to conflate —
+the live path takes indices, the flash path takes ids. **[probed]**
+
+The per-mode parameter layout below is the `hidpp20_internal_led` union, and
+applies to the flash records; the live path uses the same parameter bytes
+after its index byte. **[libratbag]**
+
+Modes and their ids:
 
     OFF 0x00   FIXED 0x01   CYCLE 0x03   WAVE 0x04
     STARLIGHT 0x05   BREATHING 0x0A   RIPPLE 0x0B   CUSTOM 0x0C
@@ -127,6 +163,11 @@ the switch G HUB flips for its software effects. Restore mode 1 when done or
 the mouse stays dependent on the host. **[probed]**
 
 Mode 0 is invalid; the firmware rejects it harmlessly. **[probed]**
+
+Switching modes needs a settle delay before the device honours writes in the
+new mode. 50 ms was marginal — a lighting write issued immediately after the
+switch intermittently returned `invalid argument`. 150 ms was reliable across
+repeated runs. **[probed]**
 
 ## Not covered
 

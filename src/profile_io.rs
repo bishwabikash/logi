@@ -283,3 +283,61 @@ mod tests {
         assert!(dump_from_json("{\n\"0\": \"abc\"\n}").is_err());
     }
 }
+
+/// Store a report rate into a profile's flash sector.
+///
+/// The live 0x8060 setter only works in host mode and is lost when the device
+/// returns to onboard mode, so this is the path that actually makes a rate
+/// stick. Byte 0x00 of the sector is the interval in milliseconds.
+pub fn set_report_rate(
+    dev: &mut Device,
+    profiles: &OnboardProfiles,
+    index: u8,
+    hz: u16,
+) -> Result<u16> {
+    let ms = crate::rate::ReportRate::interval_ms(hz)?;
+    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
+    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    if p.report_rate_ms == ms {
+        return Ok(hz);
+    }
+    p.report_rate_ms = ms;
+    write_profile(dev, profiles, index, &p)?;
+    Ok(hz)
+}
+
+/// Store a button binding into a profile's flash sector.
+pub fn set_button(
+    dev: &mut Device,
+    profiles: &OnboardProfiles,
+    index: u8,
+    button: u8,
+    binding: crate::profile_blob::Button,
+) -> Result<()> {
+    if button >= profiles.info.button_count {
+        return Err(Error::Protocol(format!(
+            "button {button} out of range 0..{}",
+            profiles.info.button_count - 1
+        )));
+    }
+    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
+    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    p.buttons[button as usize] = binding;
+    write_profile(dev, profiles, index, &p)?;
+    Ok(())
+}
+
+/// Store lighting into a profile's flash sector, both zones and their alts.
+pub fn set_lighting(
+    dev: &mut Device,
+    profiles: &OnboardProfiles,
+    index: u8,
+    leds: [crate::profile_blob::Led; 2],
+) -> Result<()> {
+    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
+    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    p.leds = leds;
+    p.alt_leds = leds;
+    write_profile(dev, profiles, index, &p)?;
+    Ok(())
+}
