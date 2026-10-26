@@ -1,0 +1,442 @@
+//! 0x8110 MOUSE_BUTTON_SPY — report physical buttons to the host, and stop
+//! them acting on their own.
+//!
+//! See PROTOCOL.md. Two things about this feature are worth stating up front:
+//!
+//!   * The remapping table is dangerous state. Writing zeros to all of it
+//!     unmaps every button: the mouse still moves but nothing clicks, in
+//!     either memory mode, and it survives unplugging. That happened during
+//!     development. So `set_remapping` refuses an all-zero table, `new()`
+//!     captures the table before anything else so there is always something to
+//!     restore, and `restore_identity` exists to dig a device out of that hole.
+//!   * Function 1 is `startSpy`, not a getter, and function 4 is a setter.
+//!     Never sweep this feature's functions with empty parameters.
+//!
+//! Binding a button to a host action is two independent steps: `start` makes
+//! the device report presses, and `silence` stops the chosen buttons also
+//! doing their physical job. Silencing without listening leaves a dead button;
+//! listening without silencing gives both behaviours at once, which is what
+//! you want for a button that keeps its click.
+
+use crate::features;
+use crate::hidpp::{Device, Error, Result, LONG_REPORT};
+
+const GET_NB_OF_BUTTONS: u8 = 0x00;
+const START_SPY: u8 = 0x01;
+const STOP_SPY: u8 = 0x02;
+const GET_REMAPPING: u8 = 0x03;
+const SET_REMAPPING: u8 = 0x04;
+
+/// A long report's payload is 16 bytes, so the table cannot exceed that.
+pub const MAX_BUTTONS: u8 = 16;
+
+/// The factory default table: button n maps to itself. Only the first
+/// `button_count` bytes are ever read or written; the tail is padding so this
+/// can be a constant.
+pub const IDENTITY: [u8; 16] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+];
+
+pub struct ButtonSpy {
+    idx: u8,
+    count: u8,
+    saved: Vec<u8>,
+}
+
+impl ButtonSpy {
+    /// Read the button count and snapshot the remapping table.
+    ///
+    /// The snapshot happens before anything else is sent, so a later
+    /// `restore` always has a target. The snapshot is run through the write
+    /// gate and replaced by IDENTITY if it fails it: a table the gate would
+    /// refuse is not a restore target at all, and a device already zeroed by
+    /// something else must not have that state preserved and written back.
+    pub fn new(dev: &mut Device) -> Result<Self> {
+        let idx = dev.feature_index(features::MOUSE_BUTTON_SPY)?;
+        let p = dev.call(idx, GET_NB_OF_BUTTONS, &[])?;
+        let count = p.first().copied().unwrap_or(0);
+        if count == 0 || count > MAX_BUTTONS {
+            return Err(Error::Protocol(format!(
+                "0x8110 reports {count} buttons, which cannot be right"
+            )));
+        }
+        let mut me = ButtonSpy { idx, count, saved: Vec::new() };
+        let live = me.get_remapping(dev)?;
+        me.saved = restorable(live, count);
+        Ok(me)
+    }
+
+    /// The feature index on this device. Events carry it in byte 2; it is not
+    /// the same number on every model.
+    pub fn feature_index(&self) -> u8 {
+        self.idx
+    }
+
+    pub fn button_count(&self) -> u8 {
+        self.count
+    }
+
+    /// The remapping table as it was when new() ran. The restore target.
+    pub fn saved_remapping(&self) -> &[u8] {
+        &self.saved
+    }
+
+    pub fn start(&self, dev: &mut Device) -> Result<()> {
+        dev.call(self.idx, START_SPY, &[])?;
+        Ok(())
+    }
+
+    pub fn stop(&self, dev: &mut Device) -> Result<()> {
+        let r = dev.call(self.idx, STOP_SPY, &[]);
+        // Events already in the kernel queue would otherwise be read as if the
+        // spy were still running. Drain even when the call failed: that is the
+        // case where the spy is most likely still sending.
+        dev.drain();
+        r.map(|_| ())
+    }
+
+    pub fn get_remapping(&self, dev: &mut Device) -> Result<Vec<u8>> {
+        let p = dev.call(self.idx, GET_REMAPPING, &[])?;
+        if p.len() < self.count as usize {
+            return Err(Error::Protocol(format!(
+                "getRemapping returned {} bytes for {} buttons",
+                p.len(),
+                self.count
+            )));
+        }
+        Ok(p[..self.count as usize].to_vec())
+    }
+
+    /// Write the table. Refuses anything that looks like the write that
+    /// unmaps the whole mouse.
+    ///
+    /// An error from here does not mean the table is unchanged: the device can
+    /// apply a write whose reply is then lost to the timeout. Treat a failure
+    /// as "the table is now unknown" and `restore`.
+    pub fn set_remapping(&self, dev: &mut Device, table: &[u8]) -> Result<()> {
+        check_table(table, self.count)?;
+        dev.call(self.idx, SET_REMAPPING, table)?;
+        Ok(())
+    }
+
+    /// Stop the listed buttons acting physically, leaving the rest untouched,
+    /// so only the host sees them.
+    ///
+    /// Built on the device's live table rather than the saved one, so
+    /// silencing a second button does not un-silence the first. A live table
+    /// the gate would refuse — all zeros, or entries this device cannot have —
+    /// is not a base to build on, so the saved table is used instead of
+    /// spreading the damage.
+    ///
+    /// The table is validated before anything is sent, and if the write itself
+    /// fails the saved table is put back: a lost reply can hide a write that
+    /// landed, and a button left dead is worse than one left un-silenced.
+    pub fn silence(&self, dev: &mut Device, buttons: &[u8]) -> Result<()> {
+        check_buttons(buttons, self.count)?;
+        // Nothing asked for, so nothing written: this table is not state to
+        // rewrite for the sake of it.
+        if buttons.is_empty() {
+            return Ok(());
+        }
+        let live = self.get_remapping(dev)?;
+        let base = if check_table(&live, self.count).is_ok() { &live } else { &self.saved };
+        let want = silence_table(base, buttons);
+        check_table(&want, self.count)?;
+        if let Err(e) = self.set_remapping(dev, &want) {
+            let _ = self.restore(dev);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Put the table back to what new() saved. Must be callable repeatedly,
+    /// and cannot be refused by the gate: new() only ever saves a table the
+    /// gate accepts.
+    pub fn restore(&self, dev: &mut Device) -> Result<()> {
+        self.set_remapping(dev, &self.saved)
+    }
+
+    /// Force the factory identity table, for recovering a device whose table
+    /// was zeroed by something else.
+    pub fn restore_identity(&self, dev: &mut Device) -> Result<()> {
+        self.set_remapping(dev, &IDENTITY[..self.count as usize])
+    }
+}
+
+/// Zero the named buttons, keep every other byte byte-for-byte.
+///
+/// Buttons are 1-based, so button 0 has no slot. `checked_sub` rather than
+/// `- 1` because an unguarded caller would otherwise underflow and panic.
+fn silence_table(base: &[u8], buttons: &[u8]) -> Vec<u8> {
+    let mut t = base.to_vec();
+    for b in buttons {
+        if let Some(slot) = (*b as usize).checked_sub(1).and_then(|i| t.get_mut(i)) {
+            *slot = 0;
+        }
+    }
+    t
+}
+
+/// Pick a table that `restore` can always write: the device's own if the gate
+/// accepts it, else the factory identity.
+fn restorable(live: Vec<u8>, count: u8) -> Vec<u8> {
+    if check_table(&live, count).is_ok() {
+        live
+    } else {
+        IDENTITY[..count as usize].to_vec()
+    }
+}
+
+/// The gate in front of every write to the remapping table.
+fn check_table(table: &[u8], count: u8) -> Result<()> {
+    if table.len() != count as usize {
+        return Err(Error::Protocol(format!(
+            "remapping table is {} bytes, device has {count} buttons",
+            table.len()
+        )));
+    }
+    if table.iter().all(|b| *b == 0) {
+        return Err(Error::Protocol(
+            "refusing to write an all-zero remapping table: that unmaps every \
+             button on the mouse, in both memory modes, and survives \
+             unplugging. Name the buttons to silence instead."
+                .into(),
+        ));
+    }
+    if let Some(bad) = table.iter().find(|b| **b > count) {
+        return Err(Error::Protocol(format!(
+            "remapping entry {bad} is not a button on a {count}-button device"
+        )));
+    }
+    Ok(())
+}
+
+fn check_buttons(buttons: &[u8], count: u8) -> Result<()> {
+    if let Some(bad) = buttons.iter().find(|b| **b == 0 || **b > count) {
+        return Err(Error::Protocol(format!(
+            "button {bad}: this device has buttons 1..{count}"
+        )));
+    }
+    Ok(())
+}
+
+/// Decode one unsolicited report into the pressed-button bitmap.
+/// Returns None if this report is not a spy event for this feature index.
+///
+/// The device index in byte 1 is deliberately not checked: it is 0xff wired
+/// but 1..6 behind a receiver, and the caller knows which device it opened.
+pub fn decode_event(report: &[u8], feature_index: u8) -> Option<u16> {
+    // Header plus the two bitmap bytes.
+    if report.len() < 6 {
+        return None;
+    }
+    if report[0] != LONG_REPORT || report[2] != feature_index {
+        return None;
+    }
+    // Byte 3 is (function or event id) << 4 | software id. A reply always
+    // carries a nonzero software id in the low nibble, so that nibble alone
+    // separates event from reply; the high nibble is checked too because an
+    // event id other than 0 would be some other 0x8110 event, whose payload is
+    // not a button bitmap.
+    if report[3] != 0 {
+        return None;
+    }
+    Some(u16::from_be_bytes([report[4], report[5]]))
+}
+
+/// Edge-detect between two bitmaps. Returns (newly pressed, newly released)
+/// as 1-based button numbers.
+pub fn transitions(prev: u16, now: u16) -> (Vec<u8>, Vec<u8>) {
+    (bits(now & !prev), bits(prev & !now))
+}
+
+/// Set bits as 1-based button numbers, lowest first.
+fn bits(mask: u16) -> Vec<u8> {
+    (0..16).filter(|i| mask & (1 << i) != 0).map(|i| i + 1).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The real factory table off a G502 HERO, 11 buttons.
+    fn factory() -> Vec<u8> {
+        vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b]
+    }
+
+    #[test]
+    fn identity_prefix_is_the_factory_table() {
+        assert_eq!(&IDENTITY[..11], factory().as_slice());
+    }
+
+    #[test]
+    fn decodes_the_real_button_one_event() {
+        // 11 ff 0d 00 | 00 01 00 00
+        let r = [0x11, 0xff, 0x0d, 0x00, 0x00, 0x01, 0x00, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), Some(0x0001));
+    }
+
+    #[test]
+    fn decodes_the_real_all_released_event() {
+        let r = [0x11, 0xff, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), Some(0x0000));
+    }
+
+    #[test]
+    fn bitmap_is_big_endian() {
+        // Button 9 is bit 8, which lands in the first payload byte.
+        let r = [0x11, 0xff, 0x0d, 0x00, 0x01, 0x00, 0x00, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), Some(0x0100));
+        assert_eq!(transitions(0, 0x0100).0, vec![9]);
+    }
+
+    #[test]
+    fn rejects_short_report_id() {
+        let r = [0x10, 0xff, 0x0d, 0x00, 0x00, 0x01, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), None);
+    }
+
+    #[test]
+    fn rejects_another_features_event() {
+        let r = [0x11, 0xff, 0x0e, 0x00, 0x00, 0x01, 0x00, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), None);
+    }
+
+    #[test]
+    fn rejects_a_reply_carrying_a_software_id() {
+        // getRemapping's own answer: function 3, software id 8.
+        let r = [0x11, 0xff, 0x0d, 0x38, 0x01, 0x02, 0x03, 0x04];
+        assert_eq!(decode_event(&r, 0x0d), None);
+    }
+
+    #[test]
+    fn rejects_a_truncated_report() {
+        let r = [0x11, 0xff, 0x0d, 0x00, 0x00];
+        assert_eq!(decode_event(&r, 0x0d), None);
+        assert_eq!(decode_event(&[], 0x0d), None);
+    }
+
+    #[test]
+    fn press_and_release_are_single_edges() {
+        assert_eq!(transitions(0x0000, 0x0001), (vec![1], vec![]));
+        assert_eq!(transitions(0x0001, 0x0000), (vec![], vec![1]));
+    }
+
+    #[test]
+    fn no_change_is_no_edge() {
+        assert_eq!(transitions(0x0005, 0x0005), (vec![], vec![]));
+        assert_eq!(transitions(0, 0), (vec![], vec![]));
+    }
+
+    #[test]
+    fn simultaneous_buttons_edge_independently() {
+        // 1 and 3 held, then 3 released and 11 pressed.
+        let (down, up) = transitions(0b0000_0101, 0b0100_0000_0001);
+        assert_eq!(down, vec![11]);
+        assert_eq!(up, vec![3]);
+    }
+
+    #[test]
+    fn all_released_reports_everything_held() {
+        let (down, up) = transitions(0b0000_0000_0001_0011, 0);
+        assert!(down.is_empty());
+        assert_eq!(up, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn silencing_touches_only_the_named_buttons() {
+        assert_eq!(
+            silence_table(&factory(), &[6, 7]),
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0x00, 0x08, 0x09, 0x0a, 0x0b]
+        );
+    }
+
+    #[test]
+    fn silencing_is_cumulative_over_a_live_table() {
+        let once = silence_table(&factory(), &[11]);
+        assert_eq!(
+            silence_table(&once, &[6]),
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x00, 0x07, 0x08, 0x09, 0x0a, 0x00]
+        );
+    }
+
+    #[test]
+    fn silencing_nothing_changes_nothing() {
+        assert_eq!(silence_table(&factory(), &[]), factory());
+    }
+
+    #[test]
+    fn button_zero_does_not_underflow() {
+        // 0 - 1 as a usize would panic in a debug build.
+        assert_eq!(silence_table(&factory(), &[0]), factory());
+        assert_eq!(silence_table(&factory(), &[0, 99]), factory());
+    }
+
+    #[test]
+    fn a_usable_live_table_is_the_restore_target() {
+        assert_eq!(restorable(factory(), 11), factory());
+        let silenced = silence_table(&factory(), &[6]);
+        assert_eq!(restorable(silenced.clone(), 11), silenced);
+    }
+
+    #[test]
+    fn an_unwritable_live_table_falls_back_to_identity() {
+        // Zeroed by somebody else: keeping it would make restore re-break the
+        // mouse.
+        assert_eq!(restorable(vec![0u8; 11], 11), factory());
+        // And a table the gate would refuse for any other reason is no
+        // restore target either, or restore would fail forever.
+        let mut odd = factory();
+        odd[3] = 0x0c;
+        assert_eq!(restorable(odd, 11), factory());
+        assert_eq!(restorable(vec![1, 2, 3], 11), factory());
+    }
+
+    #[test]
+    fn every_restore_target_passes_the_gate() {
+        for live in [factory(), vec![0u8; 11], vec![0xff; 11], vec![], vec![1, 2]] {
+            check_table(&restorable(live, 11), 11).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_all_zero_table_is_refused() {
+        let e = check_table(&[0u8; 11], 11).unwrap_err();
+        assert!(format!("{e}").contains("unmaps every button"));
+    }
+
+    #[test]
+    fn silencing_every_button_is_refused() {
+        let all: Vec<u8> = (1..=11).collect();
+        let t = silence_table(&factory(), &all);
+        assert!(check_table(&t, 11).is_err(), "that write is what broke a real mouse");
+    }
+
+    #[test]
+    fn a_partially_zeroed_table_is_allowed() {
+        check_table(&silence_table(&factory(), &[6, 7]), 11).unwrap();
+        check_table(&factory(), 11).unwrap();
+    }
+
+    #[test]
+    fn wrong_length_tables_are_refused() {
+        assert!(check_table(&factory(), 16).is_err());
+        assert!(check_table(&IDENTITY, 11).is_err());
+    }
+
+    #[test]
+    fn entries_outside_the_button_range_are_refused() {
+        let mut t = factory();
+        t[0] = 0x0c;
+        assert!(check_table(&t, 11).is_err());
+    }
+
+    #[test]
+    fn button_numbers_are_validated_against_the_count() {
+        assert!(check_buttons(&[1, 11], 11).is_ok());
+        assert!(check_buttons(&[0], 11).is_err(), "buttons are 1-based");
+        assert!(check_buttons(&[12], 11).is_err());
+        assert!(check_buttons(&[], 11).is_ok());
+    }
+}

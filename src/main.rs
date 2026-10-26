@@ -3,7 +3,9 @@
 //! Run with no arguments to open the GUI; subcommands give the same control
 //! from a shell.
 
+mod actions;
 mod appwatch;
+mod buttonspy;
 mod capabilities;
 mod deviceinfo;
 mod device;
@@ -18,6 +20,7 @@ mod profile_blob;
 mod profile_io;
 mod profiles;
 mod rate;
+mod uinput;
 
 use hidpp::Error;
 
