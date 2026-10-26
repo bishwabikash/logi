@@ -220,3 +220,58 @@ depot verification (`depot_verifier_rsa`), key rotation (`keymaster`,
 The remaining practical route is to let the installer do the download itself
 inside a throwaway Wine prefix. On this host that is blocked on i386 multiarch
 (`wine32` missing), which is a system-level change.
+
+## 0x8110 MOUSE_BUTTON_SPY
+
+Present on this device, reporting **11 buttons**. Functions:
+
+| func | name | notes |
+|---|---|---|
+| 0 | getNbOfButtons | returns 0x0b here |
+| 1 | startSpy | begins unsolicited button notifications |
+| 2 | stopSpy | |
+| 3 | getRemapping | 11 bytes, one per physical button |
+| 4 | **setRemapping** | **a setter — see the warning below** |
+
+**[probed]**
+
+### The remapping table, and a way to brick your buttons
+
+`getRemapping` returns eleven bytes whose default is the identity table
+`01 02 03 04 05 06 07 08 09 0a 0b`. Writing **zeros** to it with
+`setRemapping` unmaps every button: the mouse keeps moving, but no button does
+anything, in either memory mode. It survives a mode change, so it looks exactly
+like the device being broken.
+
+This is easy to do by accident. Probing a feature by calling its functions
+`0..n` with empty parameters sends `setRemapping` a table of zeros. The same
+trap exists at `0x8100` function 1, which is `setOnboardMode`, not a getter.
+**Do not sweep unknown HID++ functions with empty parameters.** Resolve what
+each function is first.
+
+To recover:
+
+    setRemapping(01 02 03 04 05 06 07 08 09 0a 0b)
+
+### Event format
+
+After `startSpy`, the device sends unsolicited long reports:
+
+    11 ff 0d 00 | 00 01 00 00     button 1 down
+    11 ff 0d 00 | 00 00 00 00     all released
+
+Byte 2 is the feature index, byte 3 is zero (event, no software id). The
+payload's first two bytes are a **big-endian u16 bitmap of pressed buttons**,
+bit 0 being button 1. **[probed]**
+
+## Memory mode does not affect input
+
+Worth stating because it is easy to assume otherwise: a G502 in host mode
+reports movement and button presses exactly as it does in onboard mode.
+Measured by alternating modes while using the mouse and counting kernel input
+events: onboard 1261, host 3273, onboard 4960, with buttons registering in all
+three. **[probed]**
+
+What host mode changes is that the stored profile is not applied, so lighting
+is whatever the host last pushed, and the live `0x8070` and `0x8060` setters
+start working. Nothing else. **[probed]**

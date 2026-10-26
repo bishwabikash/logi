@@ -11,7 +11,7 @@ G=./target/release/g502
 EV=$(grep -A5 'Name="Logitech G502 HERO Gaming Mouse"' /proc/bus/input/devices \
      | grep -m1 Handlers | grep -o 'event[0-9]*')
 [ -z "$EV" ] && { echo "could not find the mouse's event node"; exit 1; }
-echo "watching /dev/$EV"
+echo "watching /dev/input/$EV"
 
 restore() { echo; echo "restoring onboard mode..."; $G mode onboard; }
 trap restore EXIT INT TERM
@@ -42,10 +42,10 @@ echo
 echo "=== 1/2  ONBOARD mode (the baseline) ==="
 $G mode onboard >/dev/null
 echo "    MOVE the mouse and CLICK every button you can, for 8 seconds. Go:"
-watch_for "/dev/$EV" 8
+watch_for "/dev/input/$EV" 8
 
 echo
 echo "=== 2/2  HOST mode ==="
 $G mode host >/dev/null
 echo "    Do exactly the same again, for 8 seconds. Go:"
-watch_for "/dev/$EV" 8
+watch_for "/dev/input/$EV" 8

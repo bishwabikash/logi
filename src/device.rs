@@ -91,9 +91,9 @@ impl Handle {
 
     /// Put the mouse back into onboard mode, synchronously.
     ///
-    /// Host mode diverts the buttons to the host, so a mouse left in it has no
-    /// working click. That must never outlive the app, which means doing it
-    /// here rather than posting a command the worker might not reach.
+    /// Host mode leaves the stored profile unapplied, so the mouse would keep
+    /// whatever lighting this app last pushed after it exits. Done here rather
+    /// than as a command the worker might never reach.
     pub fn restore_onboard_blocking(&self) {
         if !self.host_held() {
             return;
