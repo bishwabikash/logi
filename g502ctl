@@ -1,320 +1,1129 @@
 #!/usr/bin/env python3
-"""g502ctl — control a Logitech G502 HERO over HID++ 2.0."""
+"""g502ctl — command-line control for the Logitech G502 HERO.
+
+A thin front end over the g502 package: every HID++ feature the library
+implements is reachable from here. Two things are worth knowing first.
+
+  * Live lighting (`led`, `effect`) only takes effect while the mouse is in
+    HOST mode, and the mode is restored when the command exits — so a live
+    effect lasts exactly as long as the process. `led ... --persist` writes
+    the effect into profile flash instead: it survives unplugging and needs
+    no running process. Every lighting command says which path it took.
+  * Writes to profile flash are CRC-checked before they go out. The firmware
+    rejects a sector with a bad CRC, so nothing is sent unless it validates.
+
+Exit codes: 0 success, 1 runtime failure, 2 usage error.
+"""
 from __future__ import annotations
 
 import argparse
+import contextlib
+import glob
+import json
+import os
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 
-from g502 import config as cfgmod
-from g502 import effects as fx
 from g502 import features as F
 from g502.discover import open_device
 from g502.dpi import Dpi
 from g502.hidpp import HidppError, HidppTimeout
-from g502.led import MODE_NAMES as LED_MODE_NAMES, Leds, parse_color
-from g502.profile_blob import Button, Led, Profile
-from g502.profiles import MODE_NAMES, OnboardProfiles
+from g502.led import MODE_NAMES as LED_MODE_NAMES
+from g502.led import WAVEFORMS, Leds, parse_color
+from g502.profile_blob import SECTOR_SIZE, Button, Led, Profile, crc_ccitt
+from g502.profiles import MODE_HOST, MODE_NAMES, OnboardProfiles
 from g502.rate import ReportRate
 
-
-def need_root() -> None:
-    import os
-    if os.geteuid() != 0:
-        sys.exit("g502ctl: needs root for raw HID access (try sudo), or install "
-                 "the udev rule: sudo ./install.sh udev")
+WATCH_UNIT = "g502-watch.service"
+DOC_FORMAT = 1  # version of the JSON documents this tool reads and writes
 
 
-def cmd_info(a) -> int:
-    d = open_device()
-    print(f"device   : {d.model} (046d:{d.pid:04x})")
-    print(f"endpoint : {d.path}")
-    print(f"HID++    : {'.'.join(map(str, d.protocol_version()))}")
+class Fail(Exception):
+    """Expected runtime failure: reported as one line, exit 1."""
+
+
+class Usage(Exception):
+    """Caller got the invocation wrong: exit 2."""
+
+
+# -- device --------------------------------------------------------------
+
+def _udev_hint() -> str:
+    """How to get access without sudo, naming the rule file actually shipped."""
+    rules = sorted(glob.glob(str(HERE / "packaging" / "*.rules")))
+    name = Path(rules[0]).name if rules else "99-logitech-g502.rules"
+    return (
+        f"no permission to open the mouse's hidraw node.\n"
+        f"  Install the udev rule, then re-plug the mouse:\n"
+        f"      sudo install -m 0644 packaging/{name} /etc/udev/rules.d/{name}\n"
+        f"      sudo udevadm control --reload-rules && sudo udevadm trigger\n"
+        f"  (or run ./install.sh udev, which does both)\n"
+        f"  The rule tags the node with uaccess, so your logged-in session\n"
+        f"  gets access and sudo is no longer needed. As a one-off: sudo g502ctl ..."
+    )
+
+
+@contextlib.contextmanager
+def opened():
+    """Resolve and open the device once, and always close it."""
     try:
-        dp = Dpi(d)
-        cap = dp.capability()
-        if cap["kind"] == "range":
-            print(f"dpi      : {dp.get()}  (range {cap['min']}-{cap['max']} "
-                  f"step {cap['step']})")
-        else:
-            print(f"dpi      : {dp.get()}  (choices {cap['values']})")
-    except (KeyError, HidppError, HidppTimeout):
-        pass
-    try:
-        rr = ReportRate(d)
-        print(f"rate     : {rr.get()} Hz  (supported {rr.supported()})")
-    except (KeyError, HidppError, HidppTimeout):
-        pass
-    op = OnboardProfiles(d)
-    print(f"mode     : {op.mode()} ({MODE_NAMES.get(op.mode(), '?')})")
-    print(f"profiles : {op.info.profile_count} + {op.info.profile_count_oob} ROM, "
-          f"active {op.current()}")
-    leds = Leds(d)
-    print(f"zones    : {leds.zone_count}")
-    for z in leds.zones:
-        modes = ", ".join(LED_MODE_NAMES.get(m, hex(m)) for m in z.modes)
-        print(f"  zone {z.index}: {z.location_name:<16} modes=[{modes}]")
-    d.close()
-    return 0
-
-
-def cmd_dpi(a) -> int:
-    d = open_device()
-    dp = Dpi(d)
-    if a.value is None:
-        print(dp.get())
-    else:
-        print(f"dpi set to {dp.set(a.value)}")
-    d.close()
-    return 0
-
-
-def cmd_rate(a) -> int:
-    d = open_device()
-    rr = ReportRate(d)
-    if a.value is None:
-        print(rr.get())
-    else:
-        rr.set(a.value)
-        print(f"rate set to {rr.get()} Hz")
-    d.close()
-    return 0
-
-
-def cmd_profile(a) -> int:
-    d = open_device()
-    op = OnboardProfiles(d)
-    if a.index is None:
-        print(op.current())
-    else:
-        op.set_current(a.index)
-        print(f"active profile {op.current()}")
-    d.close()
-    return 0
-
-
-def cmd_show(a) -> int:
-    d = open_device()
-    op = OnboardProfiles(d)
-    n = a.index if a.index is not None else op.current()
-    blob = op.read_sector(n + 1)
-    p = Profile.parse(blob)
-    print(f"--- profile {n} (sector {n + 1}) crc_ok={p.crc_ok()} ---")
-    print(p.describe(op.info.button_count))
-    d.close()
-    return 0
-
-
-def cmd_led(a) -> int:
-    """Live lighting. Needs host mode, so it is held only while we run."""
-    d = open_device()
-    leds, op = Leds(d), OnboardProfiles(d)
-    with op.host_mode():
-        if a.mode == "off":
-            leds.all_off()
-        elif a.mode == "solid":
-            r, g, b = parse_color(a.color)
-            leds.all_fixed(r, g, b)
-        elif a.mode == "breathing":
-            r, g, b = parse_color(a.color)
-            for z in range(leds.zone_count):
-                leds.breathing(z, r, g, b, a.period, a.waveform, a.intensity)
-        elif a.mode == "cycle":
-            for z in range(leds.zone_count):
-                leds.cycle(z, a.period, a.intensity)
-        print(f"applied {a.mode}")
-        if a.hold:
-            print("holding host mode; Ctrl-C to release")
-            try:
-                while True:
-                    __import__("time").sleep(1)
-            except KeyboardInterrupt:
-                pass
-        else:
-            print("note: releasing host mode restores the stored profile "
-                  "lighting. Use --hold to keep it, or 'persist' to store it.")
-    d.close()
-    return 0
-
-
-def cmd_persist(a) -> int:
-    """Write lighting into the profile so it survives without a daemon."""
-    d = open_device()
-    op = OnboardProfiles(d)
-    n = a.index if a.index is not None else op.current()
-    blob = op.read_sector(n + 1)
-    p = Profile.parse(blob)
-    if not p.crc_ok():
-        d.close()
-        sys.exit(f"profile {n} has a bad CRC already; refusing to write")
-    if a.mode == "off":
-        led = Led.off()
-    elif a.mode == "solid":
-        led = Led.fixed(*parse_color(a.color))
-    elif a.mode == "breathing":
-        from g502.led import WAVEFORMS
-        led = Led.breathing(*parse_color(a.color), a.period,
-                            WAVEFORMS.get(a.waveform, 0), a.intensity)
-    else:
-        led = Led.cycle(a.period, a.intensity)
-    p.leds = [led] * len(p.leds)
-    p.alt_leds = [led] * len(p.alt_leds)
-    op.write_sector(n + 1, p.serialize(), verify=True)
-    print(f"profile {n} lighting -> {led.describe()} (stored to flash)")
-    d.close()
-    return 0
-
-
-def cmd_button(a) -> int:
-    d = open_device()
-    op = OnboardProfiles(d)
-    n = a.profile if a.profile is not None else op.current()
-    blob = op.read_sector(n + 1)
-    p = Profile.parse(blob)
-    if not p.crc_ok():
-        d.close()
-        sys.exit(f"profile {n} has a bad CRC already; refusing to write")
-    spec = a.action
-    if spec.startswith("button:"):
-        new = Button.mouse(int(spec.split(":", 1)[1]))
-    elif spec.startswith("key:"):
-        new = Button.key(int(spec.split(":", 1)[1], 0))
-    elif spec in ("none", "disabled"):
-        new = Button.disabled()
-    else:
-        new = Button.special(spec)
-    old = p.buttons[a.index]
-    p.buttons[a.index] = new
-    op.write_sector(n + 1, p.serialize(), verify=True)
-    print(f"profile {n} button {a.index}: {old.describe()} -> {new.describe()}")
-    d.close()
-    return 0
-
-
-def cmd_effect(a) -> int:
-    d = open_device()
-    eng = fx.Engine(d, fps=a.fps)
-    gen = fx.EFFECTS[a.name]
-    kwargs = {}
-    if a.name in ("solid", "breathe", "gradient", "wave", "audio"):
-        kwargs["color"] = parse_color(a.color)
-    if a.name == "gradient":
-        kwargs["b"] = parse_color(a.color2)
-        kwargs["a"] = kwargs.pop("color")
-    if a.name in ("rainbow", "breathe", "gradient", "wave"):
-        kwargs["period"] = a.period / 1000.0
-    if a.name in ("rainbow", "wave", "audio"):
-        kwargs["zones"] = eng.zone_count
-    if a.name == "breathe":
-        kwargs["curve"] = a.waveform
-    try:
-        frames = eng.run(gen(**kwargs), duration=a.duration)
+        dev = open_device()
+    except PermissionError:
+        raise Fail(_udev_hint()) from None
     except RuntimeError as e:
-        d.close()
-        sys.exit(f"g502ctl: {e}")
-    print(f"\n{frames} frames pushed; device restored to onboard mode")
-    d.close()
-    return 0
+        # discover.open_device() collects per-node errors into one RuntimeError,
+        # so a permission problem arrives as text rather than PermissionError.
+        if "permission denied" in str(e).lower():
+            raise Fail(_udev_hint()) from None
+        raise Fail(str(e)) from None
+    try:
+        yield dev
+    finally:
+        with contextlib.suppress(OSError):
+            dev.close()
 
 
-def cmd_watch(a) -> int:
-    from g502.appwatch import Watcher
-    cfg = cfgmod.load(a.config)
-    d = open_device()
-    Watcher(d, cfg, interval=a.interval, verbose=not a.quiet).run()
-    d.close()
-    return 0
+# -- output --------------------------------------------------------------
 
-
-def cmd_config(a) -> int:
-    if a.init:
-        p = cfgmod.save(cfgmod.DEFAULT_CONFIG, a.config)
-        print(f"wrote default config to {p}")
+def emit(args, payload: dict, lines) -> int:
+    """One place where --json decides the shape of a read command's output."""
+    if getattr(args, "json", False):
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
     else:
-        import json
-        print(json.dumps(cfgmod.load(a.config), indent=2))
+        if isinstance(lines, str):
+            lines = [lines]
+        for line in lines:
+            print(line)
     return 0
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(
-        prog="g502ctl", description="Control a Logitech G502 HERO.")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+# -- optional sibling modules --------------------------------------------
 
-    sub.add_parser("info", help="show device capabilities").set_defaults(fn=cmd_info)
+_IO_HOOKS = ("export_profile", "import_profile", "backup", "restore")
 
-    p = sub.add_parser("dpi", help="get/set DPI (100-25600, step 50)")
-    p.add_argument("value", nargs="?", type=int)
-    p.set_defaults(fn=cmd_dpi)
 
-    p = sub.add_parser("rate", help="get/set report rate in Hz")
-    p.add_argument("value", nargs="?", type=int)
-    p.set_defaults(fn=cmd_rate)
+def _profile_io():
+    """g502/profile_io.py, if it is present and exposes the expected hooks.
 
-    p = sub.add_parser("profile", help="get/set active profile")
-    p.add_argument("index", nargs="?", type=int)
-    p.set_defaults(fn=cmd_profile)
+    Optional on purpose: this script carries a lossless raw-sector JSON
+    fallback, so export/import/backup/restore work whether or not the module
+    exists. A module missing any hook is left alone rather than half-used.
+    """
+    try:
+        from g502 import profile_io
+    except ImportError:
+        return None
+    return profile_io if all(hasattr(profile_io, h) for h in _IO_HOOKS) else None
 
-    p = sub.add_parser("show", help="decode a stored profile")
-    p.add_argument("index", nargs="?", type=int)
-    p.set_defaults(fn=cmd_show)
 
-    for name, fn, helptext in (
-            ("led", cmd_led, "live lighting (while held)"),
-            ("persist", cmd_persist, "store lighting into profile flash")):
-        p = sub.add_parser(name, help=helptext)
-        p.add_argument("mode", choices=["off", "solid", "breathing", "cycle"])
-        p.add_argument("color", nargs="?", default="00ffff")
-        p.add_argument("--period", type=int, default=4000, help="ms")
-        p.add_argument("--waveform", default="default")
-        p.add_argument("--intensity", type=int, default=100)
-        if name == "led":
-            p.add_argument("--hold", action="store_true")
+def _delegate(fn, *a) -> bool:
+    """Call a profile_io hook, falling back if its signature differs.
+
+    The module is written by another part of the project; a mismatch should
+    degrade to the built-in path with a warning, not raise a TypeError.
+    """
+    try:
+        fn(*a)
+        return True
+    except TypeError as e:
+        print(f"g502ctl: profile_io.{fn.__name__} signature mismatch ({e}); "
+              f"using the built-in sector codec", file=sys.stderr)
+        return False
+
+
+def _effects():
+    try:
+        from g502 import effects
+    except ImportError as e:
+        raise Fail(f"the animation engine (g502/effects.py) is not available: {e}")
+    return effects
+
+
+# -- profile documents ---------------------------------------------------
+
+def _decode(p: Profile, n_buttons: int) -> dict:
+    return {
+        "name": p.name,
+        "report_rate_hz": p.report_rate_hz,
+        "report_rate_ms": p.report_rate_ms,
+        "dpi": list(p.dpi),
+        "default_dpi_index": p.default_dpi,
+        "shift_dpi_index": p.shift_dpi,
+        "buttons": [{"index": i, "kind": b.kind, "action": b.describe(),
+                     "raw": b.raw.hex()}
+                    for i, b in enumerate(p.buttons[:n_buttons])],
+        "leds": [{"zone": i, "effect": led.describe(), "raw": led.raw.hex()}
+                 for i, led in enumerate(p.leds)],
+        "alt_leds": [{"zone": i, "effect": led.describe(), "raw": led.raw.hex()}
+                     for i, led in enumerate(p.alt_leds)],
+    }
+
+
+def _profile_doc(n: int, sector: int, blob: bytes, n_buttons: int) -> dict:
+    p = Profile.parse(blob)
+    return {
+        "tool": "g502ctl",
+        "format": DOC_FORMAT,
+        "kind": "profile",
+        "profile": n,
+        "sector": sector,
+        "crc_ok": p.crc_ok(),
+        "note": "'raw' is authoritative on import; 'decoded' is for reading "
+                "and diffing only",
+        "raw": blob.hex(),
+        "decoded": _decode(p, n_buttons),
+    }
+
+
+def _load_doc(path: str, kind: str) -> dict:
+    try:
+        doc = json.loads(Path(path).read_text())
+    except OSError as e:
+        raise Fail(f"cannot read {path}: {e.strerror or e}") from None
+    except json.JSONDecodeError as e:
+        raise Fail(f"{path} is not valid JSON: {e}") from None
+    if not isinstance(doc, dict):
+        raise Fail(f"{path} must contain a JSON object")
+    if doc.get("kind") != kind:
+        raise Fail(f"{path} is a {doc.get('kind') or 'unknown'} document, "
+                   f"expected a {kind} document")
+    if doc.get("format") != DOC_FORMAT:
+        raise Fail(f"{path} has format {doc.get('format')!r}; this tool writes "
+                   f"and reads format {DOC_FORMAT}")
+    return doc
+
+
+def _sector_from_hex(text: str, what: str) -> bytes:
+    """Decode and validate one sector of raw hex from a JSON document."""
+    try:
+        blob = bytes.fromhex(text)
+    except (TypeError, ValueError) as e:
+        raise Fail(f"{what}: raw sector is not hex ({e})") from None
+    if len(blob) != SECTOR_SIZE:
+        raise Fail(f"{what}: raw sector is {len(blob)} bytes, "
+                   f"expected {SECTOR_SIZE}")
+    stored = (blob[-2] << 8) | blob[-1]
+    if stored != crc_ccitt(blob[:-2]):
+        raise Fail(f"{what}: stored CRC 0x{stored:04x} does not match the data; "
+                   f"the file is corrupt and will not be written")
+    return blob
+
+
+def _write_file(path: str, doc: dict) -> None:
+    try:
+        Path(path).write_text(json.dumps(doc, indent=2) + "\n")
+    except OSError as e:
+        raise Fail(f"cannot write {path}: {e.strerror or e}") from None
+
+
+# -- info ----------------------------------------------------------------
+
+def _feature_table(dev) -> list[dict]:
+    try:
+        fs = dev.feature_index(F.FEATURE_SET)
+        count = dev.call(fs, 0x00)[0]
+    except (KeyError, HidppError, HidppTimeout):
+        return []
+    rows = []
+    for i in range(count + 1):
+        try:
+            p = dev.call(fs, 0x01, bytes([i]))
+        except (HidppError, HidppTimeout):
+            continue
+        fid = (p[0] << 8) | p[1]
+        rows.append({"index": i, "id": fid, "name": F.name(fid),
+                     "flags": F.type_flags(p[2])})
+    return rows
+
+
+def _firmware(dev) -> list[dict]:
+    out = []
+    try:
+        fw = dev.feature_index(F.DEVICE_FW_VERSION)
+        n = dev.call(fw, 0x00)[0]
+    except (KeyError, HidppError, HidppTimeout):
+        return out
+    kinds = {0: "main app", 1: "bootloader", 2: "hardware", 3: "touchpad"}
+    for e in range(n):
+        try:
+            p = dev.call(fw, 0x01, bytes([e]))
+        except (HidppError, HidppTimeout):
+            continue
+        out.append({
+            "entity": e,
+            "kind": kinds.get(p[0] & 0x0F, f"type{p[0]}"),
+            "prefix": bytes(p[1:4]).decode("ascii", "replace"),
+            "version": f"{p[4]:02x}.{p[5]:02x}",
+            "build": (p[6] << 8) | p[7],
+        })
+    return out
+
+
+def cmd_info(args) -> int:
+    with opened() as dev:
+        maj, minor = dev.protocol_version()
+        payload: dict = {
+            "device": {"model": dev.model, "vendor": 0x046D, "product": dev.pid,
+                       "endpoint": dev.path, "hidpp": f"{maj}.{minor}"},
+            "firmware": _firmware(dev),
+            "features": _feature_table(dev),
+        }
+        lines = [
+            f"device    : {dev.model}  (046d:{dev.pid:04x})",
+            f"endpoint  : {dev.path}",
+            f"HID++     : {maj}.{minor}",
+        ]
+        for e in payload["firmware"]:
+            lines.append(f"firmware  : {e['kind']:<11} {e['prefix']} "
+                         f"v{e['version']} build {e['build']:04x}")
+
+        with contextlib.suppress(KeyError, HidppError, HidppTimeout):
+            dpi = Dpi(dev)
+            cap = dpi.capability()
+            payload["dpi"] = {"current": dpi.get(), "default": dpi.default(),
+                              "capability": cap}
+            if cap["kind"] == "range":
+                lines.append(f"dpi       : {payload['dpi']['current']} "
+                             f"(range {cap['min']}-{cap['max']} step {cap['step']}, "
+                             f"default {payload['dpi']['default']})")
+            else:
+                lines.append(f"dpi       : {payload['dpi']['current']} "
+                             f"(choices {cap['values']})")
+
+        with contextlib.suppress(KeyError, HidppError, HidppTimeout):
+            rate = ReportRate(dev)
+            payload["report_rate"] = {"current": rate.get(),
+                                      "supported": rate.supported()}
+            lines.append(f"rate      : {rate.get()} Hz  "
+                         f"(supported {rate.supported()})")
+
+        n_buttons = 11
+        with contextlib.suppress(KeyError, HidppError, HidppTimeout):
+            op = OnboardProfiles(dev)
+            mode = op.mode()
+            n_buttons = op.info.button_count
+            payload["profiles"] = {
+                "mode": mode, "mode_name": MODE_NAMES.get(mode, "?"),
+                "current": op.current(), "dpi_index": op.dpi_index(),
+                "count": op.info.profile_count,
+                "count_rom": op.info.profile_count_oob,
+                "button_count": op.info.button_count,
+                "sector_count": op.info.sector_count,
+                "sector_size": op.info.sector_size,
+                "profile_format_id": op.info.profile_format_id,
+                "macro_format_id": op.info.macro_format_id,
+            }
+            lines += [
+                f"mode      : {mode} ({MODE_NAMES.get(mode, '?')})"
+                + ("   [live lighting active]" if mode == MODE_HOST
+                   else "   [stored profile drives the LEDs]"),
+                f"profiles  : {op.info.profile_count} onboard "
+                f"+ {op.info.profile_count_oob} ROM, active {op.current()}, "
+                f"dpi slot {op.dpi_index()}",
+                f"memory    : {op.info.sector_count} sectors x "
+                f"{op.info.sector_size} B, {op.info.button_count} buttons, "
+                f"profile format {op.info.profile_format_id}",
+            ]
+
+        with contextlib.suppress(KeyError, HidppError, HidppTimeout):
+            leds = Leds(dev)
+            payload["lighting"] = {
+                "zone_count": leds.zone_count,
+                "nv_caps": leds.nv_caps,
+                "ext_caps": leds.ext_caps,
+                "can_read_back": leds.can_read_back,
+                "zones": [{"index": z.index, "location": z.location,
+                           "location_name": z.location_name,
+                           "modes": [LED_MODE_NAMES.get(m, hex(m))
+                                     for m in z.modes]}
+                          for z in leds.zones],
+            }
+            lines.append(f"zones     : {leds.zone_count}  "
+                         f"(effect readback: "
+                         f"{'yes' if leds.can_read_back else 'not implemented'})")
+            for z in leds.zones:
+                modes = ", ".join(LED_MODE_NAMES.get(m, hex(m)) for m in z.modes)
+                lines.append(f"  zone {z.index}: {z.location_name:<16} [{modes}]")
+
+        if payload["features"]:
+            lines.append(f"features  : {len(payload['features'])}")
+            for row in payload["features"]:
+                lines.append(f"  {row['index']:>2}  0x{row['id']:04x}  "
+                             f"{row['name']:<24} {row['flags']}")
+        payload["buttons"] = n_buttons
+        return emit(args, payload, lines)
+
+
+# -- dpi / rate ----------------------------------------------------------
+
+def cmd_dpi_get(args) -> int:
+    with opened() as dev:
+        dpi = Dpi(dev)
+        cap = dpi.capability()
+        payload = {"dpi": dpi.get(), "default": dpi.default(), "capability": cap}
+        return emit(args, payload, str(payload["dpi"]))
+
+
+def cmd_dpi_set(args) -> int:
+    with opened() as dev:
+        dpi = Dpi(dev)
+        cap = dpi.capability()
+        actual = dpi.set(args.value)
+        if actual != args.value:
+            step = cap.get("step", "?")
+            print(f"dpi {args.value} snapped to {actual} "
+                  f"(hardware step is {step})")
         else:
-            p.add_argument("--index", type=int, default=None)
-        p.set_defaults(fn=fn)
+            print(f"dpi set to {actual}")
+        return 0
 
-    p = sub.add_parser("button", help="remap a button in profile flash")
+
+def cmd_rate_get(args) -> int:
+    with opened() as dev:
+        rate = ReportRate(dev)
+        payload = {"hz": rate.get(), "supported": rate.supported()}
+        return emit(args, payload, str(payload["hz"]))
+
+
+def cmd_rate_set(args) -> int:
+    with opened() as dev:
+        rate = ReportRate(dev)
+        rate.set(args.hz)
+        print(f"report rate set to {rate.get()} Hz")
+        return 0
+
+
+# -- profiles ------------------------------------------------------------
+
+def _resolve(op: OnboardProfiles, index: int | None) -> int:
+    n = op.current() if index is None else index
+    if not (0 <= n < op.info.profile_count):
+        raise Usage(f"profile {n} out of range 0..{op.info.profile_count - 1}")
+    return n
+
+
+def cmd_profile_list(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        active = op.current()
+        rows, lines = [], [f"{'':2} {'#':>2}  {'name':<20} {'rate':>7}  "
+                           f"{'dpi stages':<28} crc"]
+        for n in range(op.info.profile_count):
+            try:
+                p = Profile.parse(op.read_sector(n + 1))
+            except (HidppError, HidppTimeout, ValueError) as e:
+                lines.append(f"   {n:>2}  <unreadable: {e}>")
+                rows.append({"profile": n, "sector": n + 1, "error": str(e)})
+                continue
+            stages = [d for d in p.dpi if d]
+            rows.append({"profile": n, "sector": n + 1, "name": p.name,
+                         "report_rate_hz": p.report_rate_hz, "dpi": stages,
+                         "crc_ok": p.crc_ok(), "active": n == active})
+            lines.append(
+                f"{'->' if n == active else '  '} {n:>2}  "
+                f"{(p.name or '(unset)'):<20} {p.report_rate_hz:>5} Hz  "
+                f"{str(stages):<28} {'ok' if p.crc_ok() else 'BAD'}")
+        return emit(args, {"active": active, "profiles": rows}, lines)
+
+
+def cmd_profile_get(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        payload = {"current": op.current(), "count": op.info.profile_count,
+                   "dpi_index": op.dpi_index()}
+        return emit(args, payload, str(payload["current"]))
+
+
+def cmd_profile_set(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        op.set_current(_resolve(op, args.index))
+        print(f"active profile {op.current()}")
+        return 0
+
+
+def cmd_profile_show(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        n = _resolve(op, args.index)
+        blob = op.read_sector(n + 1)
+        p = Profile.parse(blob)
+        if getattr(args, "json", False):
+            return emit(args, _profile_doc(n, n + 1, blob,
+                                           op.info.button_count), [])
+        print(f"--- profile {n} (sector {n + 1}) "
+              f"crc={'ok' if p.crc_ok() else 'BAD'} ---")
+        print(p.describe(op.info.button_count))
+        return 0
+
+
+def cmd_profile_export(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        n = _resolve(op, args.index)
+        pio = _profile_io()
+        if pio and _delegate(pio.export_profile, dev, n, args.file):
+            print(f"profile {n} exported to {args.file} (via profile_io)")
+            return 0
+        doc = _profile_doc(n, n + 1, op.read_sector(n + 1),
+                           op.info.button_count)
+        _write_file(args.file, doc)
+        print(f"profile {n} exported to {args.file} "
+              f"(crc {'ok' if doc['crc_ok'] else 'BAD'})")
+        return 0
+
+
+def cmd_profile_import(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        n = _resolve(op, args.index)
+        pio = _profile_io()
+        if pio and _delegate(pio.import_profile, dev, n, args.file):
+            print(f"profile {n} written from {args.file} (via profile_io)")
+            return 0
+        doc = _load_doc(args.file, "profile")
+        blob = _sector_from_hex(doc.get("raw", ""), args.file)
+        if doc.get("profile") != n:
+            print(f"note: {args.file} was exported from profile "
+                  f"{doc.get('profile')}, writing it to {n}")
+        op.write_sector(n + 1, blob, verify=True)
+        print(f"profile {n} (sector {n + 1}) written from {args.file} "
+              f"and verified")
+        return 0
+
+
+# -- whole-device backup -------------------------------------------------
+
+def cmd_backup(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        pio = _profile_io()
+        if pio and _delegate(pio.backup, dev, args.file):
+            print(f"device backed up to {args.file} (via profile_io)")
+            return 0
+        sectors, failed = {}, {}
+        for s in range(op.info.sector_count):
+            try:
+                sectors[str(s)] = op.read_sector(s).hex()
+            except (HidppError, HidppTimeout) as e:
+                failed[str(s)] = str(e)  # unpopulated sectors refuse the read
+        doc = {
+            "tool": "g502ctl", "format": DOC_FORMAT, "kind": "device",
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "device": {"model": dev.model, "product": dev.pid},
+            "sector_size": op.info.sector_size,
+            "sector_count": op.info.sector_count,
+            "profile_count": op.info.profile_count,
+            "note": "sector N+1 holds profile N; sector 0 is the directory",
+            "sectors": sectors,
+            "unreadable": failed,
+        }
+        _write_file(args.file, doc)
+        print(f"backed up {len(sectors)}/{op.info.sector_count} sectors "
+              f"to {args.file}"
+              + (f" ({len(failed)} would not read)" if failed else ""))
+        return 0
+
+
+def cmd_restore(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        pio = _profile_io()
+        if pio and not args.dry_run and _delegate(pio.restore, dev, args.file):
+            print(f"device restored from {args.file} (via profile_io)")
+            return 0
+        doc = _load_doc(args.file, "device")
+        want = {int(k): v for k, v in (doc.get("sectors") or {}).items()}
+        if not want:
+            raise Fail(f"{args.file} contains no sectors")
+        if doc.get("sector_size") != op.info.sector_size:
+            raise Fail(f"{args.file} has {doc.get('sector_size')}-byte sectors "
+                       f"but this device uses {op.info.sector_size}")
+
+        # Only profile sectors are restored by default: sector 0 is the
+        # directory, and a bad directory is far harder to recover from.
+        lo = 0 if args.all_sectors else 1
+        hi = op.info.sector_count if args.all_sectors else op.info.profile_count
+        plan, skipped = [], []
+        for s in sorted(want):
+            if not (lo <= s <= hi):
+                skipped.append((s, "outside the restored range"))
+                continue
+            try:
+                plan.append((s, _sector_from_hex(want[s], f"sector {s}")))
+            except Fail as e:
+                skipped.append((s, str(e).split(": ", 1)[-1]))
+        for s, why in skipped:
+            print(f"skipping sector {s}: {why}")
+        if not plan:
+            raise Fail("nothing in the file is safe to write")
+
+        if args.dry_run:
+            print(f"dry run: would write sectors "
+                  f"{', '.join(str(s) for s, _ in plan)} "
+                  f"({len(plan)} x {op.info.sector_size} B) to flash")
+            return 0
+        if not args.yes:
+            if not sys.stdin.isatty():
+                raise Usage("restore overwrites profile flash; pass --yes "
+                            "(or --dry-run first) when not on a terminal")
+            answer = input(f"overwrite sectors "
+                           f"{', '.join(str(s) for s, _ in plan)} "
+                           f"on {dev.model}? [y/N] ")
+            if answer.strip().lower() not in ("y", "yes"):
+                print("aborted")
+                return 1
+        for s, blob in plan:
+            op.write_sector(s, blob, verify=True)
+            print(f"sector {s} written and verified")
+        print(f"restored {len(plan)} sectors from {args.file}")
+        return 0
+
+
+# -- lighting ------------------------------------------------------------
+
+def _zone_list(leds_or_count, spec: str) -> list[int]:
+    count = (leds_or_count if isinstance(leds_or_count, int)
+             else leds_or_count.zone_count)
+    if spec == "all":
+        return list(range(count))
+    try:
+        z = int(spec, 0)
+    except ValueError:
+        raise Usage(f"zone must be a number or 'all', not {spec!r}") from None
+    if not (0 <= z < count):
+        raise Usage(f"zone {z} out of range 0..{count - 1}")
+    return [z]
+
+
+def _led_params(args) -> tuple[str, tuple[int, int, int] | None, int, int, int]:
+    """Validate the shared lighting arguments once, before touching flash."""
+    mode = "fixed" if args.mode == "solid" else args.mode
+    color = None
+    if mode in ("fixed", "breathing"):
+        if not args.color:
+            raise Usage(f"'{args.mode}' needs a colour "
+                        f"(hex like ff0066, or a name like cyan)")
+        color = parse_color(args.color)
+    elif args.color:
+        raise Usage(f"'{args.mode}' takes no colour")
+    if args.waveform not in WAVEFORMS:
+        raise Usage(f"unknown waveform {args.waveform!r}; have "
+                    f"{', '.join(WAVEFORMS)}")
+    if not (1 <= args.intensity <= 100):
+        raise Usage("--intensity is a percentage, 1..100")
+    # The two animated modes have different natural periods in firmware.
+    period = args.period if args.period is not None else (
+        8000 if mode == "cycle" else 4000)
+    if period <= 0:
+        raise Usage("--period is milliseconds and must be positive")
+    return mode, color, period, WAVEFORMS[args.waveform], args.intensity
+
+
+def _led_record(mode: str, color, period: int, waveform: int,
+                intensity: int) -> Led:
+    if mode == "off":
+        return Led.off()
+    if mode == "fixed":
+        return Led.fixed(*color)
+    if mode == "breathing":
+        return Led.breathing(*color, period, waveform, intensity)
+    return Led.cycle(period, intensity)
+
+
+def cmd_led(args) -> int:
+    mode, color, period, waveform, intensity = _led_params(args)
+    if args.persist and args.hold:
+        raise Usage("--persist writes to flash, so there is nothing to hold")
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        if args.persist:
+            return _led_persist(op, args, mode, color, period, waveform,
+                                intensity)
+        return _led_live(dev, op, args, mode, color, period, waveform,
+                         intensity)
+
+
+def _led_live(dev, op: OnboardProfiles, args, mode, color, period, waveform,
+              intensity) -> int:
+    """Live 0x8070 write. Inert outside host mode, hence the mode dance."""
+    leds = Leds(dev)
+    zones = _zone_list(leds, args.zone)
+    was_host = op.mode() == MODE_HOST
+    with op.host_mode():
+        for z in zones:
+            if mode == "off":
+                leds.off(z)
+            elif mode == "fixed":
+                leds.fixed(z, *color)
+            elif mode == "breathing":
+                leds.breathing(z, *color, period, args.waveform, intensity)
+            else:
+                leds.cycle(z, period, intensity)
+        where = "zones " + ",".join(str(z) for z in zones)
+        print(f"live: {mode} applied to {where} (host mode)")
+        if args.hold:
+            print("holding host mode — Ctrl-C to release and return the "
+                  "mouse to its stored profile")
+            with contextlib.suppress(KeyboardInterrupt):
+                while True:
+                    time.sleep(1)
+    if was_host:
+        print("the mouse was already in host mode, so this stays until "
+              "something switches it back to onboard")
+    else:
+        print("host mode released: the mouse is back on its stored profile "
+              "lighting. Use --hold to keep it for this session, or "
+              "--persist to write it into flash.")
+    return 0
+
+
+def _led_persist(op: OnboardProfiles, args, mode, color, period, waveform,
+                 intensity) -> int:
+    """Store the effect in profile flash, where it survives unplugging."""
+    n = _resolve(op, args.profile)
+    blob = op.read_sector(n + 1)
+    p = Profile.parse(blob)
+    if not p.crc_ok():
+        raise Fail(f"profile {n} already has a bad CRC; refusing to write to it")
+    zones = _zone_list(len(p.leds), args.zone)
+    led = _led_record(mode, color, period, waveform, intensity)
+    for z in zones:
+        p.leds[z] = led
+        # The alternate set is what the device shows in its second (DPI-shift)
+        # state; leaving it stale would make the colour change under the hand.
+        if z < len(p.alt_leds):
+            p.alt_leds[z] = led
+    op.write_sector(n + 1, p.serialize(), verify=True)
+    print(f"persisted: profile {n} zone(s) "
+          f"{','.join(str(z) for z in zones)} -> {led.describe()}")
+    print("written to flash and verified; survives unplugging, no daemon "
+          "needed. Visible once the mouse is in onboard mode on this profile.")
+    return 0
+
+
+# -- effects -------------------------------------------------------------
+
+_EFFECT_ARGS = ("color", "a", "b", "period", "curve", "zones", "sensitivity",
+                "source")
+
+
+def _effect_kwargs(gen, args, zone_count: int) -> dict:
+    """Map CLI options onto whatever keywords this generator actually takes.
+
+    Signature-driven so an effect added to g502/effects.py works here without
+    a matching edit.
+    """
+    import inspect
+
+    names = set(inspect.signature(gen).parameters)
+    color = parse_color(args.color)
+    kwargs: dict = {}
+    if "color" in names:
+        kwargs["color"] = color
+    if "a" in names:
+        kwargs["a"] = color
+    if "b" in names:
+        kwargs["b"] = parse_color(args.color2)
+    if "period" in names:
+        kwargs["period"] = args.period / 1000.0  # generators work in seconds
+    if "curve" in names:
+        kwargs["curve"] = args.waveform
+    if "zones" in names:
+        kwargs["zones"] = zone_count
+    return {k: v for k, v in kwargs.items() if k in names}
+
+
+def _first_line(doc: str | None) -> str:
+    lines = (doc or "").strip().splitlines()
+    return lines[0] if lines else ""
+
+
+def cmd_effect_list(args) -> int:
+    import inspect
+
+    fx = _effects()
+    rows, lines = [], []
+    for name in sorted(fx.EFFECTS):
+        gen = fx.EFFECTS[name]
+        params = [p for p in inspect.signature(gen).parameters
+                  if p in _EFFECT_ARGS]
+        rows.append({"name": name, "parameters": params,
+                     "doc": _first_line(gen.__doc__)})
+        lines.append(f"  {name:<10} takes {', '.join(params) or '-'}")
+    lines.insert(0, "host-driven effects (streamed as solid colours while "
+                    "the command runs):")
+    return emit(args, {"effects": rows}, lines)
+
+
+def cmd_effect_run(args) -> int:
+    fx = _effects()
+    if args.name not in fx.EFFECTS:
+        raise Usage(f"unknown effect {args.name!r}; have "
+                    f"{', '.join(sorted(fx.EFFECTS))}")
+    with opened() as dev:
+        engine = fx.Engine(dev, fps=args.fps)
+        kwargs = _effect_kwargs(fx.EFFECTS[args.name], args, engine.zone_count)
+        print(f"running '{args.name}' at {engine.fps} fps on "
+              f"{engine.zone_count} zones — Ctrl-C to stop")
+        try:
+            frames = engine.run(fx.EFFECTS[args.name](**kwargs),
+                                duration=args.duration)
+        except RuntimeError as e:
+            raise Fail(str(e)) from None
+        print(f"{frames} frames pushed; mouse returned to its previous mode "
+              f"(live effects do not persist — see 'led --persist')")
+        return 0
+
+
+# -- daemon --------------------------------------------------------------
+
+def _unit_state(unit: str) -> dict:
+    """systemd user-unit state. No systemd, or no unit, is a fact to report."""
+    if not shutil.which("systemctl"):
+        return {"queried": False, "reason": "systemctl not found"}
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "show", unit, "--property=LoadState",
+             "--property=ActiveState", "--property=SubState",
+             "--property=MainPID"],
+            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"queried": False, "reason": str(e)}
+    props = dict(line.split("=", 1) for line in r.stdout.splitlines()
+                 if "=" in line)
+    if not props:
+        return {"queried": False,
+                "reason": (r.stderr.strip() or "no user bus reachable")}
+    return {"queried": True, "load": props.get("LoadState", "?"),
+            "active": props.get("ActiveState", "?"),
+            "sub": props.get("SubState", "?"),
+            "main_pid": int(props.get("MainPID") or 0)}
+
+
+def _watch_processes() -> list[dict]:
+    """Our watcher processes, found in /proc.
+
+    The unit may be absent, started by hand, or run straight from the source
+    tree, so the process table is the honest answer.
+    """
+    me = os.getpid()
+    out = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == me:
+            continue
+        try:
+            raw = Path(f"/proc/{entry}/cmdline").read_bytes()
+        except OSError:
+            continue  # exited between listdir and read
+        argv = [c.decode("utf-8", "replace") for c in raw.split(b"\x00") if c]
+        if not argv:
+            continue
+        if any("g502" in a for a in argv) and (
+                "watch" in argv or "daemon" in argv):
+            out.append({"pid": int(entry), "cmdline": " ".join(argv)})
+    return out
+
+
+def cmd_daemon_status(args) -> int:
+    unit = _unit_state(WATCH_UNIT)
+    procs = _watch_processes()
+    running = bool(procs) or unit.get("active") == "active"
+    payload = {"running": running, "unit": dict(name=WATCH_UNIT, **unit),
+               "processes": procs}
+    lines = [f"daemon    : {'running' if running else 'not running'}"]
+    if unit.get("queried"):
+        lines.append(f"unit      : {WATCH_UNIT} load={unit['load']} "
+                     f"active={unit['active']} ({unit['sub']})"
+                     + (f" pid {unit['main_pid']}" if unit["main_pid"] else ""))
+        if unit["load"] == "not-found":
+            lines.append("            install it with: ./install.sh service")
+    else:
+        lines.append(f"unit      : not queried ({unit['reason']})")
+    for p in procs:
+        lines.append(f"process   : pid {p['pid']}  {p['cmdline']}")
+    if not procs and not running:
+        lines.append("            start one in the foreground with: "
+                     "g502ctl watch")
+    return emit(args, payload, lines)
+
+
+# -- buttons, watcher, config -------------------------------------------
+
+def _button_from_spec(spec: str) -> Button:
+    if spec.startswith("button:"):
+        return Button.mouse(int(spec.split(":", 1)[1]))
+    if spec.startswith("key:"):
+        return Button.key(int(spec.split(":", 1)[1], 0))
+    if spec in ("none", "disabled"):
+        return Button.disabled()
+    return Button.special(spec)
+
+
+def cmd_button(args) -> int:
+    with opened() as dev:
+        op = OnboardProfiles(dev)
+        n = _resolve(op, args.profile)
+        if not (0 <= args.index < op.info.button_count):
+            raise Usage(f"button {args.index} out of range "
+                        f"0..{op.info.button_count - 1}")
+        p = Profile.parse(op.read_sector(n + 1))
+        if not p.crc_ok():
+            raise Fail(f"profile {n} already has a bad CRC; refusing to write")
+        new = _button_from_spec(args.action)
+        old = p.buttons[args.index]
+        p.buttons[args.index] = new
+        op.write_sector(n + 1, p.serialize(), verify=True)
+        print(f"profile {n} button {args.index}: "
+              f"{old.describe()} -> {new.describe()}")
+        return 0
+
+
+def cmd_watch(args) -> int:
+    from g502 import config as cfgmod
+    from g502.appwatch import Watcher
+
+    cfg = cfgmod.load(args.config)
+    with opened() as dev:
+        Watcher(dev, cfg, interval=args.interval, verbose=not args.quiet).run()
+    return 0
+
+
+def cmd_config(args) -> int:
+    from g502 import config as cfgmod
+
+    if args.init:
+        print(f"wrote default config to {cfgmod.save(cfgmod.DEFAULT_CONFIG, args.config)}")
+        return 0
+    print(json.dumps(cfgmod.load(args.config), indent=2))
+    return 0
+
+
+# -- argument parsing ----------------------------------------------------
+
+_VERB_FIRST = {"dpi", "rate", "profile"}
+_ACTIONS = {"get", "set", "list", "show", "export", "import", "run", "status"}
+
+
+def _normalize(argv: list[str]) -> list[str]:
+    """Accept the older 'dpi 1600' and 'show 0' spellings.
+
+    The documented grammar is verb-first ('dpi set 1600'); these two forms
+    came first and are still in the README and in people's scripts.
+    """
+    if not argv:
+        return argv
+    out = list(argv)
+    if out[0] == "show":
+        out[:1] = ["profile", "show"]
+        return out
+    if out[0] in _VERB_FIRST:
+        positional = [a for a in out[1:] if not a.startswith("-")]
+        if not positional:
+            out.insert(1, "get")
+        elif positional[0] not in _ACTIONS:
+            out.insert(1, "set")
+    return out
+
+
+def _json_flag(parser) -> None:
+    parser.add_argument("--json", action="store_true",
+                        help="machine-readable output")
+
+
+def build_parser() -> tuple[argparse.ArgumentParser, dict]:
+    ap = argparse.ArgumentParser(
+        prog="g502ctl",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Control a Logitech G502 HERO over HID++ 2.0.",
+        epilog="""lighting, the one thing that confuses everyone:
+
+  g502ctl led all fixed ff0066              live, while this command runs
+  g502ctl led all fixed ff0066 --hold       live, until you press Ctrl-C
+  g502ctl led all fixed ff0066 --persist    stored in flash, survives unplug
+
+Live lighting (led, effect) needs the mouse in HOST mode. g502ctl switches it
+there, writes, and switches it back, so the colour is gone when the command
+returns unless you pass --hold. --persist writes the effect into the onboard
+profile instead: it then needs no running process at all. Only the four
+effects the firmware implements (off, fixed, breathing, cycle) can be
+persisted; everything under 'effect' is generated on the host and is
+therefore live-only.""")
+    sub = ap.add_subparsers(dest="cmd")
+    subparsers: dict[str, argparse.ArgumentParser] = {}
+
+    def group(name: str, help_: str, **kw):
+        p = sub.add_parser(name, help=help_, **kw)
+        subparsers[name] = p
+        return p
+
+    p = group("info", "capabilities and current state")
+    _json_flag(p)
+    p.set_defaults(fn=cmd_info)
+
+    # dpi
+    p = group("dpi", "get or set sensor DPI")
+    s = p.add_subparsers(dest="action")
+    q = s.add_parser("get", help="current DPI")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_dpi_get)
+    q = s.add_parser("set", help="set DPI; snaps to the hardware step")
+    q.add_argument("value", type=int)
+    q.set_defaults(fn=cmd_dpi_set)
+
+    # rate
+    p = group("rate", "get or set the report rate")
+    s = p.add_subparsers(dest="action")
+    q = s.add_parser("get", help="current rate in Hz")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_rate_get)
+    q = s.add_parser("set", help="set rate in Hz (125/250/500/1000)")
+    q.add_argument("hz", type=int)
+    q.set_defaults(fn=cmd_rate_set)
+
+    # profile
+    p = group("profile", "onboard profiles")
+    s = p.add_subparsers(dest="action")
+    q = s.add_parser("list", help="all stored profiles")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_profile_list)
+    q = s.add_parser("get", help="active profile index")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_profile_get)
+    q = s.add_parser("set", help="switch the active profile")
+    q.add_argument("index", type=int)
+    q.set_defaults(fn=cmd_profile_set)
+    q = s.add_parser("show", help="decode one stored profile")
+    q.add_argument("index", type=int, nargs="?", help="default: active")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_profile_show)
+    q = s.add_parser("export", help="write a profile to a JSON file")
+    q.add_argument("index", type=int)
+    q.add_argument("file")
+    q.set_defaults(fn=cmd_profile_export)
+    q = s.add_parser("import", help="write a JSON file back to a profile")
+    q.add_argument("index", type=int)
+    q.add_argument("file")
+    q.set_defaults(fn=cmd_profile_import)
+
+    # led
+    p = group("led", "lighting: live by default, flash with --persist")
+    p.add_argument("zone", help="zone number, or 'all'")
+    p.add_argument("mode", choices=["off", "fixed", "solid", "breathing",
+                                    "cycle"],
+                   help="'solid' is an alias for 'fixed'")
+    p.add_argument("color", nargs="?",
+                   help="rrggbb, #rrggbb or a name (fixed/breathing only)")
+    p.add_argument("--period", type=int, default=None,
+                   help="ms; default 4000 breathing, 8000 cycle")
+    p.add_argument("--waveform", default="default",
+                   help=f"breathing shape: {', '.join(WAVEFORMS)}")
+    p.add_argument("--intensity", type=int, default=100, help="percent, 1-100")
+    p.add_argument("--hold", action="store_true",
+                   help="keep the live effect until Ctrl-C")
+    p.add_argument("--persist", action="store_true",
+                   help="store in profile flash instead of applying live")
+    p.add_argument("--profile", type=int, default=None,
+                   help="with --persist: which profile (default: active)")
+    p.set_defaults(fn=cmd_led)
+
+    # effect
+    p = group("effect", "host-driven animation (live only)")
+    s = p.add_subparsers(dest="action")
+    q = s.add_parser("list", help="available effects and their parameters")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_effect_list)
+    q = s.add_parser("run", help="play an effect until Ctrl-C")
+    q.add_argument("name")
+    q.add_argument("color", nargs="?", default="00ffff")
+    q.add_argument("--color2", default="ff00ff", help="gradient end colour")
+    q.add_argument("--period", type=int, default=4000, help="ms")
+    q.add_argument("--waveform", default="sine", help="breathe curve")
+    q.add_argument("--fps", type=int, default=60)
+    q.add_argument("--duration", type=float, default=None, help="seconds")
+    q.set_defaults(fn=cmd_effect_run)
+
+    # backup / restore
+    p = group("backup", "dump every readable sector to a JSON file")
+    p.add_argument("file")
+    p.set_defaults(fn=cmd_backup)
+
+    p = group("restore", "write sectors back from a backup file")
+    p.add_argument("file")
+    p.add_argument("--yes", action="store_true", help="skip the confirmation")
+    p.add_argument("--dry-run", action="store_true",
+                   help="say what would be written, write nothing")
+    p.add_argument("--all-sectors", action="store_true",
+                   help="also restore sector 0, the profile directory")
+    p.set_defaults(fn=cmd_restore)
+
+    # daemon
+    p = group("daemon", "the per-application profile watcher")
+    s = p.add_subparsers(dest="action")
+    q = s.add_parser("status", help="is the watcher running?")
+    _json_flag(q)
+    q.set_defaults(fn=cmd_daemon_status)
+
+    # button
+    p = group("button", "remap a button in profile flash")
     p.add_argument("index", type=int)
-    p.add_argument("action", help="button:N | key:0xNN | none | "
+    p.add_argument("action", help="button:N | key:0xNN | none | one of: "
                                   "wheel-left wheel-right dpi-up dpi-down "
                                   "dpi-cycle dpi-default dpi-shift profile-up "
                                   "profile-down profile-cycle second-mode")
     p.add_argument("--profile", type=int, default=None)
     p.set_defaults(fn=cmd_button)
 
-    p = sub.add_parser("effect", help="host-driven animation")
-    p.add_argument("name", choices=sorted(fx.EFFECTS))
-    p.add_argument("color", nargs="?", default="00ffff")
-    p.add_argument("--color2", default="ff00ff", help="gradient end colour")
-    p.add_argument("--period", type=int, default=4000, help="ms")
-    p.add_argument("--waveform", default="sine")
-    p.add_argument("--fps", type=int, default=60)
-    p.add_argument("--duration", type=float, default=None, help="seconds")
-    p.set_defaults(fn=cmd_effect)
-
-    p = sub.add_parser("watch", help="per-application profile switching")
+    # watch / config
+    p = group("watch", "run the per-application profile watcher")
     p.add_argument("--config", default=None)
     p.add_argument("--interval", type=float, default=2.0)
     p.add_argument("--quiet", action="store_true")
     p.set_defaults(fn=cmd_watch)
 
-    p = sub.add_parser("config", help="show or create the config file")
+    p = group("config", "show or create the config file")
     p.add_argument("--init", action="store_true")
     p.add_argument("--config", default=None)
     p.set_defaults(fn=cmd_config)
 
-    a = ap.parse_args()
-    if a.cmd != "config":
-        need_root()
+    return ap, subparsers
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = _normalize(list(sys.argv[1:] if argv is None else argv))
+    ap, subparsers = build_parser()
+    if not argv:
+        ap.print_help()
+        return 2
+    args = ap.parse_args(argv)
+    if not hasattr(args, "fn"):
+        # A group was named without an action ("g502ctl profile").
+        subparsers[args.cmd].print_help()
+        return 2
     try:
-        return a.fn(a)
-    except (HidppError, HidppTimeout) as e:
-        sys.exit(f"g502ctl: device error: {e}")
-    except (RuntimeError, ValueError) as e:
-        sys.exit(f"g502ctl: {e}")
+        return args.fn(args) or 0
+    except Usage as e:
+        print(f"g502ctl: {e}", file=sys.stderr)
+        return 2
+    except KeyError as e:
+        # feature_index() signals an unsupported feature with KeyError, whose
+        # str() would wrap the message in quotes.
+        print(f"g502ctl: {e.args[0] if e.args else e}", file=sys.stderr)
+        return 1
+    except (Fail, HidppError, HidppTimeout, ValueError, OSError,
+            RuntimeError) as e:  # RuntimeError: e.g. a sector read back wrong
+        print(f"g502ctl: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
 
 
 if __name__ == "__main__":

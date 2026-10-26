@@ -1,0 +1,55 @@
+# systemd *user* unit for g502d. Install it with packaging/install.sh, which
+# fills in the @...@ tokens below; a copy with the tokens still in it will
+# fail to start.
+#
+# A user unit rather than a system one: the daemon polls /proc for the
+# processes *you* are running, and its audio effect needs this session's
+# PulseAudio/PipeWire socket in $XDG_RUNTIME_DIR. A system service would see
+# neither, and would need root on the hidraw node instead of the udev rule.
+#
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now g502d
+#   journalctl --user -u g502d -f
+
+[Unit]
+Description=Logitech G502 HERO daemon (per-application profiles and lighting)
+Documentation=file://@G502_DOC@/README.md
+# Ordering only. The daemon starts fine without a graphical session (profile
+# switching needs nothing but /proc), but effects and audio want one.
+After=graphical-session.target
+# Stop and restart with the session, so logging out hands the mouse back to
+# onboard mode instead of leaving the daemon holding host mode.
+PartOf=graphical-session.target
+# A failure that repeats is a configuration problem, not something to retry
+# forever: give up after 5 attempts in a minute and leave it visible in
+# `systemctl --user status`.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment="PYTHONPATH=@G502_ROOT@"
+Environment="G502D_LOG_LEVEL=info"
+ExecStart=@PYTHON@ -m g502.daemon
+# Reload config without dropping the device or the running effect.
+ExecReload=/bin/kill -HUP $MAINPID
+# The daemon exits 0 only on SIGTERM/SIGINT, so on-failure covers crashes
+# without fighting a deliberate `systemctl --user stop`.
+Restart=on-failure
+RestartSec=5
+# It must be given time to put the device back into onboard mode; the restore
+# is a couple of HID++ round trips, so this is generous rather than tight.
+TimeoutStopSec=15
+KillSignal=SIGTERM
+# Reads /proc, one config file and one hidraw node. Nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+# Do NOT add PrivateDevices=true: it replaces /dev with a minimal set that
+# has no /dev/hidraw*, and the daemon would never find the mouse.
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,53 @@
+# Logitech G502 — let an ordinary user talk to the HID++ control endpoint.
+#
+# Without this, /dev/hidraw* is root-only and every g502ctl command needs sudo.
+# Two mechanisms are applied together because neither covers every setup:
+#
+#   TAG+="uaccess"  systemd-logind grants the *active local session* access via
+#                   an ACL. This is the modern mechanism and the one that works
+#                   on Wayland/GNOME. It does not apply to an ssh session or to
+#                   a system service.
+#   GROUP="plugdev" static group ownership, covering what uaccess does not.
+#   MODE="0660"     Harmless if you are not in plugdev. Check with
+#                   `id -nG | tr ' ' '\n' | grep plugdev`; add yourself with
+#                   `sudo usermod -aG plugdev $USER` (needs a re-login).
+#
+# Why this matches on vendor/product only, and not on the interface:
+#
+# A G502 exposes two hidraw nodes. Interface 0 is the plain mouse input
+# endpoint; interface 1 carries the vendor ff00 collection that HID++ speaks,
+# and is the only one this project talks to. It is tempting to narrow the rule
+# with ATTRS{bInterfaceNumber}=="01" so the input endpoint stays root-only.
+# That does not work. udev requires every ATTRS{} key in a single rule to
+# resolve on the *same* parent device, and on this hardware they do not:
+#
+#   .../usb3/3-1            ATTRS{idVendor}, ATTRS{idProduct}   <- usb_device
+#   .../usb3/3-1/3-1:1.1    ATTRS{bInterfaceNumber}             <- usb_interface
+#
+# (verified with `udevadm info -a -n /dev/hidraw2` on a real G502 HERO). A rule
+# combining the two silently matches nothing, leaving the node root-owned. So
+# both nodes are granted, which is also what libratbag and Solaar ship. The
+# practical cost is that a process which can already run as this user may read
+# raw mouse reports from interface 0; narrowing that safely needs a second rule
+# keyed on KERNELS, which is bus-path dependent and not portable.
+#
+# Install:
+#   sudo install -m 0644 packaging/99-logitech-g502.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger --subsystem-match=hidraw
+#   then UNPLUG AND REPLUG the mouse. udevadm trigger re-runs the rules, but a
+#   node that is already open keeps its old permissions, so the replug matters.
+#
+# Verify:
+#   ls -l /dev/hidraw*     # the G502's nodes should be group plugdev, mode 660
+#   ./g502ctl info         # should work with no sudo
+
+# G502 HERO / SE HERO (c08b) — probed and verified.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c08b", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Other G502 variants listed in g502/discover.py. UNTESTED — no hardware to
+# verify against. discover.open_device() probes for the node that actually
+# answers HID++, so granting both nodes is correct here too.
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c08d", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c332", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+SUBSYSTEM=="hidraw", KERNEL=="hidraw*", ATTRS{idVendor}=="046d", ATTRS{idProduct}=="c07d", MODE="0660", GROUP="plugdev", TAG+="uaccess"

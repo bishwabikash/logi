@@ -3,3 +3,4 @@ __pycache__/
 # vendor clones + large downloaded binaries, not ours to commit
 reference/
 artifacts/
+.pytest_cache/
