@@ -42,20 +42,43 @@ if [ "$DO_BIN" = 1 ] && [ ! -x "$BIN" ]; then
 fi
 
 if [ "$DO_UDEV" = 1 ]; then
-    RULE=/etc/udev/rules.d/99-logitech-g502.rules
-    if cmp -s "$HERE/99-logitech-g502.rules" "$RULE" 2>/dev/null; then
-        echo "udev rule already current: $RULE"
-    else
-        echo "Installing the udev rule to $RULE (needs sudo)."
-        sudo install -m 0644 "$HERE/99-logitech-g502.rules" "$RULE"
+    changed=0
+    for r in 99-logitech-g502.rules 99-g502-uinput.rules; do
+        dest="/etc/udev/rules.d/$r"
+        if cmp -s "$HERE/$r" "$dest" 2>/dev/null; then
+            echo "udev rule already current: $dest"
+        else
+            echo "Installing $dest (needs sudo)."
+            sudo install -m 0644 "$HERE/$r" "$dest"
+            changed=1
+        fi
+    done
+
+    # /dev/uinput does not exist until the module is loaded, so the rule has
+    # nothing to act on until then. Binding buttons to keystrokes needs it.
+    if ! lsmod | grep -q '^uinput'; then
+        echo "Loading the uinput module (needed to synthesise key presses)."
+        sudo modprobe uinput || echo "  could not load uinput; button bindings will not work"
+    fi
+    if [ ! -f /etc/modules-load.d/uinput.conf ]; then
+        echo uinput | sudo tee /etc/modules-load.d/uinput.conf >/dev/null
+        echo "uinput will now load at boot."
+    fi
+
+    if [ "$changed" = 1 ]; then
         sudo udevadm control --reload-rules
         sudo udevadm trigger --subsystem-match=hidraw
-        echo "udev rule installed."
+        sudo udevadm trigger --subsystem-match=misc
         echo
         echo "  >>> NOW UNPLUG AND REPLUG THE MOUSE. <<<"
         echo "  udevadm trigger re-runs the rules, but a node that is already"
         echo "  open keeps its old permissions, so the replug is what matters."
         echo
+    fi
+
+    if ! id -nG | tr " " "\n" | grep -qx plugdev; then
+        echo "  Note: you are not in the plugdev group. Add yourself with:"
+        echo "      sudo usermod -aG plugdev \$USER     (then log out and back in)"
     fi
 fi
 

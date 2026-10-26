@@ -1,0 +1,27 @@
+# Let g502 create a virtual input device without root.
+#
+# Binding a mouse button to a keyboard shortcut means synthesising key events,
+# and on Linux that is done by creating a virtual device through /dev/uinput.
+# That node is root-only by default, so without this rule the button-binding
+# feature cannot start.
+#
+# Two mechanisms, for the same reason as the hidraw rule beside this one:
+# uaccess covers the active local session on Wayland, GROUP covers ssh and
+# system services. plugdev rather than the more conventional input group,
+# because that is the group the hidraw rule beside this one already relies on,
+# so one group membership covers both. If you would rather use input:
+#   sudo usermod -aG input $USER     (needs a re-login)
+# and change GROUP below to match.
+#
+# Install:
+#   sudo install -m 0644 packaging/99-g502-uinput.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo modprobe uinput          # the node does not exist until this runs
+#   sudo udevadm trigger --subsystem-match=misc
+#
+# To have the module present after a reboot:
+#   echo uinput | sudo tee /etc/modules-load.d/uinput.conf
+#
+# Verify:
+#   ls -l /dev/uinput     # should be group input, mode 660
+KERNEL=="uinput", SUBSYSTEM=="misc", MODE="0660", GROUP="plugdev", TAG+="uaccess"
