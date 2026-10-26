@@ -46,6 +46,8 @@ pub struct App {
     btn_action: std::collections::HashMap<u8, String>,
 
     themed: bool,
+    /// Host mode kills the buttons, so it takes two clicks to enter.
+    host_armed: bool,
     /// True while the DPI slider is being dragged, so the live readout is not
     /// overwritten by the device's own value mid-drag.
     dpi_touched: bool,
@@ -71,6 +73,7 @@ impl App {
             backup_path: default_backup_path(),
             btn_action: std::collections::HashMap::new(),
             themed: false,
+            host_armed: false,
             dpi_touched: false,
         }
     }
@@ -114,6 +117,16 @@ fn default_backup_path() -> String {
 }
 
 impl eframe::App for App {
+    /// Hand the mouse back when the window closes.
+    ///
+    /// Host mode diverts the buttons to the host, so a mouse left in it has no
+    /// working click at all — and no way to click this app's Onboard button to
+    /// escape. This must run even on an unclean exit, so it is a blocking
+    /// restore rather than a message to the worker.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.dev.restore_onboard_blocking();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.themed {
             theme::apply(ctx);
@@ -125,6 +138,9 @@ impl eframe::App for App {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
 
         self.draw_sidebar(ctx);
+        if self.snap.mode == crate::profiles::MODE_HOST {
+            self.draw_host_banner(ctx);
+        }
         self.draw_status(ctx);
 
         egui::CentralPanel::default()
@@ -216,16 +232,91 @@ impl App {
                 }
 
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                    if self.snap.mode == crate::profiles::MODE_HOST {
-                        if ui.button("Hand back to mouse").clicked() {
-                            self.dev.send(Cmd::SetMode(crate::profiles::MODE_ONBOARD));
-                        }
-                        theme::hint(ui, "In host mode the mouse needs this app running.");
-                        ui.add_space(6.0);
-                    }
                     if ui.button("Refresh").clicked() {
                         self.dev.send(Cmd::Refresh);
                     }
+                    ui.add_space(14.0);
+
+                    // Memory mode. Host is a loaded gun: the mouse diverts its
+                    // buttons to the host, and nothing here synthesises them, so
+                    // the physical buttons stop working entirely. It therefore
+                    // takes two clicks and is reverted when the app exits.
+                    let host = self.snap.mode == crate::profiles::MODE_HOST;
+                    if host {
+                        theme::hint(
+                            ui,
+                            "Host: this app drives the mouse. Its stored profile is not \
+                             applied, lighting stops when the app does, and the physical \
+                             buttons do not work.",
+                        );
+                    } else if self.host_armed {
+                        ui.label(
+                            egui::RichText::new(
+                                "Host mode stops the physical buttons working. Click \
+                                 again to confirm.",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                    } else {
+                        theme::hint(
+                            ui,
+                            "Onboard: the mouse drives itself from its stored profile, \
+                             with nothing running. This is what you want.",
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(!host, "Onboard").clicked() {
+                            self.host_armed = false;
+                            if host {
+                                self.dev.send(Cmd::SetMode(crate::profiles::MODE_ONBOARD));
+                            }
+                        }
+                        let label = if self.host_armed && !host { "Confirm" } else { "Host" };
+                        if ui.selectable_label(host, label).clicked() && !host {
+                            if self.host_armed {
+                                self.host_armed = false;
+                                self.dev.send(Cmd::SetMode(crate::profiles::MODE_HOST));
+                            } else {
+                                self.host_armed = true;
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new("MEMORY MODE")
+                            .color(theme::MUTED)
+                            .size(11.0)
+                            .strong(),
+                    );
+                });
+            });
+    }
+
+    fn draw_host_banner(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("hostwarn")
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::WARN.gamma_multiply(0.16))
+                    .inner_margin(egui::Margin::symmetric(16, 9)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "Host mode: the mouse's physical buttons are diverted and \
+                             will not click.",
+                        )
+                        .color(theme::WARN)
+                        .size(13.0)
+                        .strong(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Restore buttons").clicked() {
+                            self.dev.send(Cmd::SetMode(crate::profiles::MODE_ONBOARD));
+                        }
+                    });
                 });
             });
     }

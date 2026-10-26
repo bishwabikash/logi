@@ -75,11 +75,35 @@ pub struct ZoneInfo {
 pub struct Handle {
     tx: Sender<Cmd>,
     snapshot: Arc<Mutex<Snapshot>>,
+    /// Set while the worker holds the device in host mode, so shutdown knows
+    /// whether it has to hand the mouse back.
+    host_held: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Handle {
     pub fn send(&self, c: Cmd) {
         let _ = self.tx.send(c);
+    }
+
+    pub fn host_held(&self) -> bool {
+        self.host_held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Put the mouse back into onboard mode, synchronously.
+    ///
+    /// Host mode diverts the buttons to the host, so a mouse left in it has no
+    /// working click. That must never outlive the app, which means doing it
+    /// here rather than posting a command the worker might not reach.
+    pub fn restore_onboard_blocking(&self) {
+        if !self.host_held() {
+            return;
+        }
+        if let Ok(f) = crate::discover::open_device() {
+            let mut dev = f.device;
+            if let Ok(p) = crate::profiles::OnboardProfiles::new(&mut dev) {
+                let _ = p.set_mode(&mut dev, crate::profiles::MODE_ONBOARD);
+            }
+        }
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -93,11 +117,13 @@ pub fn spawn() -> Handle {
     let (tx, rx) = mpsc::channel::<Cmd>();
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let shared = Arc::clone(&snapshot);
+    let host_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let held = Arc::clone(&host_held);
     std::thread::Builder::new()
         .name("g502-device".into())
-        .spawn(move || worker(rx, shared))
+        .spawn(move || worker(rx, shared, held))
         .expect("spawn device thread");
-    Handle { tx, snapshot }
+    Handle { tx, snapshot, host_held }
 }
 
 /// Take host mode only if we are not already in it. Each switch costs a
@@ -222,7 +248,11 @@ fn read_snapshot(l: &mut Live) -> Snapshot {
     s
 }
 
-fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
+fn worker(
+    rx: Receiver<Cmd>,
+    shared: Arc<Mutex<Snapshot>>,
+    host_held: Arc<std::sync::atomic::AtomicBool>,
+) {
     let mut live: Option<Live> = None;
     let mut effect: Option<effects::Running> = None;
     let mut pending: std::collections::VecDeque<Cmd> = std::collections::VecDeque::new();
@@ -372,6 +402,10 @@ fn worker(rx: Receiver<Cmd>, shared: Arc<Mutex<Snapshot>>) {
             Ok(notice) => {
                 if let Ok(mut g) = shared.lock() {
                     read_state(l, &mut g);
+                    host_held.store(
+                        g.mode == crate::profiles::MODE_HOST,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     if wrote_flash || g.profiles.is_empty() {
                         read_profiles(l, &mut g);
                     }
