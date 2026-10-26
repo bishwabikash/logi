@@ -1,0 +1,18 @@
+[Unit]
+Description=G502 per-application profile switching
+Documentation=file:///usr/local/share/doc/g502/README.md
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/g502ctl watch --quiet
+Restart=on-failure
+RestartSec=5
+# Reads /proc for process names and one hidraw node; nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# vendor clones + large downloaded binaries, not ours to commit
+reference/
+artifacts/

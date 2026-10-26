@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""g502ctl — control a Logitech G502 HERO over HID++ 2.0."""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from g502 import config as cfgmod
+from g502 import effects as fx
+from g502 import features as F
+from g502.discover import open_device
+from g502.dpi import Dpi
+from g502.hidpp import HidppError, HidppTimeout
+from g502.led import MODE_NAMES as LED_MODE_NAMES, Leds, parse_color
+from g502.profile_blob import Button, Led, Profile
+from g502.profiles import MODE_NAMES, OnboardProfiles
+from g502.rate import ReportRate
+
+
+def need_root() -> None:
+    import os
+    if os.geteuid() != 0:
+        sys.exit("g502ctl: needs root for raw HID access (try sudo), or install "
+                 "the udev rule: sudo ./install.sh udev")
+
+
+def cmd_info(a) -> int:
+    d = open_device()
+    print(f"device   : {d.model} (046d:{d.pid:04x})")
+    print(f"endpoint : {d.path}")
+    print(f"HID++    : {'.'.join(map(str, d.protocol_version()))}")
+    try:
+        dp = Dpi(d)
+        cap = dp.capability()
+        if cap["kind"] == "range":
+            print(f"dpi      : {dp.get()}  (range {cap['min']}-{cap['max']} "
+                  f"step {cap['step']})")
+        else:
+            print(f"dpi      : {dp.get()}  (choices {cap['values']})")
+    except (KeyError, HidppError, HidppTimeout):
+        pass
+    try:
+        rr = ReportRate(d)
+        print(f"rate     : {rr.get()} Hz  (supported {rr.supported()})")
+    except (KeyError, HidppError, HidppTimeout):
+        pass
+    op = OnboardProfiles(d)
+    print(f"mode     : {op.mode()} ({MODE_NAMES.get(op.mode(), '?')})")
+    print(f"profiles : {op.info.profile_count} + {op.info.profile_count_oob} ROM, "
+          f"active {op.current()}")
+    leds = Leds(d)
+    print(f"zones    : {leds.zone_count}")
+    for z in leds.zones:
+        modes = ", ".join(LED_MODE_NAMES.get(m, hex(m)) for m in z.modes)
+        print(f"  zone {z.index}: {z.location_name:<16} modes=[{modes}]")
+    d.close()
+    return 0
+
+
+def cmd_dpi(a) -> int:
+    d = open_device()
+    dp = Dpi(d)
+    if a.value is None:
+        print(dp.get())
+    else:
+        print(f"dpi set to {dp.set(a.value)}")
+    d.close()
+    return 0
+
+
+def cmd_rate(a) -> int:
+    d = open_device()
+    rr = ReportRate(d)
+    if a.value is None:
+        print(rr.get())
+    else:
+        rr.set(a.value)
+        print(f"rate set to {rr.get()} Hz")
+    d.close()
+    return 0
+
+
+def cmd_profile(a) -> int:
+    d = open_device()
+    op = OnboardProfiles(d)
+    if a.index is None:
+        print(op.current())
+    else:
+        op.set_current(a.index)
+        print(f"active profile {op.current()}")
+    d.close()
+    return 0
+
+
+def cmd_show(a) -> int:
+    d = open_device()
+    op = OnboardProfiles(d)
+    n = a.index if a.index is not None else op.current()
+    blob = op.read_sector(n + 1)
+    p = Profile.parse(blob)
+    print(f"--- profile {n} (sector {n + 1}) crc_ok={p.crc_ok()} ---")
+    print(p.describe(op.info.button_count))
+    d.close()
+    return 0
+
+
+def cmd_led(a) -> int:
+    """Live lighting. Needs host mode, so it is held only while we run."""
+    d = open_device()
+    leds, op = Leds(d), OnboardProfiles(d)
+    with op.host_mode():
+        if a.mode == "off":
+            leds.all_off()
+        elif a.mode == "solid":
+            r, g, b = parse_color(a.color)
+            leds.all_fixed(r, g, b)
+        elif a.mode == "breathing":
+            r, g, b = parse_color(a.color)
+            for z in range(leds.zone_count):
+                leds.breathing(z, r, g, b, a.period, a.waveform, a.intensity)
+        elif a.mode == "cycle":
+            for z in range(leds.zone_count):
+                leds.cycle(z, a.period, a.intensity)
+        print(f"applied {a.mode}")
+        if a.hold:
+            print("holding host mode; Ctrl-C to release")
+            try:
+                while True:
+                    __import__("time").sleep(1)
+            except KeyboardInterrupt:
+                pass
+        else:
+            print("note: releasing host mode restores the stored profile "
+                  "lighting. Use --hold to keep it, or 'persist' to store it.")
+    d.close()
+    return 0
+
+
+def cmd_persist(a) -> int:
+    """Write lighting into the profile so it survives without a daemon."""
+    d = open_device()
+    op = OnboardProfiles(d)
+    n = a.index if a.index is not None else op.current()
+    blob = op.read_sector(n + 1)
+    p = Profile.parse(blob)
+    if not p.crc_ok():
+        d.close()
+        sys.exit(f"profile {n} has a bad CRC already; refusing to write")
+    if a.mode == "off":
+        led = Led.off()
+    elif a.mode == "solid":
+        led = Led.fixed(*parse_color(a.color))
+    elif a.mode == "breathing":
+        from g502.led import WAVEFORMS
+        led = Led.breathing(*parse_color(a.color), a.period,
+                            WAVEFORMS.get(a.waveform, 0), a.intensity)
+    else:
+        led = Led.cycle(a.period, a.intensity)
+    p.leds = [led] * len(p.leds)
+    p.alt_leds = [led] * len(p.alt_leds)
+    op.write_sector(n + 1, p.serialize(), verify=True)
+    print(f"profile {n} lighting -> {led.describe()} (stored to flash)")
+    d.close()
+    return 0
+
+
+def cmd_button(a) -> int:
+    d = open_device()
+    op = OnboardProfiles(d)
+    n = a.profile if a.profile is not None else op.current()
+    blob = op.read_sector(n + 1)
+    p = Profile.parse(blob)
+    if not p.crc_ok():
+        d.close()
+        sys.exit(f"profile {n} has a bad CRC already; refusing to write")
+    spec = a.action
+    if spec.startswith("button:"):
+        new = Button.mouse(int(spec.split(":", 1)[1]))
+    elif spec.startswith("key:"):
+        new = Button.key(int(spec.split(":", 1)[1], 0))
+    elif spec in ("none", "disabled"):
+        new = Button.disabled()
+    else:
+        new = Button.special(spec)
+    old = p.buttons[a.index]
+    p.buttons[a.index] = new
+    op.write_sector(n + 1, p.serialize(), verify=True)
+    print(f"profile {n} button {a.index}: {old.describe()} -> {new.describe()}")
+    d.close()
+    return 0
+
+
+def cmd_effect(a) -> int:
+    d = open_device()
+    eng = fx.Engine(d, fps=a.fps)
+    gen = fx.EFFECTS[a.name]
+    kwargs = {}
+    if a.name in ("solid", "breathe", "gradient", "wave", "audio"):
+        kwargs["color"] = parse_color(a.color)
+    if a.name == "gradient":
+        kwargs["b"] = parse_color(a.color2)
+        kwargs["a"] = kwargs.pop("color")
+    if a.name in ("rainbow", "breathe", "gradient", "wave"):
+        kwargs["period"] = a.period / 1000.0
+    if a.name in ("rainbow", "wave", "audio"):
+        kwargs["zones"] = eng.zone_count
+    if a.name == "breathe":
+        kwargs["curve"] = a.waveform
+    try:
+        frames = eng.run(gen(**kwargs), duration=a.duration)
+    except RuntimeError as e:
+        d.close()
+        sys.exit(f"g502ctl: {e}")
+    print(f"\n{frames} frames pushed; device restored to onboard mode")
+    d.close()
+    return 0
+
+
+def cmd_watch(a) -> int:
+    from g502.appwatch import Watcher
+    cfg = cfgmod.load(a.config)
+    d = open_device()
+    Watcher(d, cfg, interval=a.interval, verbose=not a.quiet).run()
+    d.close()
+    return 0
+
+
+def cmd_config(a) -> int:
+    if a.init:
+        p = cfgmod.save(cfgmod.DEFAULT_CONFIG, a.config)
+        print(f"wrote default config to {p}")
+    else:
+        import json
+        print(json.dumps(cfgmod.load(a.config), indent=2))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="g502ctl", description="Control a Logitech G502 HERO.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("info", help="show device capabilities").set_defaults(fn=cmd_info)
+
+    p = sub.add_parser("dpi", help="get/set DPI (100-25600, step 50)")
+    p.add_argument("value", nargs="?", type=int)
+    p.set_defaults(fn=cmd_dpi)
+
+    p = sub.add_parser("rate", help="get/set report rate in Hz")
+    p.add_argument("value", nargs="?", type=int)
+    p.set_defaults(fn=cmd_rate)
+
+    p = sub.add_parser("profile", help="get/set active profile")
+    p.add_argument("index", nargs="?", type=int)
+    p.set_defaults(fn=cmd_profile)
+
+    p = sub.add_parser("show", help="decode a stored profile")
+    p.add_argument("index", nargs="?", type=int)
+    p.set_defaults(fn=cmd_show)
+
+    for name, fn, helptext in (
+            ("led", cmd_led, "live lighting (while held)"),
+            ("persist", cmd_persist, "store lighting into profile flash")):
+        p = sub.add_parser(name, help=helptext)
+        p.add_argument("mode", choices=["off", "solid", "breathing", "cycle"])
+        p.add_argument("color", nargs="?", default="00ffff")
+        p.add_argument("--period", type=int, default=4000, help="ms")
+        p.add_argument("--waveform", default="default")
+        p.add_argument("--intensity", type=int, default=100)
+        if name == "led":
+            p.add_argument("--hold", action="store_true")
+        else:
+            p.add_argument("--index", type=int, default=None)
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("button", help="remap a button in profile flash")
+    p.add_argument("index", type=int)
+    p.add_argument("action", help="button:N | key:0xNN | none | "
+                                  "wheel-left wheel-right dpi-up dpi-down "
+                                  "dpi-cycle dpi-default dpi-shift profile-up "
+                                  "profile-down profile-cycle second-mode")
+    p.add_argument("--profile", type=int, default=None)
+    p.set_defaults(fn=cmd_button)
+
+    p = sub.add_parser("effect", help="host-driven animation")
+    p.add_argument("name", choices=sorted(fx.EFFECTS))
+    p.add_argument("color", nargs="?", default="00ffff")
+    p.add_argument("--color2", default="ff00ff", help="gradient end colour")
+    p.add_argument("--period", type=int, default=4000, help="ms")
+    p.add_argument("--waveform", default="sine")
+    p.add_argument("--fps", type=int, default=60)
+    p.add_argument("--duration", type=float, default=None, help="seconds")
+    p.set_defaults(fn=cmd_effect)
+
+    p = sub.add_parser("watch", help="per-application profile switching")
+    p.add_argument("--config", default=None)
+    p.add_argument("--interval", type=float, default=2.0)
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(fn=cmd_watch)
+
+    p = sub.add_parser("config", help="show or create the config file")
+    p.add_argument("--init", action="store_true")
+    p.add_argument("--config", default=None)
+    p.set_defaults(fn=cmd_config)
+
+    a = ap.parse_args()
+    if a.cmd != "config":
+        need_root()
+    try:
+        return a.fn(a)
+    except (HidppError, HidppTimeout) as e:
+        sys.exit(f"g502ctl: device error: {e}")
+    except (RuntimeError, ValueError) as e:
+        sys.exit(f"g502ctl: {e}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
