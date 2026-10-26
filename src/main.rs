@@ -20,6 +20,8 @@ mod profile_blob;
 mod profile_io;
 mod profiles;
 mod rate;
+mod service;
+mod tray;
 mod uinput;
 
 use hidpp::Error;
@@ -129,6 +131,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "mode" => cmd_mode(args.get(1)),
         "watch" => cmd_watch(&args[1..]),
         "serve" => cmd_serve(),
+        "bind" => cmd_bind(&args[1..]),
         "led" => cmd_led(&args[1..]),
         "effect" => cmd_effect(&args[1..]),
         "backup" => {
@@ -511,6 +514,174 @@ fn install_interrupt_handler() {
         libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_interrupt as *const () as libc::sighandler_t);
     }
+}
+
+/// A Keymap over uinput's tables, which is what actions.rs expects.
+fn keymap() -> actions::FnKeymap<fn(&str) -> Option<u16>, fn(u16) -> Option<String>> {
+    actions::FnKeymap::new(
+        uinput::key_code as fn(&str) -> Option<u16>,
+        (|c| uinput::key_name(c).map(|s| s.to_string())) as fn(u16) -> Option<String>,
+    )
+}
+
+/// Carry out one bound action on the virtual input device.
+fn perform(action: &actions::Action, vd: &mut uinput::VirtualDevice) -> std::io::Result<()> {
+    match action {
+        actions::Action::Key { mods, code } => vd.chord(mods, *code),
+        actions::Action::Text(t) => vd.type_text(t),
+        actions::Action::MouseButton(c) => vd.tap(*c),
+        actions::Action::Command(cmd) => {
+            // Detached and never waited on, so a slow command cannot stall the
+            // event loop. Reaping is left to init by double-forking through
+            // setsid, which also stops a long-running child dying with us.
+            let mut parts = cmd.split_whitespace();
+            let Some(prog) = parts.next() else { return Ok(()) };
+            let args: Vec<&str> = parts.collect();
+            std::process::Command::new("setsid")
+                .arg("--fork")
+                .arg(prog)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(|_| ())
+        }
+        actions::Action::Nothing => Ok(()),
+    }
+}
+
+fn cmd_bind(args: &[String]) -> Result<(), CliError> {
+    let path = actions::config_path();
+    match args.first().map(|s| s.as_str()) {
+        Some("reset") => {
+            // The escape hatch. Deliberately does not depend on a saved
+            // snapshot: a device whose table is already zeroed has nothing
+            // useful to restore, only the factory identity.
+            let mut f = open()?;
+            let spy = buttonspy::ButtonSpy::new(&mut f.device)?;
+            spy.restore_identity(&mut f.device)?;
+            println!("Factory button mapping restored on {}.", f.name);
+            println!("Every physical button does its normal job again.");
+            Ok(())
+        }
+        Some("run") => cmd_bind_run(),
+        None | Some("list") => {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            if text.trim().is_empty() {
+                if let Some(d) = path.parent() {
+                    let _ = std::fs::create_dir_all(d);
+                }
+                let _ = std::fs::write(&path, actions::EXAMPLE);
+                println!("Wrote an example binding file to {}.", path.display());
+                println!("Edit it, or use the Buttons tab in the app, then `logi bind run`.");
+                return Ok(());
+            }
+            let km = keymap();
+            let (b, problems) = actions::Bindings::parse(&text, &km);
+            for p in &problems {
+                eprintln!("logi: {}: {p}", path.display());
+            }
+            println!("{}", path.display());
+            for bind in &b.list {
+                let mode = match bind.mode {
+                    actions::BindMode::Augment => "augment",
+                    actions::BindMode::Replace => "replace",
+                };
+                println!("  button {:<3} {:<9} {}", bind.button, mode, bind.action.describe(&km));
+            }
+            if b.list.is_empty() {
+                println!("  (no bindings)");
+            }
+            Ok(())
+        }
+        Some(o) => Err(CliError::Usage(format!("unknown bind command {o:?}"))),
+    }
+}
+
+/// Run the spy: silence what Replace asks for, listen, act, and always put the
+/// device back.
+fn cmd_bind_run() -> Result<(), CliError> {
+    let path = actions::config_path();
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| CliError::Failed(format!("reading {}: {e}", path.display())))?;
+    let km = keymap();
+    let (bindings, problems) = actions::Bindings::parse(&text, &km);
+    for p in &problems {
+        eprintln!("logi: {}: {p}", path.display());
+    }
+    if bindings.list.is_empty() {
+        return Err(CliError::Failed(format!("{} has no bindings", path.display())));
+    }
+
+    let mut f = open()?;
+    if !f.caps.button_spy {
+        return Err(CliError::Failed(format!(
+            "{} does not report the button-spy feature (0x8110)",
+            f.name
+        )));
+    }
+    let spy = buttonspy::ButtonSpy::new(&mut f.device)?;
+    let mut vd = uinput::VirtualDevice::new("logi virtual input").map_err(|e| {
+        CliError::Failed(format!(
+            "{e}
+
+Binding buttons needs /dev/uinput. Install the rules with:
+                 packaging/install.sh
+             then re-plug the mouse."
+        ))
+    })?;
+
+    // Anything that silences a button must be undone even on an abnormal exit,
+    // because a silenced button that outlives this process is a mouse the user
+    // cannot fix by clicking.
+    install_interrupt_handler();
+    let silence = bindings.to_silence();
+    if !silence.is_empty() {
+        spy.silence(&mut f.device, &silence)?;
+    }
+
+    let outcome = (|| -> Result<(), CliError> {
+        spy.start(&mut f.device)?;
+        let mut listener = f.device.open_listener()?;
+        let idx = spy.feature_index();
+        println!("logi: acting on {} binding(s); Ctrl-C to stop", bindings.list.len());
+        let mut prev: u16 = 0;
+        while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let Some(report) =
+                listener.read_event(std::time::Duration::from_millis(250))?
+            else {
+                continue;
+            };
+            let Some(now) = buttonspy::decode_event(&report, idx) else { continue };
+            let (pressed, _released) = buttonspy::transitions(prev, now);
+            prev = now;
+            for b in pressed {
+                if let Some(bind) = bindings.get(b) {
+                    if let Err(e) = perform(&bind.action, &mut vd) {
+                        eprintln!("logi: button {b}: {e}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    // Unconditional teardown. Report failures rather than swallowing them:
+    // a restore that did not happen is exactly what the user needs to know.
+    if let Err(e) = spy.stop(&mut f.device) {
+        eprintln!("logi: could not stop the spy: {e}");
+    }
+    if !silence.is_empty() {
+        match spy.restore(&mut f.device) {
+            Ok(()) => println!("logi: button mapping restored"),
+            Err(e) => eprintln!(
+                "logi: COULD NOT RESTORE the button mapping: {e}
+                 Run `logi bind reset` to put it back."
+            ),
+        }
+    }
+    outcome
 }
 
 /// The background service.

@@ -23,6 +23,9 @@ pub const MAX_BUTTON: u8 = 16;
 /// kernel's key table.
 pub trait Keymap {
     fn code(&self, name: &str) -> Option<u16>;
+    /// Some only for codes the host side can actually emit. Parsing leans on
+    /// that: a raw numeric code the keymap cannot name is refused, because the
+    /// virtual device never registers it and the binding would do nothing.
     fn name(&self, code: u16) -> Option<String>;
 }
 
@@ -89,13 +92,18 @@ fn canonical(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-/// A name, or a raw numeric code. The numeric form exists so that
-/// `describe` round-trips a code the keymap has no name for.
+/// A name, or a raw decimal code.
+///
+/// The numeric form is only accepted for a code the keymap can name back, so
+/// that every code this returns is one the host can emit. Taking any number
+/// would turn `key 999` into a binding that parses, loads, and then silently
+/// does nothing on every press.
 fn key_code(keys: &dyn Keymap, name: &str) -> Option<u16> {
-    if name.is_empty() {
-        return None;
+    if let Some(c) = keys.code(canonical(name)) {
+        return Some(c);
     }
-    keys.code(canonical(name)).or_else(|| name.parse::<u16>().ok())
+    let c = name.parse::<u16>().ok()?;
+    keys.name(c).map(|_| c)
 }
 
 fn key_label(keys: &dyn Keymap, code: u16, short: bool) -> String {
@@ -123,11 +131,13 @@ fn unknown_key(name: &str) -> String {
 pub enum Action {
     /// A key, optionally with modifiers: "ctrl+c", "f5", "volumeup".
     Key { mods: Vec<u16>, code: u16 },
-    /// Type a literal string.
+    /// Type a literal string. One line: the config file is line-based and has
+    /// no escape syntax, so a newline here cannot be written back out.
     Text(String),
     /// Another mouse button, by Linux BTN_* code.
     MouseButton(u16),
-    /// Run a shell command, detached, without blocking the caller.
+    /// Run a command, detached, without blocking the caller. One line, for the
+    /// reason given on `Text`.
     Command(String),
     /// Explicitly do nothing. Useful with Replace to disable a button.
     Nothing,
@@ -142,14 +152,18 @@ impl Action {
             Some((w, r)) => (w, r.trim()),
             None => (t, ""),
         };
+        // `text` and `command` take the rest of the line verbatim; the actions
+        // with a fixed grammar get a trailing comment cut off them instead.
+        // `strip_comment` says why the line is drawn here.
+        let bare = strip_comment(rest).trim();
         match word.to_ascii_lowercase().as_str() {
             "key" => {
-                if rest.is_empty() {
+                if bare.is_empty() {
                     return Err("`key` needs a key name, like ctrl+c".into());
                 }
-                let parts: Vec<&str> = rest.split('+').map(str::trim).collect();
+                let parts: Vec<&str> = bare.split('+').map(str::trim).collect();
                 if parts.iter().any(|p| p.is_empty()) {
-                    return Err(format!("bad key {rest:?}: empty name beside a +"));
+                    return Err(format!("bad key {bare:?}: empty name beside a +"));
                 }
                 let (last, mods) = parts.split_last().unwrap();
                 let mut codes = Vec::with_capacity(mods.len());
@@ -166,15 +180,25 @@ impl Action {
                 Ok(Action::Text(rest.to_string()))
             }
             "mouse" => {
-                let found = MOUSE_BUTTONS
+                let code = MOUSE_BUTTONS
                     .iter()
-                    .find(|(n, _)| n.eq_ignore_ascii_case(rest))
+                    .find(|(n, _)| n.eq_ignore_ascii_case(bare))
                     .map(|(_, c)| *c)
-                    .or_else(|| rest.parse::<u16>().ok());
-                found.map(Action::MouseButton).ok_or_else(|| {
-                    let names: Vec<&str> = MOUSE_BUTTONS.iter().map(|(n, _)| *n).collect();
-                    format!("unknown mouse button {rest:?}; want one of {}", names.join(" "))
-                })
+                    .or_else(|| bare.parse::<u16>().ok())
+                    .ok_or_else(|| {
+                        let names: Vec<&str> = MOUSE_BUTTONS.iter().map(|(n, _)| *n).collect();
+                        format!("unknown mouse button {bare:?}; want one of {}", names.join(" "))
+                    })?;
+                // The names above are resolved without the keymap, so the code
+                // is checked against it: a binding the host cannot press would
+                // leave a Replace-bound button silenced and doing nothing,
+                // which is the one failure worth being strict about.
+                if keys.name(code).is_none() {
+                    return Err(format!(
+                        "mouse button {bare:?} (code {code}) is not one the host can press"
+                    ));
+                }
+                Ok(Action::MouseButton(code))
             }
             "command" => {
                 if rest.is_empty() {
@@ -183,10 +207,10 @@ impl Action {
                 Ok(Action::Command(rest.to_string()))
             }
             "nothing" => {
-                if rest.is_empty() {
+                if bare.is_empty() {
                     Ok(Action::Nothing)
                 } else {
-                    Err(format!("`nothing` takes no argument, got {rest:?}"))
+                    Err(format!("`nothing` takes no argument, got {bare:?}"))
                 }
             }
             "" => Err("expected an action: key, text, mouse, command or nothing".into()),
@@ -240,9 +264,15 @@ impl Bindings {
         self.list.iter().find(|b| b.button == button)
     }
 
-    /// Buttons that must be silenced in the remapping table.
+    /// Buttons that must be silenced in the device's remapping table.
     ///
     /// Only Replace bindings: augmenting a button must never take it away.
+    ///
+    /// The dangerous half belongs to the caller. Silence a button only once
+    /// the host side is known to work — a silenced button with nothing
+    /// listening is a dead button, and it stays dead across unplugging — and
+    /// check these numbers against the device's own button count, not
+    /// `MAX_BUTTON`, which is only the event bitmap's ceiling.
     pub fn to_silence(&self) -> Vec<u8> {
         let mut v: Vec<u8> = self
             .list
@@ -262,8 +292,11 @@ impl Bindings {
         let mut out = Bindings::default();
         let mut problems = Vec::new();
         for (n, raw) in text.lines().enumerate() {
-            let line = strip_comment(raw).trim();
-            if line.is_empty() {
+            let line = raw.trim();
+            // Only a whole-line comment is dropped here. A `#` further along
+            // is the action's business, because a `text` or `command` value
+            // owns the rest of the line.
+            if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let Some((lhs, rhs)) = line.split_once('=') else {
@@ -316,9 +349,17 @@ impl Bindings {
     }
 }
 
-/// `#` starts a comment at the start of a line or after whitespace only, so
-/// that `text issue#5` and `command sed s/#//` survive. There is no escape
-/// for a space-preceded `#` in a text or command action.
+/// Cut a trailing `#` comment off an action that has a fixed grammar.
+///
+/// Deliberately not applied to a `text` or `command` value. There is no escape
+/// syntax, so either `#` is a comment marker everywhere — and `text see #5`
+/// quietly loses half its payload, while `text #5` loses the whole binding —
+/// or a free-form value runs to the end of the line and a comment needs a line
+/// of its own. The second loses nothing and keeps `render` an exact inverse of
+/// `parse`, which matters once anything but a human writes the file.
+///
+/// The marker still has to follow whitespace, so `mouse 4#2` stays a bad
+/// number rather than becoming a valid 4.
 fn strip_comment(line: &str) -> &str {
     let b = line.as_bytes();
     for i in 0..b.len() {
@@ -391,6 +432,11 @@ pub fn argv(command: &str) -> Vec<String> {
 /// `wait` on it. The thread blocks, never the caller, and the reap happens
 /// whenever the command finishes, so nothing becomes a zombie. A double fork
 /// would also work, but this needs no unsafe code.
+///
+/// `Builder`, not `thread::spawn`, which panics when the process cannot make
+/// another thread: a button press must not be able to kill the driver. If the
+/// reaper will not start, the error is returned and that one child is left for
+/// process exit to collect.
 pub fn spawn_detached(command: &str) -> std::io::Result<()> {
     let args = argv(command);
     let Some((exe, rest)) = args.split_first() else {
@@ -406,10 +452,14 @@ pub fn spawn_detached(command: &str) -> std::io::Result<()> {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn()?;
-    std::thread::spawn(move || {
-        let mut child = child;
-        let _ = child.wait();
-    });
+    // The reaper only ever sits in wait(), so it has no use for the default
+    // 8 MiB of stack apiece.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        })?;
     Ok(())
 }
 
@@ -424,15 +474,21 @@ pub fn config_path() -> std::path::PathBuf {
 pub const EXAMPLE: &str = "\
 # logi button bindings.
 #
-# One `button N [replace] = ACTION` per line, `#` starts a comment. Button
-# numbers are the device's own, 1 upwards; `logi buttons watch` prints which
-# physical button is which.
+# One `button N [replace] = ACTION` per line. A line starting with `#` is a
+# comment, and so is a `#` after the action on a `key`, `mouse` or `nothing`
+# line; a `text` or `command` value instead runs to the end of the line, so
+# give those a comment line of their own rather than a trailing one.
+#
+# Button numbers are the device's own, counting from 1. Press each button
+# while watching button events to see which is which.
 #
 # ACTION is one of:
-#   key ctrl+c              a key, with modifiers (ctrl shift alt super)
+#   key ctrl+c              a key, with modifiers (ctrl shift alt super).
+#                           Any name the driver knows; a raw code is taken
+#                           only if it is one it can actually press.
 #   text Hello there        type a literal string
 #   mouse middle            another mouse button: left right middle side
-#                           extra forward back task, or a raw Linux code
+#                           extra forward back task, or a raw BTN_ code
 #   command notify-send hi  run a program, detached from this one
 #   nothing                 do nothing
 #
@@ -468,6 +524,9 @@ mod tests {
         ("volumeup", 115),
         ("leftctrl", 29),
         ("leftshift", 42),
+        // uinput's table carries the BTN_ range too, so `mouse 274` has to
+        // have somewhere to resolve.
+        ("btn_middle", 0x112),
     ];
 
     impl Keymap for FakeKeys {
@@ -512,11 +571,69 @@ mod tests {
     }
 
     #[test]
-    fn a_nameless_code_round_trips_numerically() {
-        // 999 is not in the fake table, so describe falls back to the number
-        // and parse has to take it back.
-        assert_eq!(round_trip("key 999"), Action::Key { mods: vec![], code: 999 });
-        assert_eq!(round_trip("mouse 300"), Action::MouseButton(300));
+    fn a_raw_code_is_taken_only_when_the_keymap_knows_it() {
+        // A code the keymap names is usable, and describe prints the name.
+        let a = Action::parse("key 63", &FakeKeys).unwrap();
+        assert_eq!(a, Action::Key { mods: vec![], code: 63 });
+        assert_eq!(a.describe(&FakeKeys), "key f5");
+        assert_eq!(round_trip("mouse 274"), Action::MouseButton(0x112));
+
+        // A code nothing can press has to fail here, where the error is
+        // printed, rather than silently on every press for ever after.
+        // `mouse side` is a known name, but the fake keymap cannot press it,
+        // so it is refused for the same reason.
+        for bad in ["key 999", "key ctrl+999", "mouse 300", "mouse side"] {
+            assert!(Action::parse(bad, &FakeKeys).is_err(), "{bad:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn a_free_form_value_keeps_everything_after_a_hash() {
+        let src = "button 9 = text see # 5\nbutton 8 = command sed s/#// a # b\n";
+        let (b, probs) = Bindings::parse(src, &FakeKeys);
+        assert!(probs.is_empty(), "{probs:?}");
+        assert_eq!(b.get(9).unwrap().action, Action::Text("see # 5".into()));
+        assert_eq!(
+            b.get(8).unwrap().action,
+            Action::Command("sed s/#// a # b".into())
+        );
+        // The whole point: what render writes, parse reads back unchanged.
+        assert_eq!(b.render(&FakeKeys), src);
+    }
+
+    #[test]
+    fn a_text_value_that_is_only_a_hash_is_not_a_dropped_binding() {
+        let (b, probs) = Bindings::parse("button 9 = text #5\n", &FakeKeys);
+        assert!(probs.is_empty(), "{probs:?}");
+        assert_eq!(b.get(9).unwrap().action, Action::Text("#5".into()));
+    }
+
+    #[test]
+    fn a_fixed_action_still_loses_a_trailing_comment() {
+        let (b, probs) = Bindings::parse(
+            "button 10 = key ctrl+c   # copy\n\
+             button 7 = mouse middle  # wheel click\n\
+             button 6 replace = nothing # dead\n",
+            &FakeKeys,
+        );
+        assert!(probs.is_empty(), "{probs:?}");
+        assert_eq!(b.get(10).unwrap().action, Action::Key { mods: vec![29], code: 46 });
+        assert_eq!(b.get(7).unwrap().action, Action::MouseButton(0x112));
+        assert_eq!(b.get(6).unwrap().action, Action::Nothing);
+    }
+
+    #[test]
+    fn a_command_spawns_without_waiting_for_it() {
+        // The child runs for a second; the call has to come straight back or a
+        // bound button would freeze the event loop for as long as it runs.
+        let t = std::time::Instant::now();
+        spawn_detached("/bin/sleep 1").expect("spawn /bin/sleep");
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
+    }
+
+    #[test]
+    fn a_missing_program_is_an_error_not_a_panic() {
+        assert!(spawn_detached("/nonexistent/no-such-program").is_err());
     }
 
     #[test]
@@ -667,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    fn config_path_is_under_g502() {
+    fn config_path_is_under_logi() {
         let p = config_path();
         assert!(p.ends_with("logi/bindings.conf"), "{p:?}");
     }

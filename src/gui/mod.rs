@@ -7,6 +7,9 @@ use crate::led;
 use crate::profile_blob::{Button, Led, SPECIALS};
 use eframe::egui;
 
+pub mod bindings_editor;
+pub mod profile_editor;
+pub mod rules_editor;
 pub mod theme;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -15,6 +18,8 @@ enum Tab {
     Lighting,
     Profiles,
     Buttons,
+    Apps,
+    Service,
     About,
 }
 
@@ -46,6 +51,12 @@ pub struct App {
     btn_action: std::collections::HashMap<u8, String>,
 
     themed: bool,
+    profile_editor: profile_editor::ProfileEditor,
+    rules: rules_editor::RulesEditor,
+    bindings: bindings_editor::BindingsEditor,
+    service: crate::service::Watcher,
+    /// Editors read their config files once, off the first paint.
+    loaded: bool,
     /// True while the DPI slider is being dragged, so the live readout is not
     /// overwritten by the device's own value mid-drag.
     dpi_touched: bool,
@@ -71,6 +82,11 @@ impl App {
             backup_path: default_backup_path(),
             btn_action: std::collections::HashMap::new(),
             themed: false,
+            profile_editor: profile_editor::ProfileEditor::new(),
+            rules: rules_editor::RulesEditor::new(),
+            bindings: bindings_editor::BindingsEditor::new(),
+            service: crate::service::Watcher::new(),
+            loaded: false,
             dpi_touched: false,
         }
     }
@@ -129,6 +145,12 @@ impl eframe::App for App {
             theme::apply(ctx);
             self.themed = true;
         }
+        if !self.loaded {
+            // File IO, so once rather than every frame.
+            self.rules.load();
+            self.bindings.load();
+            self.loaded = true;
+        }
         self.snap = self.dev.snapshot();
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
@@ -154,6 +176,11 @@ impl eframe::App for App {
                         Tab::Lighting => self.draw_lighting(ui),
                         Tab::Profiles => self.draw_profiles(ui),
                         Tab::Buttons => self.draw_buttons(ui),
+                        Tab::Apps => {
+                            let snap = self.snap.clone();
+                            self.rules.ui(ui, &snap);
+                        }
+                        Tab::Service => self.draw_service(ui),
                         Tab::About => self.draw_about(ui),
                     }
                 });
@@ -210,6 +237,8 @@ impl App {
                     (Tab::Lighting, "Lighting"),
                     (Tab::Profiles, "Profiles"),
                     (Tab::Buttons, "Buttons"),
+                    (Tab::Apps, "Apps"),
+                    (Tab::Service, "Service"),
                     (Tab::About, "About"),
                 ] {
                     let on = self.tab == t;
@@ -652,6 +681,15 @@ impl App {
             });
         }
 
+        if self.snap.has_profiles && self.snap.profile_format == 2 {
+            ui.add_space(14.0);
+            let snap = self.snap.clone();
+            let sel = self.profile_sel as u8;
+            for cmd in self.profile_editor.ui(ui, &snap, sel) {
+                self.dev.send(cmd);
+            }
+        }
+
         ui.add_space(14.0);
         theme::section(ui, "Backup", |ui| {
             ui.horizontal(|ui| {
@@ -671,6 +709,13 @@ impl App {
     }
 
     fn draw_buttons(&mut self, ui: &mut egui::Ui) {
+        // Host bindings first: they need no flash write and are what most
+        // people are looking for.
+        let snap = self.snap.clone();
+        for cmd in self.bindings.ui(ui, &snap) {
+            self.dev.send(cmd);
+        }
+        ui.add_space(18.0);
         if !self.snap.has_profiles {
             theme::unsupported(ui, "onboard profiles, so bindings cannot be read");
             return;
@@ -746,6 +791,84 @@ impl App {
             self.dev.send(Cmd::SetButton { index: idx, button, binding });
             self.btn_action.remove(&button);
         }
+    }
+
+    fn draw_service(&mut self, ui: &mut egui::Ui) {
+        use crate::service::{self as svc, Action, State};
+        let st = self.service.state();
+        let colour = match st {
+            State::Active => theme::GOOD,
+            State::Failed => theme::BAD,
+            State::Inactive => theme::WARN,
+            _ => theme::FAINT,
+        };
+
+        theme::section(ui, "Background service", |ui| {
+            ui.horizontal(|ui| {
+                theme::pill(ui, svc::label(st), colour);
+                if self.service.is_enabled() {
+                    theme::pill(ui, "starts at login", theme::DIM);
+                }
+                if let Some(a) = self.service.busy() {
+                    theme::pill(ui, a.describe(), theme::ACCENT);
+                }
+            });
+            ui.add_space(8.0);
+            theme::hint(ui, svc::describe(st));
+            ui.add_space(12.0);
+
+            let can = svc::can_control(st) && self.service.busy().is_none();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(can && st != State::Active, egui::Button::new("Start")).clicked() {
+                    self.service.request(Action::Start);
+                }
+                if ui.add_enabled(can && st == State::Active, egui::Button::new("Stop")).clicked() {
+                    self.service.request(Action::Stop);
+                }
+                if ui.add_enabled(can, egui::Button::new("Restart")).clicked() {
+                    self.service.request(Action::Restart);
+                }
+                let enabled = self.service.is_enabled();
+                let label = if enabled { "Don't start at login" } else { "Start at login" };
+                if ui.add_enabled(can, egui::Button::new(label)).clicked() {
+                    self.service.request(if enabled { Action::Disable } else { Action::Enable });
+                }
+            });
+
+            if st == State::NotInstalled {
+                ui.add_space(10.0);
+                theme::hint(
+                    ui,
+                    "The unit file is not installed. Run packaging/install.sh once; it \
+                     needs sudo for the udev rules, which is why the app cannot do it.",
+                );
+            }
+            if let Some(e) = self.service.last_error() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(e).color(theme::BAD).size(12.5));
+            }
+            if let Some(n) = self.service.last_notice() {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(n).color(theme::GOOD).size(12.5));
+            }
+        });
+
+        theme::section(ui, "Recent log", |ui| {
+            let log = self.service.log();
+            if log.is_empty() {
+                theme::hint(ui, "Nothing logged yet.");
+            } else {
+                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                    for line in log {
+                        ui.label(egui::RichText::new(line).monospace().size(11.5).color(theme::DIM));
+                    }
+                });
+            }
+            ui.add_space(8.0);
+            if ui.button("Refresh").clicked() {
+                self.service.refresh();
+            }
+        });
     }
 
     fn draw_about(&mut self, ui: &mut egui::Ui) {

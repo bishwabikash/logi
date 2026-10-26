@@ -26,18 +26,27 @@ byte-identical to a backup taken first.
 | Packaging | udev rules, desktop entry, systemd user unit, installer |
 | Service | Installed, enabled, running as `logi serve` |
 
-## Built, not yet reachable from the UI
+## Editable from the app
 
-`src/buttonspy.rs`, `src/uinput.rs`, `src/actions.rs` compile with 101 tests
-passing between them and the rest of the suite. They cover the 0x8110 button
-spy, a uinput virtual device, and the action model with both bind modes. The
-CLI and GUI entry points are still to be wired.
+Seven tabs: Sensor, Lighting, Profiles, Buttons, Apps, Service, About.
+209 tests pass.
 
-## In progress
+| Panel | Edits |
+|---|---|
+| Profiles | Name, DPI stages, default and sniper index, rate, per-zone lighting, all 11 buttons. Staged in memory, committed by one explicit save, because this is flash |
+| Buttons | Host bindings: a key or chord, typed text, another button, a command, or nothing. Augment or Replace |
+| Apps | Per-application rules, with a picker listing running programs so no process name has to be typed |
+| Service | Start, stop, restart, start-at-login, and the journal tail |
 
-In-app editing of profiles, per-application rules and button bindings; a tray
-icon carrying service status and a context menu; and service control from
-inside the app. The aim is that the terminal is never required.
+Button bindings also work from the CLI: `logi bind`, `logi bind run`, and
+`logi bind reset`, which restores the factory button mapping and is the escape
+hatch if a button stops responding.
+
+## Still to wire
+
+The tray icon compiles but is not yet spawned from main; the context menu and
+status reporting are written and unit-tested. Nothing in the app depends on
+it.
 
 ## Deliberately out of scope
 

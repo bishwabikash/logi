@@ -230,6 +230,54 @@ impl Device {
         }
     }
 
+    /// Open a second handle on the same node, for receiving events.
+    ///
+    /// hidraw queues input reports per open file description, so a listener on
+    /// its own handle gets its own copy and the two do not steal from each
+    /// other. That matters because `call` drains the queue before every
+    /// request: sharing one handle between command traffic and an event
+    /// listener would throw away button presses as a side effect of, say,
+    /// reading the DPI.
+    pub fn open_listener(&self) -> Result<Device> {
+        Device::open(&self.path)
+    }
+
+    /// Wait for one unsolicited event report.
+    ///
+    /// Returns Ok(None) on timeout, which is the normal idle case rather than
+    /// an error. Replies to our own requests are skipped: byte 3's low nibble
+    /// carries the software id, and anything tagged with ours is a response
+    /// someone else is waiting for, not an event.
+    pub fn read_event(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>> {
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 64];
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(None);
+            }
+            if !self.wait_readable(left.min(Duration::from_millis(100))) {
+                continue;
+            }
+            let n = match self.file.read(&mut buf) {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => return Err(Error::Io(e)),
+            };
+            if n < 4 {
+                continue;
+            }
+            let r = &buf[..n];
+            if !matches!(r[0], SHORT_REPORT | LONG_REPORT | VERY_LONG_REPORT) {
+                continue;
+            }
+            if (r[3] & 0x0F) == SOFTWARE_ID {
+                continue; // a reply, not an event
+            }
+            return Ok(Some(r.to_vec()));
+        }
+    }
+
     /// Resolve a feature id (e.g. 0x8070) to its index on this device.
     pub fn feature_index(&mut self, id: u16) -> Result<u8> {
         if let Some(&i) = self.feature_cache.get(&id) {
