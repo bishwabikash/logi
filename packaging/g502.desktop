@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=G502
+GenericName=Mouse Configuration
+Comment=Configure a Logitech G502 HERO: DPI, report rate, lighting and onboard profiles
+Exec=g502
+Icon=input-mouse
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=mouse;logitech;g502;dpi;rgb;
+StartupNotify=true

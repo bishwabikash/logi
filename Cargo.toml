@@ -1,0 +1,32 @@
+[package]
+name = "g502"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Driver and management app for the Logitech G502 HERO, speaking HID++ 2.0"
+license = "MIT"
+default-run = "g502"
+
+[[bin]]
+name = "g502"
+path = "src/main.rs"
+
+[dependencies]
+# poll(2) for HID++ response timeouts. The device layer otherwise needs nothing
+# beyond std: hidraw is a plain character device.
+libc = "0.2"
+
+# GUI. glow (OpenGL) rather than wgpu: it starts faster and this is a control
+# panel, not a 3D app. wayland and x11 are both enabled; winit dlopens them at
+# runtime, which is why this builds with no -dev packages installed.
+egui = "0.33"
+eframe = { version = "0.33", default-features = false, features = [
+    "glow", "wayland", "x11", "default_fonts",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
