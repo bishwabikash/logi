@@ -256,8 +256,12 @@ impl App {
                     self.service.request(a);
                 }
                 Event::RestartService => self.service.request(crate::service::Action::Restart),
-                Event::SetProfile(p) => self.dev.send(Cmd::SetProfile(p)),
-                Event::SetDpi(d) => self.dev.send(Cmd::SetDpi(d)),
+                Event::SetProfile(p) => {
+                    self.dev.send(Cmd::SetProfile(p));
+                }
+                Event::SetDpi(d) => {
+                    self.dev.send(Cmd::SetDpi(d));
+                }
                 Event::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             }
         }

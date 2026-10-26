@@ -13,6 +13,7 @@ use crate::profiles::{OnboardProfiles, MODE_ONBOARD};
 use crate::rate::ReportRate;
 use crate::{discover, effects, profile_io};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -44,6 +45,102 @@ pub enum Cmd {
     RestoreIdentity,
 }
 
+/// Identifies one command for whoever sent it.
+///
+/// Assigned by `Handle::send`, which hands it back, and carried through to the
+/// `Outcome` recorded in the snapshot. Monotonic for the life of the handle.
+/// Zero is never issued, so it reads as "nothing recorded yet".
+pub type CmdId = u64;
+
+/// Which command an `Outcome` belongs to.
+///
+/// The id alone would do for a caller that keeps what `send` returned, but the
+/// GUI funnels several panels' commands through one dispatch loop that drops
+/// it. So the kind is what lets a panel recognise its own answer, and the
+/// per-profile commands carry the index they touch for exactly that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmdKind {
+    Refresh,
+    SetDpi,
+    SetRate,
+    SetProfile,
+    SetMode,
+    Led,
+    PersistLighting,
+    StartEffect,
+    StopEffect,
+    Backup,
+    WriteProfile(u8),
+    SetButton(u8),
+    ApplyBindings,
+    RestoreIdentity,
+}
+
+impl Cmd {
+    pub fn kind(&self) -> CmdKind {
+        match self {
+            Cmd::Refresh => CmdKind::Refresh,
+            Cmd::SetDpi(_) => CmdKind::SetDpi,
+            Cmd::SetRate(_) => CmdKind::SetRate,
+            Cmd::SetProfile(_) => CmdKind::SetProfile,
+            Cmd::SetMode(_) => CmdKind::SetMode,
+            Cmd::LedFixed { .. }
+            | Cmd::LedBreathing { .. }
+            | Cmd::LedCycle { .. }
+            | Cmd::LedOff { .. } => CmdKind::Led,
+            Cmd::PersistLighting { .. } => CmdKind::PersistLighting,
+            Cmd::StartEffect { .. } => CmdKind::StartEffect,
+            Cmd::StopEffect => CmdKind::StopEffect,
+            Cmd::Backup(_) => CmdKind::Backup,
+            Cmd::WriteProfile { index, .. } => CmdKind::WriteProfile(*index),
+            Cmd::SetButton { index, .. } => CmdKind::SetButton(*index),
+            Cmd::ApplyBindings { .. } => CmdKind::ApplyBindings,
+            Cmd::RestoreIdentity => CmdKind::RestoreIdentity,
+        }
+    }
+
+    /// True when running this leaves the decoded profiles in the snapshot
+    /// stale, so they have to be read again. `Refresh` is in here because
+    /// that re-read is its whole job.
+    fn rereads_profiles(&self) -> bool {
+        matches!(
+            self,
+            Cmd::PersistLighting { .. }
+                | Cmd::WriteProfile { .. }
+                | Cmd::SetButton { .. }
+                | Cmd::Refresh
+        )
+    }
+}
+
+/// What happened to one command the worker executed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outcome {
+    pub id: CmdId,
+    pub kind: CmdKind,
+    pub ok: bool,
+    /// The notice on success, the error on failure. `None` only for a command
+    /// that succeeded with nothing to say.
+    pub message: Option<String>,
+}
+
+impl Outcome {
+    pub fn ok(id: CmdId, kind: CmdKind, message: Option<String>) -> Self {
+        Outcome { id, kind, ok: true, message }
+    }
+
+    pub fn failed(id: CmdId, kind: CmdKind, message: impl Into<String>) -> Self {
+        Outcome { id, kind, ok: false, message: Some(message.into()) }
+    }
+}
+
+/// How many outcomes the snapshot keeps.
+///
+/// A panel polls at frame rate, so one would nearly always do. The ring is
+/// here so a burst of commands from other panels cannot push an answer out
+/// before the panel waiting on it has had a frame to look.
+const OUTCOME_HISTORY: usize = 16;
+
 /// A snapshot of device state for the UI to render. Cheap to clone.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
@@ -73,6 +170,57 @@ pub struct Snapshot {
     /// Most recent error, for the status bar.
     pub error: Option<String>,
     pub notice: Option<String>,
+    /// The last few executed commands and how each went, oldest first.
+    ///
+    /// `error` and `notice` are the newest of these flattened for the status
+    /// bar, which is all most panels need. This is what a panel reads when it
+    /// has to know whether its *own* command landed: an error in the status
+    /// bar may belong to anyone.
+    pub outcomes: Vec<Outcome>,
+}
+
+impl Snapshot {
+    /// Record one executed command, newest last.
+    ///
+    /// Also updates `error` and `notice`, so every panel that only reads
+    /// those keeps working unchanged.
+    pub fn record(&mut self, o: Outcome) {
+        if o.ok {
+            self.notice = o.message.clone();
+            self.error = None;
+        } else {
+            self.error = o.message.clone();
+            self.notice = None;
+        }
+        if self.outcomes.len() >= OUTCOME_HISTORY {
+            let over = self.outcomes.len() + 1 - OUTCOME_HISTORY;
+            self.outcomes.drain(..over);
+        }
+        self.outcomes.push(o);
+    }
+
+    /// Highest outcome id recorded, or 0 if none.
+    ///
+    /// A panel reads this *before* it sends, so it can tell its own answer
+    /// from one that was already on the books.
+    pub fn newest_outcome_id(&self) -> CmdId {
+        self.outcomes.iter().map(|o| o.id).max().unwrap_or(0)
+    }
+
+    /// The outcome for `id`, if it is still in the ring.
+    pub fn outcome(&self, id: CmdId) -> Option<&Outcome> {
+        self.outcomes.iter().find(|o| o.id == id)
+    }
+
+    /// The oldest outcome newer than `after` for `kind`.
+    ///
+    /// Ids are handed out in send order and the worker executes in that same
+    /// order, so "newer than the id I saw before I sent" plus "the kind I
+    /// sent" identifies a panel's own command without the panel having to
+    /// keep the id `send` returned — which the GUI's dispatch loop discards.
+    pub fn outcome_after(&self, after: CmdId, kind: CmdKind) -> Option<&Outcome> {
+        self.outcomes.iter().find(|o| o.id > after && o.kind == kind)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -86,16 +234,35 @@ pub struct ZoneInfo {
 }
 
 pub struct Handle {
-    tx: Sender<Cmd>,
+    tx: Sender<(CmdId, Cmd)>,
     snapshot: Arc<Mutex<Snapshot>>,
+    /// Next command id. Shared so a clone of the handle could not hand out
+    /// the same id twice.
+    next_id: Arc<AtomicU64>,
     /// Set while the worker holds the device in host mode, so shutdown knows
     /// whether it has to hand the mouse back.
     host_held: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Handle {
-    pub fn send(&self, c: Cmd) {
-        let _ = self.tx.send(c);
+    /// Queue a command and return its id, which shows up in
+    /// `Snapshot::outcomes` once the worker has run it.
+    ///
+    /// Deliberately not `#[must_use]`: nearly every caller fires and forgets,
+    /// and only one that waits for the result needs the id.
+    pub fn send(&self, c: Cmd) -> CmdId {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let _ = self.tx.send((id, c));
+        id
+    }
+
+    /// The id the next `send` will hand out.
+    ///
+    /// For a caller that cannot keep what `send` returned — the GUI dispatches
+    /// several panels' commands through one loop — this is the other way to
+    /// bound the search of `Snapshot::outcomes` from below.
+    pub fn next_id(&self) -> CmdId {
+        self.next_id.load(Ordering::Relaxed)
     }
 
     pub fn host_held(&self) -> bool {
@@ -127,7 +294,7 @@ impl Handle {
 /// Spawn the device worker. Returns immediately; the first snapshot arrives
 /// once the worker has probed the device.
 pub fn spawn() -> Handle {
-    let (tx, rx) = mpsc::channel::<Cmd>();
+    let (tx, rx) = mpsc::channel::<(CmdId, Cmd)>();
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let shared = Arc::clone(&snapshot);
     let host_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -136,7 +303,8 @@ pub fn spawn() -> Handle {
         .name("logi-device".into())
         .spawn(move || worker(rx, shared, held))
         .expect("spawn device thread");
-    Handle { tx, snapshot, host_held }
+    // Ids start at 1 so that 0 can mean "no outcome recorded yet".
+    Handle { tx, snapshot, next_id: Arc::new(AtomicU64::new(1)), host_held }
 }
 
 /// Take host mode only if we are not already in it. Each switch costs a
@@ -296,13 +464,14 @@ fn read_profiles(l: &mut Live, into: &mut Snapshot) {
 }
 
 fn worker(
-    rx: Receiver<Cmd>,
+    rx: Receiver<(CmdId, Cmd)>,
     shared: Arc<Mutex<Snapshot>>,
     host_held: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut live: Option<Live> = None;
     let mut effect: Option<effects::Running> = None;
-    let mut pending: std::collections::VecDeque<Cmd> = std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<(CmdId, Cmd)> =
+        std::collections::VecDeque::new();
 
     loop {
         // Reconnect lazily so unplug/replug is handled without crashing.
@@ -328,7 +497,7 @@ fn worker(
         }
 
         // Anything queued by the previous iteration runs before we block.
-        let cmd = match pending.pop_front() {
+        let (id, cmd) = match pending.pop_front() {
             Some(c) => c,
             None => match rx.recv_timeout(Duration::from_millis(400)) {
                 Ok(c) => c,
@@ -336,6 +505,7 @@ fn worker(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
         };
+        let kind = cmd.kind();
 
         // Any command other than StopEffect ends a running effect first: the
         // effect holds the device, and two owners would interleave writes.
@@ -346,20 +516,18 @@ fn worker(
         }
 
         let Some(l) = live.as_mut() else {
+            // Still an outcome: a panel waiting on this id must be told it
+            // failed, or it waits for an answer that is never coming.
             if let Ok(mut g) = shared.lock() {
-                g.error = Some("device not connected".into());
+                let msg = "device not connected".to_string();
+                g.error = Some(msg.clone());
+                g.record(Outcome::failed(id, kind, msg));
             }
             continue;
         };
 
         let name_for_backup = l.name.clone();
-        let wrote_flash = matches!(
-            cmd,
-            Cmd::PersistLighting { .. }
-                | Cmd::WriteProfile { .. }
-                | Cmd::SetButton { .. }
-                | Cmd::Refresh
-        );
+        let wrote_flash = cmd.rereads_profiles();
         let result: crate::hidpp::Result<Option<String>> = match cmd {
             Cmd::Refresh => Ok(None),
             Cmd::SetDpi(v) => feat!(l, dpi, "adjustable DPI").and_then(|(d, dev)| {
@@ -497,8 +665,9 @@ fn worker(
                     if wrote_flash || g.profiles.is_empty() {
                         read_profiles(l, &mut g);
                     }
-                    g.notice = notice;
+                    g.notice = notice.clone();
                     g.error = None;
+                    g.record(Outcome::ok(id, kind, notice));
                 }
             }
             Err(e) => {
@@ -507,8 +676,11 @@ fn worker(
                 let gone = matches!(e, crate::hidpp::Error::Io(_))
                     || matches!(e, crate::hidpp::Error::NotFound(_));
                 if let Ok(mut g) = shared.lock() {
-                    g.error = Some(msg);
+                    g.error = Some(msg.clone());
                     g.notice = None;
+                    // Recorded before the handle is dropped, so a panel waiting
+                    // on this id learns the write failed rather than timing out.
+                    g.record(Outcome::failed(id, kind, msg));
                 }
                 if gone {
                     live = None;
@@ -520,7 +692,7 @@ fn worker(
         // the previous version matched Ok(_) and broke, which silently threw
         // away whatever it had just received. Two quick clicks lost the second.
         while let Ok(next) = rx.try_recv() {
-            if matches!(next, Cmd::Refresh) {
+            if matches!(next.1, Cmd::Refresh) {
                 continue;
             }
             pending.push_back(next);
