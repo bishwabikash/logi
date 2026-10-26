@@ -740,14 +740,23 @@ fn cmd_serve() -> Result<(), CliError> {
     Ok(())
 }
 
-/// One connected run of the watcher. Returns when the device goes away or the
-/// service is asked to stop, so the caller can retry.
+/// One connected run of the service: per-application profile switching and
+/// button bindings together.
+///
+/// Both at once, because they are what the service is for and neither is much
+/// use alone. They share the device: the watcher issues commands on the
+/// control handle while the spy reads events on its own, which works because
+/// hidraw queues input reports per open file description.
+///
+/// Returns when the device goes away or the service is asked to stop, so the
+/// caller can retry.
 fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
     let mut f = discover::open_device()?;
+    let name = f.name.clone();
+    let has_spy = f.caps.button_spy;
     let dev = &mut f.device;
     let profiles = profiles::OnboardProfiles::new(dev)?;
     let dpi_feat = dpi::Dpi::new(dev).ok();
-    eprintln!("logi: watching {} with {} rule(s)", f.name, cfg.rules.len());
 
     let have = profiles.info.profile_count;
     for p in appwatch::referenced_profiles(&cfg) {
@@ -756,25 +765,135 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
         }
     }
 
+    // Button bindings are optional: no file, no bindings, or a device without
+    // the feature all just mean the watcher runs alone.
+    let km = keymap();
+    let bindings = std::fs::read_to_string(actions::config_path())
+        .ok()
+        .map(|t| {
+            let (b, problems) = actions::Bindings::parse(&t, &km);
+            for p in &problems {
+                eprintln!("logi: bindings: {p}");
+            }
+            b
+        })
+        .filter(|b| !b.list.is_empty());
+
+    let mut spy_state = None;
+    if let Some(b) = &bindings {
+        if !has_spy {
+            eprintln!("logi: {name} has no button-spy feature; bindings ignored");
+        } else {
+            match start_spy(dev, b) {
+                Ok(s) => spy_state = Some(s),
+                Err(e) => eprintln!("logi: button bindings unavailable: {e}"),
+            }
+        }
+    }
+
+    eprintln!(
+        "logi: watching {name}: {} rule(s), {} binding(s)",
+        cfg.rules.len(),
+        bindings.as_ref().map(|b| b.list.len()).unwrap_or(0)
+    );
+
     let poll = cfg.poll;
     let mut watcher = appwatch::Watcher::new(cfg);
-    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-        let procs = appwatch::scan_processes();
-        let decision = watcher.tick(&procs, std::time::Instant::now());
-        if let appwatch::Decision::Switch { profile, dpi: want, .. } = &decision {
-            if let Some(msg) = appwatch::describe(&decision) {
-                eprintln!("logi: applying {msg}");
+    let mut last_scan = std::time::Instant::now() - poll;
+    let mut prev_mask: u16 = 0;
+
+    let outcome = (|| -> Result<(), hidpp::Error> {
+        while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            // The spy read doubles as the loop's tick, so with bindings active
+            // we block on events rather than sleeping, and button presses are
+            // acted on immediately instead of at the next poll.
+            if let Some(s) = &mut spy_state {
+                if let Some(report) =
+                    s.listener.read_event(std::time::Duration::from_millis(200))?
+                {
+                    if let Some(now) = buttonspy::decode_event(&report, s.spy.feature_index()) {
+                        let (pressed, _) = buttonspy::transitions(prev_mask, now);
+                        prev_mask = now;
+                        for b in pressed {
+                            if let Some(bind) = s.bindings.get(b) {
+                                if let Err(e) = perform(&bind.action, &mut s.vd) {
+                                    eprintln!("logi: button {b}: {e}");
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
-            profiles.set_current(dev, *profile)?;
-            if let (Some(d), Some(v)) = (dpi_feat.as_ref(), want) {
-                if let Err(e) = d.set(dev, *v, 0) {
-                    eprintln!("logi: setting {v} dpi: {e}");
+
+            if last_scan.elapsed() >= poll {
+                last_scan = std::time::Instant::now();
+                let procs = appwatch::scan_processes();
+                let decision = watcher.tick(&procs, std::time::Instant::now());
+                if let appwatch::Decision::Switch { profile, dpi: want, .. } = &decision {
+                    if let Some(msg) = appwatch::describe(&decision) {
+                        eprintln!("logi: applying {msg}");
+                    }
+                    profiles.set_current(dev, *profile)?;
+                    if let (Some(d), Some(v)) = (dpi_feat.as_ref(), want) {
+                        if let Err(e) = d.set(dev, *v, 0) {
+                            eprintln!("logi: setting {v} dpi: {e}");
+                        }
+                    }
                 }
             }
         }
-        std::thread::sleep(poll);
+        Ok(())
+    })();
+
+    // Unconditional teardown. A silenced button outliving this process is the
+    // one way the feature can leave someone unable to click, so a failure here
+    // is reported loudly rather than swallowed.
+    if let Some(s) = spy_state {
+        if let Err(e) = s.spy.stop(dev) {
+            eprintln!("logi: could not stop the spy: {e}");
+        }
+        if s.silenced {
+            match s.spy.restore(dev) {
+                Ok(()) => eprintln!("logi: button mapping restored"),
+                Err(e) => eprintln!(
+                    "logi: COULD NOT RESTORE the button mapping: {e}. \
+                     Run `logi bind reset`."
+                ),
+            }
+        }
     }
-    Ok(())
+    outcome
+}
+
+/// Everything a running spy owns, so teardown can be one place.
+struct SpyState {
+    spy: buttonspy::ButtonSpy,
+    listener: hidpp::Device,
+    vd: uinput::VirtualDevice,
+    bindings: actions::Bindings,
+    silenced: bool,
+}
+
+fn start_spy(
+    dev: &mut hidpp::Device,
+    bindings: &actions::Bindings,
+) -> Result<SpyState, hidpp::Error> {
+    let spy = buttonspy::ButtonSpy::new(dev)?;
+    let vd = uinput::VirtualDevice::new("logi virtual input").map_err(|e| {
+        hidpp::Error::Protocol(format!(
+            "{e} (install the udev rules with packaging/install.sh)"
+        ))
+    })?;
+    let silence = bindings.to_silence();
+    let silenced = !silence.is_empty();
+    if silenced {
+        spy.silence(dev, &silence)?;
+    }
+    spy.start(dev)?;
+    let listener = dev.open_listener()?;
+    Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced })
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), CliError> {

@@ -42,11 +42,24 @@ Button bindings also work from the CLI: `logi bind`, `logi bind run`, and
 `logi bind reset`, which restores the factory button mapping and is the escape
 hatch if a button stops responding.
 
-## Still to wire
+## Tray icon
 
-The tray icon compiles but is not yet spawned from main; the context menu and
-status reporting are written and unit-tested. Nothing in the app depends on
-it.
+Spawned from the GUI and verified registered with GNOME's watcher as
+org.kde.StatusNotifierItem, exposing /StatusNotifierItem and /MenuBar. The
+menu carries the device, service state with start/stop/restart, a profile
+submenu, a DPI submenu, open and quit. Absent on a desktop with no tray host,
+which the app treats as normal rather than an error.
+
+## The terminal is no longer needed
+
+The background service runs the per-application rules and the button bindings
+together, so bindings edited in the Buttons tab take effect without anything
+being typed. They share the device: the watcher issues commands on the control
+handle while the spy reads events on its own, which works because hidraw
+queues input reports per open file description.
+
+One command is still needed once, to install the udev rules, because an
+unprivileged GUI cannot grant itself device access.
 
 ## Deliberately out of scope
 

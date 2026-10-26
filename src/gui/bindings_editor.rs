@@ -39,7 +39,11 @@ pub enum Request {
 
 /// The escape hatch, for a mouse too dead to click this app's own button.
 /// Named once so the UI copy and the integrator cannot drift apart.
-pub const RESTORE_CLI: &str = "logi buttons restore";
+///
+/// This has to be a command that actually exists: it is what someone whose
+/// left click is silenced types. `main.rs` dispatches `bind` to `cmd_bind`,
+/// whose `reset` arm writes the factory identity table.
+pub const RESTORE_CLI: &str = "logi bind reset";
 
 /// Header written above the generated bindings, so someone who does find the
 /// file knows what rewrites it.
@@ -393,7 +397,17 @@ impl BindingsEditor {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
-        std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+        // Through a temporary in the same directory, then renamed. A plain
+        // write truncates first, so a crash or a full disk between the two
+        // leaves half a file — and the service reads this file as the user's
+        // bindings, with a half-read Replace line silencing a button.
+        let tmp = path.with_extension("conf.tmp");
+        std::fs::write(&tmp, &text)
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("cannot replace {}: {e}", path.display())
+        })?;
         self.saved = self.rows.clone();
         self.problems.clear();
         Ok(silence)
@@ -536,7 +550,7 @@ impl BindingsEditor {
             ui.add_space(12.0);
             for i in 0..count {
                 let button = i + 1;
-                self.draw_row(ui, button, keys);
+                self.draw_row(ui, button, count, keys);
                 if button != count {
                     ui.add_space(6.0);
                     let r = ui.available_rect_before_wrap();
@@ -551,7 +565,7 @@ impl BindingsEditor {
         });
     }
 
-    fn draw_row(&mut self, ui: &mut egui::Ui, button: u8, keys: &dyn Keymap) {
+    fn draw_row(&mut self, ui: &mut egui::Ui, button: u8, count: u8, keys: &dyn Keymap) {
         // Edited on a copy, so one row's widgets cannot borrow the whole
         // editor and the write-back is the only place the model changes.
         let Some(idx) = self.rows.iter().position(|r| r.button == button) else { return };
@@ -583,14 +597,12 @@ impl BindingsEditor {
                 self.set_augment(button);
             }
             if ui.selectable_label(replaced, "Replace").clicked() && !replaced {
-                let count = self
-                    .rows
-                    .iter()
-                    .filter(|r| r.button <= MAX_BUTTON)
-                    .count() as u8;
-                // The refusal is checked against the device's button count,
-                // which draw_rows already clamped the visible rows to.
-                self.want_replace(button, count.min(MAX_BUTTON));
+                // Against the device's own button count, the same number
+                // draw_rows clamped the visible rows to. Counting the rows
+                // instead gives MAX_BUTTON every time — there is always one
+                // row per possible button — so on any mouse with fewer
+                // buttons than that the all-Replace refusal could never fire.
+                self.want_replace(button, count);
             }
             if button == 1 && replaced {
                 theme::pill(ui, "left click silenced", theme::BAD);

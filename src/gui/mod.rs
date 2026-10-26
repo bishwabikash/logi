@@ -57,6 +57,10 @@ pub struct App {
     service: crate::service::Watcher,
     /// Editors read their config files once, off the first paint.
     loaded: bool,
+    /// None when there is no StatusNotifierWatcher, which is normal on a
+    /// desktop without a tray host. The app works either way.
+    tray: Option<crate::tray::Tray>,
+    tray_tried: bool,
     /// True while the DPI slider is being dragged, so the live readout is not
     /// overwritten by the device's own value mid-drag.
     dpi_touched: bool,
@@ -87,6 +91,8 @@ impl App {
             bindings: bindings_editor::BindingsEditor::new(),
             service: crate::service::Watcher::new(),
             loaded: false,
+            tray: None,
+            tray_tried: false,
             dpi_touched: false,
         }
     }
@@ -151,6 +157,7 @@ impl eframe::App for App {
             self.bindings.load();
             self.loaded = true;
         }
+        self.sync_tray(ctx);
         self.snap = self.dev.snapshot();
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
@@ -195,6 +202,51 @@ const PALETTE: &[[u8; 3]] = &[
 ];
 
 impl App {
+    /// Register the tray once, then keep it in step and act on its menu.
+    fn sync_tray(&mut self, ctx: &egui::Context) {
+        use crate::tray::{Event, Status};
+
+        if !self.tray_tried {
+            self.tray_tried = true;
+            match crate::tray::Tray::spawn(Status::default()) {
+                Ok(t) => self.tray = Some(t),
+                Err(e) => eprintln!("logi: no tray icon: {e}"),
+            }
+        }
+        let Some(tray) = &self.tray else { return };
+
+        // update() is a no-op when nothing changed, so this is cheap per frame.
+        tray.update(Status {
+            device: self.snap.connected.then(|| self.snap.model.clone()),
+            service: self.service.state(),
+            active_profile: self.snap.active_profile,
+            profile_count: self.snap.profile_count,
+            dpi: self.snap.dpi,
+            dpi_presets: vec![400, 800, 1600, 3200, 6400],
+        });
+
+        for ev in tray.poll() {
+            match ev {
+                Event::Open => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                }
+                Event::ToggleService => {
+                    let a = if self.service.state() == crate::service::State::Active {
+                        crate::service::Action::Stop
+                    } else {
+                        crate::service::Action::Start
+                    };
+                    self.service.request(a);
+                }
+                Event::RestartService => self.service.request(crate::service::Action::Restart),
+                Event::SetProfile(p) => self.dev.send(Cmd::SetProfile(p)),
+                Event::SetDpi(d) => self.dev.send(Cmd::SetDpi(d)),
+                Event::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            }
+        }
+    }
+
     fn draw_sidebar(&mut self, ctx: &egui::Context) {
         egui::SidePanel::left("nav")
             .exact_width(186.0)
