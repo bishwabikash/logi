@@ -308,8 +308,20 @@ fn cmd_rate(args: &[String]) -> Result<(), CliError> {
             if live {
                 // 0x8060 is rejected in onboard mode, so take host mode first.
                 let p = profiles::OnboardProfiles::new(dev)?;
+                let previous = p.mode(dev).unwrap_or(profiles::MODE_ONBOARD);
                 p.set_mode(dev, profiles::MODE_HOST)?;
-                r.set(dev, hz)?;
+                if let Err(e) = r.set(dev, hz) {
+                    // The rate did not change, so host mode bought nothing;
+                    // leaving the mouse in it would stop its stored profile
+                    // applying for no reason the user could see.
+                    if previous != profiles::MODE_HOST {
+                        if let Err(e2) = p.set_mode(dev, previous) {
+                            eprintln!("logi: the mouse is still in host mode: {e2}");
+                            eprintln!("      run `logi mode onboard` to hand it back.");
+                        }
+                    }
+                    return Err(e.into());
+                }
                 println!("{hz} (live; host mode, lost when the mouse returns to onboard)");
             } else {
                 let p = profiles::OnboardProfiles::new(dev)?;
@@ -406,9 +418,11 @@ fn cmd_profile(args: &[String]) -> Result<(), CliError> {
                 .parse()
                 .map_err(|_| CliError::Usage("bad profile index".into()))?;
             if n >= p.info.profile_count {
+                // saturating: profile_count comes straight off the device, and
+                // a reply of 0 would underflow the subtraction.
                 return Err(CliError::Usage(format!(
                     "profile {n} out of range 0..{}",
-                    p.info.profile_count - 1
+                    p.info.profile_count.saturating_sub(1)
                 )));
             }
             let blob = p.read_sector(dev, n as u16 + 1, None)?;
@@ -433,34 +447,59 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
     if args.is_empty() {
         return Err(CliError::Usage("led needs a spec: off | <colour> | breathing <colour> | cycle".into()));
     }
+    // Decided before the device is touched. Parsing inside the apply step put
+    // the mouse into host mode first, so `logi led notacolour` left its stored
+    // profile unapplied and said nothing about it.
+    enum Spec {
+        Off,
+        Cycle,
+        Breathing([u8; 3]),
+        Fixed([u8; 3]),
+    }
+    let spec = match args[0].as_str() {
+        "off" => Spec::Off,
+        "cycle" => Spec::Cycle,
+        "breathing" => {
+            Spec::Breathing(led::parse_color(args.get(1).map(|s| s.as_str()).unwrap_or("cyan"))?)
+        }
+        other => Spec::Fixed(led::parse_color(other)?),
+    };
+
     let mut f = open()?;
     let dev = &mut f.device;
     let l = led::Leds::new(dev)?;
     let p = profiles::OnboardProfiles::new(dev)?;
     // Live lighting is inert in onboard mode, so take host mode first.
+    let previous = p.mode(dev).unwrap_or(profiles::MODE_ONBOARD);
     p.set_mode(dev, profiles::MODE_HOST)?;
 
     let r = (|| -> hidpp::Result<()> {
-        match args[0].as_str() {
-            "off" => l.all_off(dev),
-            "cycle" => {
-                // Returns a message explaining the two working routes.
-                l.cycle(dev, 0, 8000, 100)
-            }
-            "breathing" => {
-                let c = led::parse_color(args.get(1).map(|s| s.as_str()).unwrap_or("cyan"))?;
+        match &spec {
+            Spec::Off => l.all_off(dev),
+            // Returns a message explaining the two working routes.
+            Spec::Cycle => l.cycle(dev, 0, 8000, 100),
+            Spec::Breathing(c) => {
                 for z in 0..l.zone_count {
-                    l.breathing(dev, z, c, 4000, 0, 100)?;
+                    l.breathing(dev, z, *c, 4000, 0, 100)?;
                 }
                 Ok(())
             }
-            spec => {
-                let c = led::parse_color(spec)?;
-                l.all_fixed(dev, c)
-            }
+            Spec::Fixed(c) => l.all_fixed(dev, *c),
         }
     })();
-    r?;
+    if let Err(e) = r {
+        // Nothing was applied, so host mode bought nothing, and leaving the
+        // mouse in it would mean its stored profile stays unapplied until the
+        // user works out that `logi mode onboard` is the way back. `cycle`
+        // always lands here: this firmware refuses to set it live.
+        if previous != profiles::MODE_HOST {
+            if let Err(e2) = p.set_mode(dev, previous) {
+                eprintln!("logi: the mouse is still in host mode: {e2}");
+                eprintln!("      run `logi mode onboard` to hand it back.");
+            }
+        }
+        return Err(e.into());
+    }
     println!("applied (live, host mode).");
     println!("This is lost on unplug, and the mouse stays in host mode until you run");
     println!("`logi mode onboard`. To make lighting persist instead, store it into the");
@@ -486,14 +525,22 @@ fn cmd_effect(args: &[String]) -> Result<(), CliError> {
                 .map(|s| led::parse_color(s))
                 .transpose()?
                 .unwrap_or([0, 255, 255]);
-            let running = effects::start(name.to_string(), color, 4000)
-                .map_err(CliError::Failed)?;
-            println!("running {name}; press Ctrl-C to stop and hand the mouse back");
+            // Installed before the effect starts, not after: a signal in the
+            // gap would kill the process with the device already in host mode,
+            // and dropping `running` is the only thing that puts it back.
+            //
             // Ctrl-C must unwind rather than kill the process: dropping
             // `running` is what puts the device back into onboard mode, and a
             // bare SIGINT would leave its lighting owned by a dead process.
             install_interrupt_handler();
-            while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+            let running = effects::start(name.to_string(), color, 4000)
+                .map_err(CliError::Failed)?;
+            println!("running {name}; press Ctrl-C to stop and hand the mouse back");
+            // `leaving()`, not just INTERRUPTED: the handler above replaces
+            // SIGHUP's default of killing us, so a loop that ignored a hangup
+            // would survive its terminal closing and hold the mouse in host
+            // mode for as long as the session lasted.
+            while !leaving() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             running.stop();
@@ -551,15 +598,24 @@ fn leaving() -> bool {
     stopping() || reloading()
 }
 
-/// Sleep in one-second steps so a stop or a reload is acted on promptly rather
-/// than a minute later.
-fn nap(secs: u64) {
-    for _ in 0..secs {
-        if leaving() {
+/// Sleep in short steps so a stop or a reload is acted on promptly rather than
+/// a whole interval later. The step is well under a second because `poll_ms`
+/// has no upper bound: a rule file asking for a minute between scans would
+/// otherwise make Ctrl-C look like a hang.
+fn nap_for(total: std::time::Duration) {
+    const STEP: std::time::Duration = std::time::Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + total;
+    while !leaving() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::thread::sleep(left.min(STEP));
     }
+}
+
+fn nap(secs: u64) {
+    nap_for(std::time::Duration::from_secs(secs));
 }
 
 /// A Keymap over uinput's tables, which is what actions.rs expects.
@@ -739,12 +795,17 @@ fn cmd_serve() -> Result<(), CliError> {
     // Idling is the steady state with no rules, and repeating the same
     // sentence into the journal every minute forever buries everything else.
     let mut announced_idle = false;
+    // Same reason: with rules in place and no mouse attached, the retry loop
+    // would otherwise put the identical line in the journal every ten seconds
+    // for as long as the machine stayed up.
+    let mut announced_problem: Option<String> = None;
     while !stopping() {
         // A hangup is the unit's ExecReload. serve_once has already torn down
         // by the time we get here, so re-reading the file is all it takes.
         if RELOAD.swap(false, Ordering::Relaxed) {
             eprintln!("logi: reloading {}", path.display());
             announced_idle = false;
+            announced_problem = None;
         }
         let rules = std::fs::read_to_string(&path).ok();
         match rules {
@@ -773,10 +834,17 @@ fn cmd_serve() -> Result<(), CliError> {
                     continue;
                 }
                 announced_idle = false;
-                if let Err(e) = serve_once(cfg) {
+                match serve_once(cfg) {
                     // A missing or unplugged device is normal, not fatal.
-                    eprintln!("logi: {e}; retrying in 10s");
-                    nap(10);
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if announced_problem.as_deref() != Some(msg.as_str()) {
+                            eprintln!("logi: {msg}; retrying every 10s until it clears");
+                            announced_problem = Some(msg);
+                        }
+                        nap(10);
+                    }
+                    Ok(()) => announced_problem = None,
                 }
             }
         }
@@ -809,7 +877,10 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
     let have = profiles.info.profile_count;
     for p in appwatch::referenced_profiles(&cfg) {
         if p >= have {
-            eprintln!("logi: rules name profile {p}, device has 0..{}", have - 1);
+            eprintln!(
+                "logi: rules name profile {p}, device has 0..{}",
+                have.saturating_sub(1)
+            );
         }
     }
 
@@ -851,7 +922,11 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
     let mut prev_mask: u16 = 0;
 
     let outcome = (|| -> Result<(), hidpp::Error> {
-        while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        // `leaving()`, not just INTERRUPTED: the unit's ExecReload is a SIGHUP,
+        // and cmd_serve re-reads its configuration only once this returns. A
+        // loop that watched INTERRUPTED alone made `systemctl --user reload
+        // logi` a silent no-op for as long as the device stayed attached.
+        while !leaving() {
             // The spy read doubles as the loop's tick, so with bindings active
             // we block on events rather than sleeping, and button presses are
             // acted on immediately instead of at the next poll.
@@ -1018,7 +1093,10 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
     let have = profiles.info.profile_count;
     for p in appwatch::referenced_profiles(&cfg) {
         if p >= have {
-            eprintln!("logi: warning: rules reference profile {p}, device has 0..{}", have - 1);
+            eprintln!(
+                "logi: warning: rules reference profile {p}, device has 0..{}",
+                have.saturating_sub(1)
+            );
         }
     }
 
@@ -1033,7 +1111,10 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
     install_interrupt_handler();
     let poll = cfg.poll;
     let mut watcher = appwatch::Watcher::new(cfg);
-    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+    // `leaving()`, not just INTERRUPTED: the handler above replaces SIGHUP's
+    // default of killing us, so ignoring a hangup here would leave this
+    // command running after the terminal that started it had gone.
+    while !leaving() {
         let procs = appwatch::scan_processes();
         let decision = watcher.tick(&procs, std::time::Instant::now());
         if let appwatch::Decision::Switch { profile, dpi: want, .. } = &decision {
@@ -1053,7 +1134,7 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
                 }
             }
         }
-        std::thread::sleep(poll);
+        nap_for(poll);
     }
     println!("\nstopped");
     Ok(())
@@ -1066,8 +1147,31 @@ fn cmd_backup(path: &str) -> Result<(), CliError> {
     let p = profiles::OnboardProfiles::new(dev)?;
     let dump = profile_io::dump_all(dev, &p);
     let readable = dump.iter().filter(|(_, d)| d.is_some()).count();
-    std::fs::write(path, profile_io::dump_to_json(&model, &dump))
-        .map_err(|e| CliError::Failed(format!("writing {path}: {e}")))?;
+    // A dump where every sector is absent is not a backup. `restore` rejects
+    // one ("backup contains no sectors"), so writing it can only destroy the
+    // good backup that was already at this path.
+    if readable == 0 {
+        return Err(CliError::Failed(format!(
+            "no sector could be read from {model}, so {path} was left alone"
+        )));
+    }
+    // Written beside the target and renamed into place. fs::write truncates
+    // first, so a write that fails or is interrupted halfway would leave the
+    // user with neither the old backup nor a usable new one.
+    let tmp = format!("{path}.part");
+    let write = std::fs::write(&tmp, profile_io::dump_to_json(&model, &dump))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CliError::Failed(format!("writing {path}: {e}")));
+    }
+    if readable < dump.len() {
+        eprintln!(
+            "logi: {} sector(s) would not read and are recorded as absent; restoring \
+             this file will leave them as they are",
+            dump.len() - readable
+        );
+    }
     println!("{readable}/{} sectors written to {path}", dump.len());
     Ok(())
 }
@@ -1082,4 +1186,28 @@ fn cmd_restore(path: &str) -> Result<(), CliError> {
     let n = profile_io::restore_all(dev, &p, &backup)?;
     println!("{n} sector(s) written; the rest already matched");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn nap_for_honours_sub_second_durations() {
+        // The reason nap_for exists alongside nap: `logi watch` sleeps a poll
+        // interval whose floor is 100ms, and a whole-second step would both
+        // overshoot the interval and make Ctrl-C look like a hang.
+        let t = Instant::now();
+        super::nap_for(Duration::from_millis(120));
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(100), "returned early, after {took:?}");
+        assert!(took < Duration::from_millis(900), "overslept {took:?}");
+    }
+
+    #[test]
+    fn nap_for_zero_returns_without_sleeping() {
+        let t = Instant::now();
+        super::nap_for(Duration::ZERO);
+        assert!(t.elapsed() < Duration::from_millis(100));
+    }
 }

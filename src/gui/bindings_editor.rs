@@ -12,7 +12,10 @@
 //!   * Replace silences a button in the mouse's own remapping table, which the
 //!     mouse keeps across unplugging. So Replace on every button at once is
 //!     refused outright, Replace on button 1 needs a second click, and
-//!     `Request::RestoreIdentity` is always one button away.
+//!     `Request::RestoreIdentity` is always one button away. Every save sends
+//!     the complete silenced set, including the empty one, because that is
+//!     what `buttonspy::silence` takes and the only thing that lets a button
+//!     moved off Replace get its click back without the factory table.
 //!   * The config file is written only when the user asks. No autosave on
 //!     keystroke: the file is read by the service, and half-typed bindings
 //!     would be applied.
@@ -23,18 +26,24 @@ use crate::device::{Cmd, CmdKind, Snapshot};
 use crate::uinput;
 use eframe::egui;
 
-/// Something the editor needs from the device layer that `device::Cmd` cannot
-/// express yet. One new `Cmd` variant each; see the integration notes.
+/// The device-side half of an edit, queued for the integrator to send.
+///
+/// One `device::Cmd` variant each, and the host that drains `take_requests`
+/// maps them straight across. Kept as its own type so this module can be read
+/// and tested without the device layer: the semantics below are the contract,
+/// and they are `buttonspy`'s, not this module's to choose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Silence these buttons in the mouse's own remapping table.
+    /// Silence exactly these buttons in the mouse's own remapping table,
+    /// and give every other button its own click back.
     ///
-    /// Additive, and the UI copy has to say so: `buttonspy::silence` builds on
-    /// the table already in the mouse, so a button dropped from this list is
-    /// *not* given its click back by sending a shorter list, and an empty list
-    /// writes nothing at all. `RestoreIdentity` is the only thing that
-    /// un-silences. Nor does this start button reporting — the service does
-    /// that — so a Replace applied with no service running is a dead button.
+    /// Exact, not additive, and the UI copy has to say so. `buttonspy::silence`
+    /// builds the table from a healed snapshot of the device's own, so a button
+    /// dropped from this list *is* given its click back, and an empty list puts
+    /// the whole table back — which is how a Replace is undone by saving. The
+    /// whole set has to be sent every time for that to hold. It does not start
+    /// button reporting, though — the service does that — so a Replace applied
+    /// with no service running is a dead button.
     ApplyBindings { silence: Vec<u8> },
     /// Write the factory identity remapping table. The recovery path for a
     /// mouse whose buttons were silenced with nothing listening.
@@ -458,19 +467,37 @@ impl BindingsEditor {
     /// Reading raw events rather than a focused widget is what makes a chord
     /// like ctrl+shift+f5 capturable: a TextEdit would eat some of those as
     /// shortcuts and never see the rest.
+    ///
+    /// Taken *out*, not just read. While capture is armed the key belongs to
+    /// the capture and to nothing else, and leaving it in the queue hands the
+    /// same press to whatever still holds keyboard focus. Capture is armed by
+    /// clicking a focusable widget, so that widget is usually the one holding
+    /// it: capturing Space or Enter activated it a second time and silently
+    /// re-armed capture, which then ate the next key the user typed anywhere
+    /// in the app and rewrote a row with it. The `Text` events the same press
+    /// produces go with it, or the character is inserted into whichever
+    /// TextEdit had focus.
     fn poll_capture(&mut self, ui: &egui::Ui) {
         let Some(button) = self.capturing else { return };
-        let got = ui.input(|i| {
-            i.events.iter().find_map(|e| match e {
+        let got = ui.input_mut(|i| {
+            let mut first = None;
+            i.events.retain(|e| match e {
                 egui::Event::Key {
                     key,
                     pressed: true,
                     repeat: false,
                     modifiers,
                     ..
-                } => Some((key.name(), *modifiers)),
-                _ => None,
-            })
+                } => {
+                    first.get_or_insert((key.name(), *modifiers));
+                    false
+                }
+                // Releases and repeats go too: half a press left behind is
+                // what makes a focused widget act on a key capture took.
+                egui::Event::Key { .. } | egui::Event::Text(_) => false,
+                _ => true,
+            });
+            first
         });
         let Some((name, mods)) = got else { return };
         self.capturing = None;
@@ -585,7 +612,7 @@ impl BindingsEditor {
                 "Augment keeps the button's own job and fires the action as well. \
                  Replace silences the physical button in the mouse's remapping \
                  table, so it only fires the action — and the mouse keeps that \
-                 until something puts the table back, including across unplugging.",
+                 across unplugging, until a Save without it or Restore puts it back.",
             );
             ui.add_space(12.0);
             for i in 0..count {
@@ -850,17 +877,18 @@ impl BindingsEditor {
                 theme::hint(
                     ui,
                     "These buttons stop working physically once the bindings are applied, \
-                     and stay that way across unplugging. Applying only ever takes clicks \
-                     away: moving a button back to Augment and saving again does not \
-                     return its click. Restore below is the only thing that does, so the \
-                     order for changing which buttons are silenced is Restore, then Save.",
+                     and stay that way across unplugging and after this app is closed. \
+                     Each Save writes the whole set at once, so a button moved back to \
+                     Augment gets its click back on the next Save. Restore below is the \
+                     escape for when this window can no longer be clicked at all.",
                 );
             } else {
                 theme::hint(
                     ui,
-                    "Nothing above is set to Replace, so these bindings silence no \
-                     button. If a button was silenced earlier, it is still silenced in \
-                     the mouse: Restore below is what puts it back.",
+                    "Nothing above is set to Replace. Saving in this state silences no \
+                     button and gives back the click of any button silenced earlier. \
+                     Restore below does the same without saving, by forcing the factory \
+                     table.",
                 );
             }
 
@@ -907,6 +935,40 @@ impl BindingsEditor {
         });
     }
 
+    /// Queue the device-side half of a save that has just landed, and return
+    /// the message to show for it.
+    ///
+    /// The empty list is queued too, and that is the whole point.
+    /// `buttonspy::silence` writes exactly the set it is given and puts every
+    /// button not in it back to its own click, so an empty set un-silences the
+    /// lot. Swallowing it here left a button the user had just moved off
+    /// Replace silenced in the mouse — across unplugging — with only the
+    /// factory table to get it back, and told them so in the status line.
+    fn queue_apply(&mut self, apply: bool, silence: Vec<u8>) -> String {
+        let path = actions::config_path();
+        if !apply {
+            return format!(
+                "saved to {}; not applied, because no connected mouse can report \
+                 button presses",
+                path.display()
+            );
+        }
+        let n = silence.len();
+        self.requests.push(Request::ApplyBindings { silence });
+        if n == 0 {
+            format!(
+                "saved to {}; nothing is set to Replace, so every physical button \
+                 clicks again",
+                path.display()
+            )
+        } else {
+            format!(
+                "saved to {}; {n} button(s) silenced, every other one left clicking",
+                path.display()
+            )
+        }
+    }
+
     fn draw_save(&mut self, ui: &mut egui::Ui, snap: &Snapshot, errs: &[String], count: u8) {
         theme::section(ui, "Save", |ui| {
             let blocked = all_replaced(&self.rows, count);
@@ -918,8 +980,6 @@ impl BindingsEditor {
                 {
                     match self.save(count) {
                         Ok(silence) => {
-                            let n = silence.len();
-                            let path = actions::config_path();
                             // Only ask the device layer for anything when the
                             // mouse can actually report button presses. A
                             // Replace silences the physical button; doing that
@@ -929,28 +989,7 @@ impl BindingsEditor {
                             // what the hint at the bottom of the section
                             // promises, so the two must not drift apart.
                             let apply = snap.connected && snap.has_button_spy;
-                            // An empty list is not an un-silence: buttonspy
-                            // writes nothing at all for it. Sending it anyway
-                            // would only put a notice about a table nothing
-                            // touched in front of someone whose button is
-                            // still silenced and who needs Restore.
-                            let msg = if !apply {
-                                format!(
-                                    "saved to {}; not applied, because no connected \
-                                     mouse can report button presses",
-                                    path.display()
-                                )
-                            } else if n == 0 {
-                                format!(
-                                    "saved to {}; nothing to silence. A button silenced \
-                                     earlier is still silenced in the mouse — Restore is \
-                                     what gives it back.",
-                                    path.display()
-                                )
-                            } else {
-                                self.requests.push(Request::ApplyBindings { silence });
-                                format!("saved to {}; {n} button(s) silenced", path.display())
-                            };
+                            let msg = self.queue_apply(apply, silence);
                             self.status = Some((msg, true));
                         }
                         Err(e) => self.status = Some((e, false)),
@@ -1368,6 +1407,116 @@ mod tests {
         let e = ed.borrow();
         assert!(!e.dirty(), "painting made the editor think it had edits");
         assert_eq!(e.rows, editor(SRC).rows);
+    }
+
+    /// Saving with nothing on Replace still has to reach the device.
+    ///
+    /// `buttonspy::silence` writes exactly the set it is handed and returns
+    /// every other button to its own click, so the empty set is the un-silence
+    /// — not a no-op. Dropping it here left a button the user had just moved
+    /// off Replace dead in the mouse, across unplugging, with only the factory
+    /// table to dig it out.
+    #[test]
+    fn saving_sends_the_whole_silenced_set_including_the_empty_one() {
+        let mut e = editor("");
+
+        let msg = e.queue_apply(true, Vec::new());
+        assert_eq!(
+            e.take_requests(),
+            vec![Request::ApplyBindings { silence: Vec::new() }],
+            "an empty set must still be applied: it is what gives a click back"
+        );
+        assert!(msg.contains("clicks again"), "{msg}");
+
+        // A non-empty one carries exactly the Replace rows, nothing more.
+        let msg = e.queue_apply(true, vec![3, 4]);
+        assert_eq!(
+            e.take_requests(),
+            vec![Request::ApplyBindings { silence: vec![3, 4] }]
+        );
+        assert!(msg.contains("2 button(s) silenced"), "{msg}");
+
+        // And nothing at all is asked of a mouse that cannot report presses:
+        // silencing a button there is silencing it with nothing listening.
+        let msg = e.queue_apply(false, vec![3]);
+        assert!(e.take_requests().is_empty(), "nothing may be applied");
+        assert!(msg.contains("not applied"), "{msg}");
+    }
+
+    /// A captured key belongs to the capture and to nothing else.
+    ///
+    /// Capture is armed by clicking a focusable widget, so that widget still
+    /// holds keyboard focus. Leaving the press in the queue let it act on the
+    /// same key: Space or Enter clicked the Capture control a second time and
+    /// re-armed capture, which then ate the next key typed anywhere in the app.
+    #[test]
+    fn a_captured_key_is_taken_out_of_the_frame() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(""));
+        let left = RefCell::new(usize::MAX);
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            e.capturing = Some(4);
+            ui.input_mut(|i| {
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                // The same press on a printable key: this is what a focused
+                // TextEdit would have inserted.
+                i.events.push(egui::Event::Text(" ".into()));
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::Space,
+                    physical_key: None,
+                    pressed: false,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            });
+            e.poll_capture(ui);
+            *left.borrow_mut() = ui.input(|i| i.events.len());
+        });
+        let e = ed.borrow();
+        assert_eq!(e.capturing, None, "the capture did not finish");
+        assert_eq!(e.rows.iter().find(|r| r.button == 4).unwrap().key, "space");
+        assert_eq!(e.rows.iter().find(|r| r.button == 4).unwrap().kind, Kind::Key);
+        assert_eq!(
+            *left.borrow(),
+            0,
+            "the press was left for the focused widget to act on as well"
+        );
+    }
+
+    /// Escape cancels, and is swallowed with everything else: a cancel that
+    /// also closes whatever else listens for Escape is not a cancel.
+    #[test]
+    fn escape_cancels_the_capture_and_leaves_the_row_alone() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(""));
+        let left = RefCell::new(usize::MAX);
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            e.capturing = Some(4);
+            ui.input_mut(|i| {
+                i.events.push(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            });
+            e.poll_capture(ui);
+            *left.borrow_mut() = ui.input(|i| i.events.len());
+        });
+        let e = ed.borrow();
+        assert_eq!(e.capturing, None);
+        assert!(e.rows.iter().find(|r| r.button == 4).unwrap().key.is_empty());
+        assert_eq!(e.rows.iter().find(|r| r.button == 4).unwrap().kind, Kind::None);
+        assert_eq!(*left.borrow(), 0);
     }
 
     #[test]

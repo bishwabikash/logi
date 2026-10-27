@@ -129,6 +129,22 @@ impl App {
     }
 }
 
+/// Every label the per-button menu offers.
+///
+/// Each one has to survive `action_to_button` and come back out of
+/// `Button::describe` spelled the same way: the Apply button is armed by
+/// comparing the chosen label with the device's own description, so a label
+/// that does not round-trip would stay armed after a successful write and
+/// invite another flash write for no change.
+fn button_choices() -> Vec<String> {
+    let mut choices: Vec<String> = SPECIALS.iter().map(|(_, n)| n.to_string()).collect();
+    for n in 1..=5u8 {
+        choices.push(format!("button {n}"));
+    }
+    choices.push("disabled".to_string());
+    choices
+}
+
 /// Map a menu label back to a binding. Labels come from the same tables that
 /// produced them, so an unknown one means a bug rather than user input.
 fn action_to_button(label: &str) -> Option<Button> {
@@ -139,6 +155,45 @@ fn action_to_button(label: &str) -> Option<Button> {
         return rest.trim().parse::<u8>().ok().map(Button::mouse);
     }
     Button::special(label)
+}
+
+/// Whether a lighting mode is one a profile record can encode.
+///
+/// `profile_blob::Led` has a constructor for exactly these four. Anything else
+/// a zone reports — wave, starlight, ripple, the frame-streaming mode — would
+/// be written as a fixed colour, which is not what the panel is showing.
+fn storable_mode(m: u8) -> bool {
+    matches!(m, led::OFF | led::FIXED | led::BREATHING | led::CYCLE)
+}
+
+/// Why storing lighting into the onboard profile is not on offer, or `None`
+/// when it is.
+///
+/// Every one of these is a reason a write would land as something other than
+/// what the panel is showing, and the write is flash, so the button is
+/// disabled and this says why rather than letting it fail afterwards.
+fn store_blocked_reason(storable: bool, format: u8, slot_known: bool) -> Option<&'static str> {
+    if !storable {
+        return Some(
+            "A profile record can hold off, fixed, breathing or cycle. This mode is not \
+             one of them, so there is nothing to write that would mean what it says.",
+        );
+    }
+    if format != 2 {
+        return Some(
+            "Saving reads the profile sector and writes it back, which needs the format 2 \
+             layout this app decodes. This device reports another one, so nothing is \
+             written.",
+        );
+    }
+    if !slot_known {
+        return Some(
+            "The active profile has not been read off the mouse yet, so the other zone's \
+             stored lighting is unknown and saving this one would overwrite it. Press \
+             Refresh.",
+        );
+    }
+    None
 }
 
 fn default_backup_path() -> String {
@@ -281,8 +336,14 @@ impl App {
         for ev in tray.poll() {
             match ev {
                 Event::Open => {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    // Un-minimise first. Focus does not restore a minimised
+                    // window on most compositors, and a minimised window is
+                    // the usual reason someone reaches for the tray at all,
+                    // so without this the one menu item that has to work did
+                    // nothing.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 Event::ToggleService => {
                     let a = if self.service.state() == crate::service::State::Active {
@@ -573,10 +634,17 @@ impl App {
                 }
             });
             ui.add_space(8.0);
+            // What this button actually sends is `setReportRate`, the live
+            // setter. It does not touch the profile, and PROTOCOL.md has it
+            // measured: in onboard mode the device answers invalid argument,
+            // and a rate set live is lost the moment it goes back. The old
+            // wording here promised the opposite, which is the profile
+            // editor's job, not this one's.
             theme::hint(
                 ui,
-                "Written into the active onboard profile, so it survives unplugging. \
-                 The live setter is rejected in onboard mode.",
+                "Sets the rate live. The mouse only accepts that in host mode, and forgets \
+                 it on the way back to onboard. To make a rate stick, set it on the \
+                 Profiles tab: that writes byte 0 of the profile sector.",
             );
         });
     }
@@ -593,7 +661,10 @@ impl App {
 
         theme::section(ui, "Zone", |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.selectable_label(self.all_zones, "Both").clicked() {
+                // "All", not "Both": the zone list is read off the device and
+                // this app has no model whitelist, so the number of zones is
+                // not something the label gets to claim.
+                if ui.selectable_label(self.all_zones, "All").clicked() {
                     self.all_zones = true;
                 }
                 for (i, z) in zones.iter().enumerate() {
@@ -616,8 +687,13 @@ impl App {
                 for m in &available {
                     let label = if live_ok(*m) {
                         led::mode_name(*m).to_string()
-                    } else {
+                    } else if storable_mode(*m) {
                         format!("{} (store only)", led::mode_name(*m))
+                    } else {
+                        // Neither path can carry it: the live setter refuses
+                        // it and no profile record encodes it. Saying "store
+                        // only" here would point at a button that is off.
+                        format!("{} (not supported here)", led::mode_name(*m))
                     };
                     if ui.selectable_label(self.mode == *m, label).clicked() {
                         self.mode = *m;
@@ -669,12 +745,41 @@ impl App {
                 });
             }
 
+            // Storing goes through the format-2 profile codec and writes
+            // flash, so three things have to hold before the button is live.
+            //
+            // The record has to be able to say what was picked. `Led` encodes
+            // off, fixed, breathing and cycle; a zone that reports wave or
+            // starlight would otherwise fall through to the fixed arm below
+            // and store a plain colour nobody chose.
+            let storable = storable_mode(self.mode);
+            // The other zone's record has to be known, because the command
+            // carries both slots. Writing this record into both when the
+            // mouse's own lighting has not been read is the silent loss of
+            // stored lighting that the slot pairing below exists to prevent,
+            // and it is reachable whenever the sectors are undecoded.
+            let stored = self
+                .snap
+                .profiles
+                .get(self.snap.active_profile as usize)
+                .map(|p| p.leds);
+            let slot_known =
+                self.all_zones || stored.map(|k| self.zone_sel < k.len()).unwrap_or(false);
+            // And the sector has to be one this app can decode at all: the
+            // worker parses it with the format-2 codec before writing it back.
+            let blocked =
+                store_blocked_reason(storable, self.snap.profile_format, slot_known);
+            let can_store = blocked.is_none();
+
             ui.add_space(14.0);
             if !live_ok(self.mode) {
                 theme::hint(
                     ui,
-                    "This firmware will not set cycling live. Store it so the mouse runs \
-                     it itself, or stream the rainbow effect below.",
+                    &format!(
+                        "This firmware will not set {} live. Store it so the mouse runs \
+                         it itself, or stream the rainbow effect below.",
+                        led::mode_name(self.mode)
+                    ),
                 );
                 ui.add_space(8.0);
             }
@@ -699,7 +804,10 @@ impl App {
                         });
                     }
                 }
-                if ui.button("Save to mouse").clicked() {
+                if ui
+                    .add_enabled(can_store, egui::Button::new("Save to mouse"))
+                    .clicked()
+                {
                     let c = self.rgb();
                     let wf = led::WAVEFORMS[self.waveform].1;
                     let rec = match self.mode {
@@ -714,11 +822,6 @@ impl App {
                     // lighting the user never touched. Record slot and zone
                     // position line up, which is the same pairing the profile
                     // editor uses.
-                    let stored = self
-                        .snap
-                        .profiles
-                        .get(self.snap.active_profile as usize)
-                        .map(|p| p.leds);
                     let leds = match (self.all_zones, stored) {
                         (false, Some(mut keep)) if self.zone_sel < keep.len() => {
                             keep[self.zone_sel] = rec;
@@ -735,6 +838,10 @@ impl App {
                 "Apply now needs host mode and is lost on unplug. Save to mouse writes \
                  onboard flash, so it persists with nothing running, and into Windows.",
             );
+            if let Some(why) = blocked {
+                ui.add_space(6.0);
+                theme::hint(ui, why);
+            }
         });
 
         ui.add_space(14.0);
@@ -918,11 +1025,7 @@ impl App {
             self.btn_profile = Some(idx);
         }
 
-        let mut choices: Vec<String> = SPECIALS.iter().map(|(_, n)| n.to_string()).collect();
-        for n in 1..=5u8 {
-            choices.push(format!("button {n}"));
-        }
-        choices.push("disabled".to_string());
+        let choices = button_choices();
 
         let n_buttons = self.snap.button_count;
         let mut pending: Option<(u8, Button)> = None;
@@ -980,6 +1083,11 @@ impl App {
     fn draw_service(&mut self, ui: &mut egui::Ui) {
         use crate::service::{self as svc, Action, State};
         let st = self.service.state();
+        // The first poll runs journalctl, which can outlast the first frames.
+        // Until it lands the cached state is only a default, and printing it
+        // tells the user the unit is installed and stopped without anything
+        // having looked. Saying so is what `Watcher::known` is for.
+        let known = self.service.known();
         let colour = match st {
             State::Active => theme::GOOD,
             State::Failed => theme::BAD,
@@ -989,8 +1097,12 @@ impl App {
 
         theme::section(ui, "Background service", |ui| {
             ui.horizontal(|ui| {
-                theme::pill(ui, svc::label(st), colour);
-                if self.service.is_enabled() {
+                if known {
+                    theme::pill(ui, svc::label(st), colour);
+                } else {
+                    theme::pill(ui, "checking", theme::FAINT);
+                }
+                if known && self.service.is_enabled() {
                     theme::pill(ui, "starts at login", theme::DIM);
                 }
                 if let Some(a) = self.service.busy() {
@@ -998,10 +1110,13 @@ impl App {
                 }
             });
             ui.add_space(8.0);
-            theme::hint(ui, svc::describe(st));
+            theme::hint(
+                ui,
+                if known { svc::describe(st) } else { "Asking systemd what the unit is doing." },
+            );
             ui.add_space(12.0);
 
-            let can = svc::can_control(st) && self.service.busy().is_none();
+            let can = known && svc::can_control(st) && self.service.busy().is_none();
             ui.horizontal(|ui| {
                 if ui.add_enabled(can && st != State::Active, egui::Button::new("Start")).clicked() {
                     self.service.request(Action::Start);
@@ -1116,4 +1231,84 @@ pub fn run() -> eframe::Result {
         ..Default::default()
     };
     eframe::run_native("logi", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Apply button in the Buttons grid is armed by comparing the chosen
+    /// menu label with `Button::describe` of what the device holds. If a label
+    /// did not come back out spelled the same way, Apply would stay armed
+    /// after a successful write, and Apply writes flash.
+    #[test]
+    fn every_menu_label_round_trips_through_describe() {
+        for label in button_choices() {
+            let b = action_to_button(&label)
+                .unwrap_or_else(|| panic!("{label} is offered but maps to no binding"));
+            assert_eq!(b.describe(), label, "{label} does not come back as itself");
+        }
+    }
+
+    #[test]
+    fn a_label_from_nowhere_sends_nothing() {
+        // No binding means `pending` stays None, so no command is queued.
+        assert_eq!(action_to_button("nonsense"), None);
+        assert_eq!(action_to_button("button"), None);
+        assert_eq!(action_to_button("button x"), None);
+        // Past the 16-bit mask, so `Button::mouse` would clamp and the write
+        // would not be the button that was asked for.
+        assert_eq!(action_to_button("button 900"), None);
+    }
+
+    #[test]
+    fn describe_of_an_unmodelled_binding_is_not_offered_as_a_choice() {
+        // A key binding, written by the CLI or the profile editor. The grid
+        // shows it, but it must not be reachable from the menu, or choosing it
+        // back would be a write that means something else.
+        let key = Button::key(0x1e, 0x02);
+        assert!(!button_choices().contains(&key.describe()));
+        assert_eq!(action_to_button(&key.describe()), None);
+    }
+
+    #[test]
+    fn storable_modes_are_exactly_the_ones_led_can_encode() {
+        for m in [led::OFF, led::FIXED, led::BREATHING, led::CYCLE] {
+            assert!(storable_mode(m), "{} has an Led constructor", led::mode_name(m));
+        }
+        for m in [led::WAVE, led::STARLIGHT, led::RIPPLE, led::CUSTOM] {
+            assert!(!storable_mode(m), "{} has no Led constructor", led::mode_name(m));
+        }
+        // And what we do store for each really is that mode, so the record
+        // cannot say something other than the panel.
+        assert_eq!(Led::off().mode(), led::OFF);
+        assert_eq!(Led::fixed([1, 2, 3]).mode(), led::FIXED);
+        assert_eq!(Led::breathing([1, 2, 3], 4000, 0, 100).mode(), led::BREATHING);
+        assert_eq!(Led::cycle(4000, 100).mode(), led::CYCLE);
+    }
+
+    #[test]
+    fn storing_is_refused_until_the_write_can_mean_what_it_shows() {
+        // A mode no record encodes.
+        assert!(store_blocked_reason(false, 2, true).is_some());
+        // A sector layout this app does not decode: the worker parses it with
+        // the format-2 codec before writing it back.
+        assert!(store_blocked_reason(true, 1, true).is_some());
+        assert!(store_blocked_reason(true, 0, true).is_some());
+        // One zone selected with the stored records unknown. The command
+        // carries both slots, so writing would overwrite the other zone's
+        // stored lighting with a copy of this one.
+        assert!(store_blocked_reason(true, 2, false).is_some());
+        // All three hold.
+        assert_eq!(store_blocked_reason(true, 2, true), None);
+    }
+
+    #[test]
+    fn a_backup_path_is_absolute_even_with_no_home() {
+        // `HOME` unset is not worth a panic, and a bare filename would write
+        // into whatever directory the app happened to be started from.
+        let p = default_backup_path();
+        assert!(p.ends_with("logi-backup.json"), "{p}");
+        assert!(p.len() > "logi-backup.json".len(), "{p} has no directory");
+    }
 }

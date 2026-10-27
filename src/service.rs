@@ -330,9 +330,15 @@ fn probe() -> Probe {
         // `show` answered with something unexpected. Fall back to the simpler
         // command rather than reporting a state we did not establish.
         None => {
-            let state = run("systemctl", &["--user", "is-active", UNIT])
-                .map(|o| parse_is_active(&o.stdout))
-                .unwrap_or(State::NoSystemd);
+            // Its stderr goes through `classify` first for the same reason
+            // `show`'s does: a failed `is-active` leaves stdout empty, and an
+            // empty stdout reads as "unknown unit", so without this a command
+            // that never reached systemd at all would be reported as a unit
+            // that is not installed.
+            let state = match run("systemctl", &["--user", "is-active", UNIT]) {
+                Ok(o) => classify(&o.stderr, o.code).unwrap_or_else(|| parse_is_active(&o.stdout)),
+                Err(_) => State::NoSystemd,
+            };
             let enabled = run("systemctl", &["--user", "is-enabled", UNIT])
                 .map(|o| parse_enabled(&o.stdout))
                 .unwrap_or(false);
@@ -436,9 +442,18 @@ fn classify(stderr: &str, code: Option<i32>) -> Option<State> {
     // directory" on a TTY with no XDG_RUNTIME_DIR, "...: No medium found" under
     // sudo, "Failed to connect to user scope bus via local transport" on newer
     // systemd.
+    //
+    // "System has not been booted with systemd as init system (PID 1). Can't
+    // operate." is the other one, and it is the only one that can arrive on
+    // its own: a container or a non-systemd distro that still ships the
+    // systemctl binary prints it with no bus line after it. Without this the
+    // message falls through to the unit checks, `show` prints nothing, and
+    // the panel ends up claiming the unit is not installed on a machine that
+    // could not have told it either way.
     if e.contains("failed to connect to bus")
         || e.contains("failed to connect to user scope bus")
         || e.contains("failed to get d-bus connection")
+        || e.contains("has not been booted with systemd")
         || e.contains("no medium found")
         || e.contains("xdg_runtime_dir")
         || e.contains("dbus_session_bus_address")
@@ -1021,6 +1036,20 @@ mod tests {
         ] {
             assert_eq!(classify(e, Some(1)), Some(State::NoSystemd), "{e}");
         }
+    }
+
+    /// A container or a distro that ships systemctl without running it as PID
+    /// 1 prints this and nothing else: no bus line to match on. It used to
+    /// fall through to the unit checks and come back as NotInstalled, which
+    /// offers the user an install that cannot help.
+    #[test]
+    fn a_machine_not_booted_with_systemd_is_no_systemd_not_a_missing_unit() {
+        let alone = "System has not been booted with systemd as init system (PID 1). \
+                     Can't operate.";
+        assert_eq!(classify(alone, Some(1)), Some(State::NoSystemd));
+        // And with the bus line some versions add after it.
+        let both = format!("{alone}\nFailed to connect to bus: Host is down");
+        assert_eq!(classify(&both, Some(1)), Some(State::NoSystemd));
     }
 
     #[test]

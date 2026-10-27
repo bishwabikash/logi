@@ -99,6 +99,28 @@ impl Cmd {
         }
     }
 
+    /// True when running this can leave the device in host mode.
+    ///
+    /// The flag shutdown reads is set from this *before* the command runs,
+    /// not from the mode read back after it, because a `setOnboardMode` whose
+    /// reply was lost may still have landed. Handing the mouse back when it
+    /// did not need it costs one HID++ call at exit; not handing it back
+    /// leaves a mouse that ignores its own stored profile until something
+    /// else sets the mode, which is not something the user can click.
+    fn takes_host_mode(&self) -> bool {
+        match self {
+            Cmd::SetMode(m) => *m == crate::profiles::MODE_HOST,
+            // Live lighting only takes effect in host mode, so each of these
+            // switches into it first; see `ensure_host`.
+            Cmd::LedFixed { .. }
+            | Cmd::LedBreathing { .. }
+            | Cmd::LedCycle { .. }
+            | Cmd::LedOff { .. }
+            | Cmd::StartEffect { .. } => true,
+            _ => false,
+        }
+    }
+
     /// True when running this leaves the decoded profiles in the snapshot
     /// stale, so they have to be read again. `Refresh` is in here because
     /// that re-read is its whole job.
@@ -252,7 +274,17 @@ impl Handle {
     /// and only one that waits for the result needs the id.
     pub fn send(&self, c: Cmd) -> CmdId {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let _ = self.tx.send((id, c));
+        let kind = c.kind();
+        if self.tx.send((id, c)).is_err() {
+            // The worker thread is gone, so nothing will ever record an
+            // outcome for this id and a panel waiting on its own answer would
+            // wait for one that cannot arrive. Writing the snapshot from here
+            // is safe in exactly the case it matters: the only other writer is
+            // the worker, and it has stopped publishing.
+            if let Ok(mut g) = self.snapshot.lock() {
+                g.record(Outcome::failed(id, kind, "the device thread has stopped"));
+            }
+        }
         id
     }
 
@@ -450,10 +482,20 @@ fn read_profiles(l: &mut Live, into: &mut Snapshot) {
     {
         let mut out = Vec::new();
         for i in 0..into.profile_count {
-            if let Ok(blob) = p.read_sector(&mut l.dev, i as u16 + 1, None) {
-                if let Ok(parsed) = Profile::parse(&blob) {
-                    out.push(parsed);
+            match p.read_sector(&mut l.dev, i as u16 + 1, None) {
+                Ok(blob) => {
+                    if let Ok(parsed) = Profile::parse(&blob) {
+                        out.push(parsed);
+                    }
                 }
+                // A device that has stopped answering will not answer the
+                // next sector either, and one sector is 16 calls at 800ms
+                // apiece. Grinding through the remaining four is a minute in
+                // which no queued command runs. A malformed reply is
+                // different: that is one bad sector, so keep reading.
+                Err(crate::hidpp::Error::Timeout { .. })
+                | Err(crate::hidpp::Error::Io(_)) => break,
+                Err(_) => {}
             }
         }
         if !out.is_empty() {
@@ -461,6 +503,36 @@ fn read_profiles(l: &mut Live, into: &mut Snapshot) {
         }
     }
     l.profiles = Some(p);
+}
+
+/// Hand the worker's snapshot to the UI.
+///
+/// The worker keeps the authoritative copy and is its only writer, so every
+/// HID++ read happens with no lock held and the lock is taken for exactly one
+/// clone. It used to be held across `read_state` and `read_profiles` — the
+/// latter is 80 round trips, over a second — while the frame loop blocked on
+/// the same lock every frame, which is precisely the stall this worker thread
+/// exists to keep out of the UI.
+///
+/// Published in one assignment, so the outcome of a flash write and the
+/// re-read that followed it still become visible together: the profile editor
+/// settles a write by reading both out of the same snapshot.
+fn publish(shared: &Mutex<Snapshot>, snap: &Snapshot) {
+    if let Ok(mut g) = shared.lock() {
+        *g = snap.clone();
+    }
+}
+
+/// Drop everything read off a device, keeping the record of what was asked of
+/// it.
+///
+/// Reconnecting used to assign a fresh `Snapshot::default()`, which threw the
+/// outcome ring away with it. A panel that had just been told its write failed
+/// because the mouse was unplugged had that answer erased by the replug, and
+/// went on waiting for one that no longer existed.
+fn reset_for_connect(snap: &mut Snapshot) {
+    let outcomes = std::mem::take(&mut snap.outcomes);
+    *snap = Snapshot { outcomes, ..Snapshot::default() };
 }
 
 fn worker(
@@ -472,24 +544,25 @@ fn worker(
     let mut effect: Option<effects::Running> = None;
     let mut pending: std::collections::VecDeque<(CmdId, Cmd)> =
         std::collections::VecDeque::new();
+    // The worker's own copy. Mutated freely here and published in one clone,
+    // so no device read ever happens with the UI's lock held.
+    let mut snap = Snapshot::default();
 
     loop {
         // Reconnect lazily so unplug/replug is handled without crashing.
         if live.is_none() && effect.is_none() {
             match connect() {
                 Ok(mut l) => {
-                    if let Ok(mut g) = shared.lock() {
-                        *g = Snapshot::default();
-                        read_state(&mut l, &mut g);
-                        read_profiles(&mut l, &mut g);
-                    }
+                    reset_for_connect(&mut snap);
+                    read_state(&mut l, &mut snap);
+                    read_profiles(&mut l, &mut snap);
                     live = Some(l);
+                    publish(&shared, &snap);
                 }
                 Err(e) => {
-                    if let Ok(mut g) = shared.lock() {
-                        g.connected = false;
-                        g.error = Some(e);
-                    }
+                    snap.connected = false;
+                    snap.error = Some(e);
+                    publish(&shared, &snap);
                     // Back off; a missing device is the normal idle state.
                     std::thread::sleep(Duration::from_millis(1500));
                 }
@@ -507,22 +580,53 @@ fn worker(
         };
         let kind = cmd.kind();
 
-        // Any command other than StopEffect ends a running effect first: the
-        // effect holds the device, and two owners would interleave writes.
-        if !matches!(cmd, Cmd::StopEffect) {
-            if let Some(r) = effect.take() {
-                r.stop();
-            }
+        // Every command ends a running effect first: the effect thread holds
+        // its own handle on the device, and two owners would interleave
+        // writes. Stopping it joins that thread, which hands the mouse back
+        // and releases the device for the loop top to open again.
+        let was_running = effect.is_some();
+        if let Some(r) = effect.take() {
+            r.stop();
+        }
+        if was_running {
+            snap.effect_running = None;
+        }
+
+        // Stopping needs no handle of its own, and must not be made to wait
+        // for one. This used to fall through to the handle check below, which
+        // fails every command with "device not connected" while an effect
+        // runs — `live` is None for the whole of one — so Stop reported a
+        // failure, left `effect` in place, and with `effect` in place the loop
+        // top would not reconnect either: every later command failed the same
+        // way and the only way out of the effect was quitting the app.
+        if matches!(cmd, Cmd::StopEffect) {
+            let msg = if was_running { "effect stopped" } else { "no effect was running" };
+            snap.record(Outcome::ok(id, kind, Some(msg.to_string())));
+            publish(&shared, &snap);
+            continue;
+        }
+        if was_running {
+            // The device is free now but not yet open. Requeue rather than
+            // fail the command for a handle the loop top is about to take.
+            publish(&shared, &snap);
+            pending.push_front((id, cmd));
+            continue;
+        }
+
+        // Marked before the command runs, not after it succeeds: a mode
+        // switch whose reply was lost may still have landed, and until this
+        // flag is set nothing at exit will hand the mouse back. See
+        // `Cmd::takes_host_mode`.
+        let takes_host = cmd.takes_host_mode();
+        if takes_host {
+            host_held.store(true, Ordering::Relaxed);
         }
 
         let Some(l) = live.as_mut() else {
             // Still an outcome: a panel waiting on this id must be told it
             // failed, or it waits for an answer that is never coming.
-            if let Ok(mut g) = shared.lock() {
-                let msg = "device not connected".to_string();
-                g.error = Some(msg.clone());
-                g.record(Outcome::failed(id, kind, msg));
-            }
+            snap.record(Outcome::failed(id, kind, "device not connected"));
+            publish(&shared, &snap);
             continue;
         };
 
@@ -624,7 +728,13 @@ fn worker(
                     let json = profile_io::dump_to_json(&name_for_backup, &dump);
                     std::fs::write(&path, json)
                         .map(|_| Some(format!("backup written to {path}")))
-                        .map_err(crate::hidpp::Error::Io)
+                        // Not Error::Io: that is the class this loop reads as
+                        // "the device vanished", so an unwritable backup path
+                        // used to drop a perfectly good handle and pay for a
+                        // full reconnect and re-read.
+                        .map_err(|e| {
+                            crate::hidpp::Error::Protocol(format!("writing {path}: {e}"))
+                        })
                 })
             }
             Cmd::StartEffect { name, color, period_ms } => {
@@ -633,55 +743,55 @@ fn worker(
                         effect = Some(r);
                         // The effect thread now owns the device.
                         live = None;
-                        if let Ok(mut g) = shared.lock() {
-                            g.effect_running = Some(name);
-                            g.notice = Some("effect running; it stops when you stop it".into());
-                            g.error = None;
-                        }
+                        snap.effect_running = Some(name);
+                        // Recorded like any other command: the success path
+                        // used to record nothing, so a caller waiting on this
+                        // id waited for an answer that was never written.
+                        snap.record(Outcome::ok(
+                            id,
+                            kind,
+                            Some("effect running; it stops when you stop it".to_string()),
+                        ));
+                        publish(&shared, &snap);
                         continue;
                     }
                     Err(e) => Err(crate::hidpp::Error::Protocol(e)),
                 }
             }
-            Cmd::StopEffect => {
-                if let Some(r) = effect.take() {
-                    r.stop();
-                }
-                if let Ok(mut g) = shared.lock() {
-                    g.effect_running = None;
-                }
-                Ok(Some("effect stopped".into()))
-            }
+            // Handled above, before the device handle is required.
+            Cmd::StopEffect => Ok(None),
         };
 
         match result {
             Ok(notice) => {
-                if let Ok(mut g) = shared.lock() {
-                    read_state(l, &mut g);
-                    host_held.store(
-                        g.mode == crate::profiles::MODE_HOST,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    if wrote_flash || g.profiles.is_empty() {
-                        read_profiles(l, &mut g);
-                    }
-                    g.notice = notice.clone();
-                    g.error = None;
-                    g.record(Outcome::ok(id, kind, notice));
+                read_state(l, &mut snap);
+                if wrote_flash || snap.profiles.is_empty() {
+                    read_profiles(l, &mut snap);
                 }
+                // `snap.mode` is the last mode actually read back, so a failed
+                // read leaves the previous one standing rather than reading as
+                // onboard. Only that, and a command that cannot have taken
+                // host mode, hands the mouse back unprompted at exit.
+                host_held.store(
+                    snap.mode == crate::profiles::MODE_HOST || takes_host,
+                    Ordering::Relaxed,
+                );
+                // Recorded with the re-read in one publish, so a panel that
+                // settles a write against this outcome sees the post-write
+                // sectors in the same snapshot.
+                snap.record(Outcome::ok(id, kind, notice));
+                publish(&shared, &snap);
             }
             Err(e) => {
-                let msg = e.to_string();
                 // A vanished device must drop the handle so the loop reconnects.
-                let gone = matches!(e, crate::hidpp::Error::Io(_))
-                    || matches!(e, crate::hidpp::Error::NotFound(_));
-                if let Ok(mut g) = shared.lock() {
-                    g.error = Some(msg.clone());
-                    g.notice = None;
-                    // Recorded before the handle is dropped, so a panel waiting
-                    // on this id learns the write failed rather than timing out.
-                    g.record(Outcome::failed(id, kind, msg));
-                }
+                let gone = matches!(
+                    e,
+                    crate::hidpp::Error::Io(_) | crate::hidpp::Error::NotFound(_)
+                );
+                // Recorded before the handle is dropped, so a panel waiting
+                // on this id learns the write failed rather than timing out.
+                snap.record(Outcome::failed(id, kind, e.to_string()));
+                publish(&shared, &snap);
                 if gone {
                     live = None;
                 }
@@ -698,5 +808,171 @@ fn worker(
             pending.push_back(next);
             break;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile_blob::{Button, Led, LED_RECORD};
+
+    fn ok(id: CmdId, kind: CmdKind) -> Outcome {
+        Outcome::ok(id, kind, Some(format!("outcome {id}")))
+    }
+
+    #[test]
+    fn record_flattens_the_newest_outcome_into_the_status_bar() {
+        let mut s = Snapshot::default();
+        s.record(Outcome::failed(1, CmdKind::SetDpi, "nope"));
+        assert_eq!(s.error.as_deref(), Some("nope"));
+        assert_eq!(s.notice, None);
+        s.record(Outcome::ok(2, CmdKind::SetDpi, Some("DPI 800".into())));
+        // A success has to clear the previous error, or the status bar keeps
+        // reporting a failure the device has since taken back.
+        assert_eq!(s.error, None);
+        assert_eq!(s.notice.as_deref(), Some("DPI 800"));
+    }
+
+    #[test]
+    fn the_ring_is_bounded_and_keeps_the_newest() {
+        let mut s = Snapshot::default();
+        for i in 1..=(OUTCOME_HISTORY as u64 * 3) {
+            s.record(ok(i, CmdKind::Refresh));
+        }
+        assert_eq!(s.outcomes.len(), OUTCOME_HISTORY);
+        assert_eq!(s.newest_outcome_id(), OUTCOME_HISTORY as u64 * 3);
+        // Oldest first, contiguous: the tail of what was recorded.
+        let ids: Vec<CmdId> = s.outcomes.iter().map(|o| o.id).collect();
+        assert_eq!(ids.first(), Some(&(OUTCOME_HISTORY as u64 * 2 + 1)));
+        assert!(ids.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn newest_outcome_id_is_zero_before_anything_runs() {
+        // Panels bound their search with this before they send, so it has to
+        // be a value no command will ever be issued: ids start at 1.
+        assert_eq!(Snapshot::default().newest_outcome_id(), 0);
+    }
+
+    #[test]
+    fn outcome_after_ignores_an_answer_that_predates_the_send() {
+        let mut s = Snapshot::default();
+        s.record(ok(1, CmdKind::ApplyBindings));
+        let after = s.newest_outcome_id();
+        // Someone else's command lands in between.
+        s.record(ok(2, CmdKind::SetDpi));
+        assert!(s.outcome_after(after, CmdKind::ApplyBindings).is_none());
+        s.record(ok(3, CmdKind::ApplyBindings));
+        assert_eq!(s.outcome_after(after, CmdKind::ApplyBindings).unwrap().id, 3);
+    }
+
+    #[test]
+    fn outcome_after_takes_the_oldest_match_not_the_newest() {
+        // Two of the same kind in flight: the first answer belongs to the
+        // first send, and handing it the second would settle it on the wrong
+        // result.
+        let mut s = Snapshot::default();
+        s.record(Outcome::failed(1, CmdKind::SetRate, "refused"));
+        s.record(ok(2, CmdKind::SetRate));
+        let got = s.outcome_after(0, CmdKind::SetRate).unwrap();
+        assert_eq!(got.id, 1);
+        assert!(!got.ok);
+    }
+
+    #[test]
+    fn write_outcomes_are_told_apart_by_profile() {
+        // The GUI drops the id `send` returned, so the index in the kind is
+        // the only thing keeping one profile's answer off another's draft.
+        let mut s = Snapshot::default();
+        s.record(ok(1, CmdKind::WriteProfile(2)));
+        assert!(s.outcome_after(0, CmdKind::WriteProfile(1)).is_none());
+        assert_eq!(s.outcome_after(0, CmdKind::WriteProfile(2)).unwrap().id, 1);
+    }
+
+    #[test]
+    fn a_burst_cannot_push_out_an_answer_before_it_is_read() {
+        // What the ring is for: a panel polls once a frame, so one outcome
+        // has to survive everything other panels can queue in that frame.
+        let mut s = Snapshot::default();
+        s.record(ok(1, CmdKind::WriteProfile(0)));
+        for i in 2..=(OUTCOME_HISTORY as u64) {
+            s.record(ok(i, CmdKind::Led));
+        }
+        assert!(s.outcome(1).is_some());
+        assert_eq!(s.outcome_after(0, CmdKind::WriteProfile(0)).unwrap().id, 1);
+    }
+
+    #[test]
+    fn reset_for_connect_clears_the_device_but_keeps_the_answers() {
+        let mut s = Snapshot::default();
+        s.connected = true;
+        s.model = "G502".into();
+        s.dpi = 1600;
+        s.mode = crate::profiles::MODE_HOST;
+        s.record(Outcome::failed(7, CmdKind::WriteProfile(1), "device disconnected"));
+        reset_for_connect(&mut s);
+        assert!(!s.connected);
+        assert_eq!(s.model, "");
+        assert_eq!(s.dpi, 0);
+        assert_eq!(s.mode, 0);
+        // The replug must not erase the answer the panel is still waiting to
+        // read, or it waits for one that no longer exists.
+        assert_eq!(s.outcome(7).unwrap().message.as_deref(), Some("device disconnected"));
+    }
+
+    #[test]
+    fn every_live_lighting_command_is_marked_as_taking_host_mode() {
+        // Live 0x8070 only lands in host mode, so each of these switches into
+        // it. Miss one and the mouse is left ignoring its stored profile.
+        for c in [
+            Cmd::LedFixed { zone: 0, color: [1, 2, 3] },
+            Cmd::LedBreathing { zone: 0, color: [1, 2, 3], period: 2000, waveform: 0, intensity: 100 },
+            Cmd::LedCycle { zone: 0, period: 2000, intensity: 100 },
+            Cmd::LedOff { zone: 0 },
+            Cmd::StartEffect { name: "rainbow".into(), color: [1, 2, 3], period_ms: 2000 },
+            Cmd::SetMode(crate::profiles::MODE_HOST),
+        ] {
+            assert!(c.takes_host_mode(), "{c:?} leaves the device in host mode");
+        }
+    }
+
+    #[test]
+    fn commands_that_end_in_onboard_mode_do_not_claim_host_mode() {
+        // PersistLighting switches back itself, and a plain refresh or a
+        // sensor change never leaves onboard mode at all. Claiming host mode
+        // here would mean a pointless device open on every exit.
+        for c in [
+            Cmd::SetMode(crate::profiles::MODE_ONBOARD),
+            Cmd::Refresh,
+            Cmd::SetDpi(800),
+            Cmd::SetRate(1000),
+            Cmd::PersistLighting { leds: [Led([0; LED_RECORD]); 2] },
+            Cmd::StopEffect,
+        ] {
+            assert!(!c.takes_host_mode(), "{c:?} does not take host mode");
+        }
+    }
+
+    #[test]
+    fn everything_that_writes_flash_forces_a_profile_re_read() {
+        for c in [
+            Cmd::PersistLighting { leds: [Led([0; LED_RECORD]); 2] },
+            Cmd::SetButton { index: 0, button: 1, binding: Button::disabled() },
+            Cmd::Refresh,
+        ] {
+            assert!(c.rereads_profiles(), "{c:?} leaves the decoded profiles stale");
+        }
+        for c in [Cmd::SetDpi(800), Cmd::LedOff { zone: 0 }, Cmd::ApplyBindings { silence: vec![] }] {
+            assert!(!c.rereads_profiles(), "{c:?} does not touch a profile sector");
+        }
+    }
+
+    #[test]
+    fn the_four_lighting_commands_answer_under_one_kind() {
+        // The Lighting panel waits on CmdKind::Led whichever one it sent.
+        assert_eq!(Cmd::LedOff { zone: 1 }.kind(), CmdKind::Led);
+        assert_eq!(Cmd::LedFixed { zone: 0, color: [0; 3] }.kind(), CmdKind::Led);
+        assert_eq!(Cmd::SetButton { index: 3, button: 4, binding: Button::disabled() }.kind(), CmdKind::SetButton(3));
+        assert_eq!(Cmd::SetMode(1).kind(), CmdKind::SetMode);
     }
 }

@@ -621,6 +621,10 @@ pub struct RulesEditor {
     /// Saving is blocked while this is set: an empty editor over a config we
     /// never managed to read would write the user's rules away.
     unreadable: Option<String>,
+    /// Set when a Save found the file different from the copy in
+    /// `disk_text`. The next Save goes through; this is the one chance to
+    /// press Reload instead.
+    confirm_overwrite: bool,
     requested: Option<Instant>,
 }
 
@@ -655,6 +659,7 @@ impl RulesEditor {
             scanner: None,
             no_scanner: false,
             unreadable: None,
+            confirm_overwrite: false,
             requested: None,
         }
     }
@@ -750,6 +755,7 @@ impl RulesEditor {
             }
         }
         self.disk_text = text;
+        self.confirm_overwrite = false;
     }
 
     pub fn dirty(&self) -> bool {
@@ -758,10 +764,38 @@ impl RulesEditor {
 
     /// Render, verify, then replace the file. Nothing is written if the
     /// round trip does not match.
+    ///
+    /// The copy in `disk_text` can be hours old: `load` runs once, when the
+    /// window opens, and this file is meant to be hand-edited. So the file is
+    /// re-read here and a Save that would replace something logi never showed
+    /// costs a second press. Writing over an editor window the user still has
+    /// open is the one way this panel can destroy rules it never displayed.
     pub fn save(&mut self) {
         if let Some(why) = self.unreadable.clone() {
             self.status = Status::Failed(why);
             return;
+        }
+        if !self.confirm_overwrite {
+            match self.read_file() {
+                Ok(text) if text != self.disk_text => {
+                    self.confirm_overwrite = true;
+                    self.status = Status::Note(format!(
+                        "{} changed on disk since logi read it. Press Save again to \
+                         replace it with what is on screen, or Reload from file to take \
+                         the version on disk and lose the edits here.",
+                        self.path.display()
+                    ));
+                    return;
+                }
+                Ok(_) => {}
+                Err(msg) => {
+                    // It was readable at load and is not now. Same rule as
+                    // there: do not write over a file we cannot read.
+                    self.unreadable = Some(msg.clone());
+                    self.status = Status::Failed(msg);
+                    return;
+                }
+            }
         }
         let model = self.model.normalized();
         match round_trip(&model) {
@@ -771,6 +805,14 @@ impl RulesEditor {
                     self.model = model.clone();
                     self.disk = model;
                     self.disk_text = Some(text);
+                    self.confirm_overwrite = false;
+                    // `round_trip` has already confirmed that the only
+                    // problems the written file still has are the kept lines,
+                    // so every note from the load is about a line that has
+                    // just been rewritten. Leaving them up would keep
+                    // "Lines logi could not read" complaining about a line
+                    // that is no longer in the file.
+                    self.notes.clear();
                     self.status = Status::Saved(format!("Saved to {}.", self.path.display()));
                 }
                 Err(e) => {
@@ -1854,6 +1896,117 @@ poll_ms = 500
         ed.model.add("blender", 2);
         ed.save();
         assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_over_a_file_changed_since_it_was_read_costs_a_second_press() {
+        // `load` runs once, when the window opens. A file this panel calls
+        // hand-editable can therefore have been rewritten in a text editor
+        // hours ago, and the first Save must not throw those rules away
+        // without saying so.
+        let dir = temp_dir("stale");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+
+        std::fs::write(&path, "factorio = 3\n").unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Note(_)), "{:?}", ed.status);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "factorio = 3\n",
+            "the first Save must not have written anything"
+        );
+        assert!(ed.dirty(), "and the edit is still unsaved");
+
+        // Pressing it again is the user saying to replace it anyway.
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("csgo = 1"), "{text}");
+        assert!(text.contains("blender = 2"), "{text}");
+        assert!(!text.contains("factorio"), "{text}");
+
+        // And the next save is unremarkable again: the file is ours now.
+        ed.model.add("doom", 0);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reloading_instead_of_confirming_takes_the_version_on_disk() {
+        let dir = temp_dir("stale-reload");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        std::fs::write(&path, "factorio = 3\n").unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Note(_)), "{:?}", ed.status);
+
+        ed.reload();
+        assert_eq!(ed.model.rows.len(), 1);
+        assert_eq!(ed.model.rows[0].pattern, "factorio");
+        // Reload took the file, so the armed confirmation has to be gone: the
+        // next edit's Save must check the file again, not sail past it.
+        ed.model.add("doom", 0);
+        std::fs::write(&path, "quake = 2\n").unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Note(_)), "{:?}", ed.status);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "quake = 2\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_is_refused_if_the_file_stopped_being_readable_after_the_load() {
+        let dir = temp_dir("went-bad");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+
+        std::fs::write(&path, b"\xff\xfe not utf 8\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert!(ed.unreadable.is_some(), "and saving stays blocked");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a file we can no longer read must not be written over"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_stops_complaining_about_a_line_it_has_just_rewritten() {
+        // `csgo = 1, abc` parses to a rule with no dpi and a note about the
+        // dpi. Saving rewrites the line as `csgo = 1`, so the note is about
+        // something no longer in the file and must not stay on screen.
+        let dir = temp_dir("stale-note");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1, abc\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        assert_eq!(ed.notes.len(), 1, "{:?}", ed.notes);
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        assert!(ed.notes.is_empty(), "{:?}", ed.notes);
+
+        // and the file really is clean now
+        let (_, problems) = appwatch::parse_rules(&std::fs::read_to_string(&path).unwrap());
+        assert!(problems.is_empty(), "{problems:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

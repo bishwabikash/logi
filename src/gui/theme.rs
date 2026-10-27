@@ -34,6 +34,17 @@ pub const WARN: Color32 = Color32::from_rgb(0xd8, 0xa5, 0x5c);
 pub const BAD: Color32 = Color32::from_rgb(0xdd, 0x7b, 0x7b);
 
 pub fn apply(ctx: &egui::Context) {
+    // Pin the preference before writing anything. egui keeps a separate style
+    // for dark and for light, and `set_visuals`/`set_style` only write the one
+    // belonging to whichever theme is active *now*; the default preference is
+    // System. So on a desktop that switches to light mid-session, winit sends
+    // ThemeChanged, egui swaps to the other slot, and the whole design — this
+    // palette, the type scale, the spacing — is replaced by stock egui. The
+    // caller applies this once, so nothing would ever put it back. There is no
+    // light variant of this palette, so the honest fix is to ask for dark and
+    // stay there.
+    ctx.set_theme(egui::ThemePreference::Dark);
+
     let mut v = Visuals::dark();
     v.panel_fill = BG;
     v.window_fill = BG;
@@ -219,4 +230,77 @@ pub fn swatch(ui: &mut egui::Ui, rgb: [u8; 3], selected: bool) -> egui::Response
     };
     p.rect_stroke(rect, CornerRadius::same(5), stroke, egui::StrokeKind::Inside);
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// egui keeps one style for dark and one for light and swaps the active
+    /// one when the desktop theme changes. `apply` runs once, off the first
+    /// paint, so if it wrote only the slot that happened to be active, a
+    /// desktop switching to light mid-session would replace this palette, the
+    /// type scale and the spacing with stock egui and nothing would put them
+    /// back.
+    #[test]
+    fn the_design_survives_a_system_theme_switch() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        assert_eq!(ctx.style().visuals.panel_fill, BG);
+
+        // Exactly what winit reports on a switch to light.
+        let input = egui::RawInput {
+            system_theme: Some(egui::Theme::Light),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |_| {});
+
+        assert_eq!(
+            ctx.style().visuals.panel_fill,
+            BG,
+            "a light system theme dropped the design"
+        );
+        assert_eq!(
+            ctx.style().text_styles[&egui::TextStyle::Body].size,
+            14.0,
+            "the type scale went with it"
+        );
+        assert_eq!(ctx.style().visuals.override_text_color, Some(TEXT));
+    }
+
+    /// The accent means "this one" or "right now", so status must never be
+    /// drawn in it by accident.
+    #[test]
+    fn status_colours_stay_off_the_accent() {
+        for c in [GOOD, WARN, BAD] {
+            assert_ne!(c, ACCENT);
+            assert_ne!(c, ACCENT_FILL);
+        }
+    }
+
+    #[test]
+    fn a_section_hands_back_what_its_body_returns() {
+        let got: std::cell::RefCell<Option<i32>> = std::cell::RefCell::new(None);
+        egui::__run_test_ui(|ui| {
+            let v = section(ui, "sensor", |ui| {
+                hint(ui, "a line");
+                41 + 1
+            });
+            *got.borrow_mut() = Some(v);
+        });
+        assert_eq!(*got.borrow(), Some(42));
+    }
+
+    #[test]
+    fn a_swatch_takes_the_space_it_claims_and_reports_no_click() {
+        let out: std::cell::RefCell<Option<(egui::Vec2, bool)>> =
+            std::cell::RefCell::new(None);
+        egui::__run_test_ui(|ui| {
+            let r = swatch(ui, [0x2d, 0xd4, 0xd4], true);
+            *out.borrow_mut() = Some((r.rect.size(), r.clicked()));
+        });
+        // Painting is not clicking: a swatch that reported a click would
+        // rewrite the chosen colour with no pointer anywhere near it.
+        assert_eq!(*out.borrow(), Some((egui::vec2(24.0, 24.0), false)));
+    }
 }
