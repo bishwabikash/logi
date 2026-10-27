@@ -4,3 +4,7 @@ __pycache__/
 reference/
 artifacts/
 .pytest_cache/
+
+# cargo build output; it was committed by accident and every build
+# dirtied the tree with thousands of artifact changes.
+target/

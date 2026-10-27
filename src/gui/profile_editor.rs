@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 
 use super::theme;
-use crate::device::{Cmd, Snapshot};
+use crate::device::{Cmd, CmdId, CmdKind, Snapshot};
 use crate::dpi::Capability;
 use crate::led;
 use crate::profile_blob::{
@@ -31,10 +31,16 @@ use crate::rate::ReportRate;
 /// The name field is 48 bytes of UTF-16LE, so 24 code units.
 pub const NAME_UNITS: usize = NAME_LEN / 2;
 
-/// How long the "writing to flash" marker stays up before giving up on seeing
-/// the device catch up. The worker re-reads every sector after a write, which
-/// takes about a second.
-const WRITE_SETTLE: Duration = Duration::from_secs(4);
+/// How long to wait for the outcome of a write before giving up on ever
+/// seeing one.
+///
+/// Not a guess at how long the write takes: the worker records an outcome for
+/// every command it executes, the device-not-connected early return included,
+/// so the answer normally arrives within a frame or two of the re-read. This
+/// bound only covers an answer that never comes at all — the outcome ring
+/// overflowing while this panel was not on screen, or a worker that died —
+/// and that path keeps the edits.
+const OUTCOME_WAIT: Duration = Duration::from_secs(20);
 
 /// Mouse buttons this editor offers. The report has sixteen bits, but a
 /// profile binding past the fifth physical button is not something a user can
@@ -419,6 +425,39 @@ impl Staged {
     }
 }
 
+/// Where the last write this panel sent stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WriteState {
+    /// Handed to the worker; no outcome recorded for it yet.
+    Waiting,
+    /// The worker answered, and it did not go through. Carries what it said.
+    Failed(String),
+    /// No outcome arrived inside `OUTCOME_WAIT`. Says nothing about whether
+    /// the mouse took the write, so the edits are kept either way.
+    Unanswered,
+}
+
+/// One write handed to the worker, and what came back.
+///
+/// Dropped outright on success, which is what lets the device's own reading
+/// take over. Kept on every other result, because the staged edits are still
+/// on screen and the user has to be told why.
+#[derive(Debug, Clone)]
+struct Write {
+    index: u8,
+    /// Highest outcome id on the books when Save was pressed. The answer to
+    /// this write is the first `WriteProfile(index)` outcome newer than it.
+    ///
+    /// The id `Handle::send` returns would be more direct, but this panel
+    /// never sees it: `ui` returns commands and the host's dispatch loop is
+    /// what sends them. Ids are handed out in send order and executed in that
+    /// same order, so a watermark plus the kind — which carries the profile
+    /// index — names this write's own outcome.
+    after: CmdId,
+    sent: Instant,
+    state: WriteState,
+}
+
 /// In-app profile editing. One instance holds the staged edits for every
 /// profile the user has touched.
 pub struct ProfileEditor {
@@ -428,9 +467,9 @@ pub struct ProfileEditor {
     /// after it has been taken.
     backup_asked: bool,
     copy_from: u8,
-    /// Index and time of the last write, so the UI can say a write is in
-    /// flight while the worker re-reads the sectors.
-    writing: Option<(u8, Instant)>,
+    /// The last write handed to the worker, until its outcome says what
+    /// happened to it. `None` once a write has succeeded.
+    write: Option<Write>,
 }
 
 impl Default for ProfileEditor {
@@ -446,7 +485,7 @@ impl ProfileEditor {
             backup_path: default_backup_path(),
             backup_asked: false,
             copy_from: 0,
-            writing: None,
+            write: None,
         }
     }
 
@@ -503,44 +542,79 @@ impl ProfileEditor {
         let n_buttons = (snap.button_count as usize).min(original.buttons.len());
         let base = Draft::from_profile(original, n_buttons);
 
-        // The write marker clears itself; a failed write shows up as an error
-        // in the status bar, which the host owns. Cleared before the staged
-        // entry is chosen, because a write still in flight decides which one
-        // stands.
-        if self.writing.map(|(_, t)| t.elapsed() > WRITE_SETTLE).unwrap_or(false) {
-            self.writing = None;
-        }
-        let writing = self.writing.map(|(i, _)| i) == Some(index);
-        let mut st = stage_for(self.staged.remove(&index), &base, writing);
+        // Settled before the staged entry is chosen: a write that has just
+        // succeeded drops its staged entry, and that is what lets the reading
+        // below take over.
+        self.resolve_write(snap);
+        let state = self.write.as_ref().filter(|w| w.index == index).map(|w| w.state.clone());
+        let mut st = stage_for(self.staged.remove(&index), &base);
 
-        self.draw_header(ui, &st, index, writing);
+        self.draw_header(ui, &st, index, state.as_ref());
         self.draw_identity(ui, &mut st.draft, &base);
         self.draw_rate(ui, &mut st.draft, snap);
         self.draw_dpi(ui, &mut st.draft, snap);
         self.draw_lighting(ui, &mut st.draft, snap);
         self.draw_buttons(ui, &mut st.draft, &base, n_buttons);
         self.draw_copy_from(ui, &mut st.draft, snap, index, n_buttons);
-        let reverted = self.draw_save(ui, &mut st, original, index, &mut cmds);
-
-        // The sector now reads back as what was written, so the marker goes
-        // now rather than sitting out the settle timer.
-        if writing && !st.dirty() && st.base == base {
-            self.writing = None;
-        }
+        let reverted =
+            self.draw_save(ui, &mut st, original, index, snap, state.as_ref(), &mut cmds);
 
         // Reverting drops the entry, which is what makes the device's own
-        // reading show again. A saved one is kept, now matching what was
-        // written, until the worker's re-read confirms or corrects it: the
-        // device is the source of truth, but it is a second behind, and
-        // showing the pre-write values in the meantime reads as a lost edit
-        // and invites a second flash write.
+        // reading show again. Everything else is kept: a write waiting on its
+        // outcome still holds the edits that were sent, and one that failed or
+        // went unanswered holds them so they can be retried. Only the outcome
+        // for a write clears them, in `resolve_write`.
         if !reverted && (st.dirty() || st.base != base) {
             self.staged.insert(index, st);
         }
         cmds
     }
 
-    fn draw_header(&self, ui: &mut egui::Ui, st: &Staged, index: u8, writing: bool) {
+    /// Settle a write against the outcome the worker recorded for it.
+    ///
+    /// Success is the only path that drops the staged edits, and it drops them
+    /// knowing the device agrees: the worker re-reads every sector and records
+    /// the outcome under one lock, so by the time the outcome is visible here
+    /// `snap.profiles` is already the post-write reading.
+    fn resolve_write(&mut self, snap: &Snapshot) {
+        let Some(w) = self.write.as_ref() else {
+            return;
+        };
+        if w.state != WriteState::Waiting {
+            return;
+        }
+        let settled = match snap.outcome_after(w.after, CmdKind::WriteProfile(w.index)) {
+            // Through. The reading in this same snapshot is what the device
+            // now holds, so the draft has nothing left to say.
+            Some(o) if o.ok => None,
+            Some(o) => Some(WriteState::Failed(
+                o.message.clone().unwrap_or_else(|| "the mouse refused the write".into()),
+            )),
+            None if w.sent.elapsed() > OUTCOME_WAIT => Some(WriteState::Unanswered),
+            // Still in flight.
+            None => return,
+        };
+        match settled {
+            Some(state) => {
+                if let Some(w) = self.write.as_mut() {
+                    w.state = state;
+                }
+            }
+            None => {
+                let index = w.index;
+                self.staged.remove(&index);
+                self.write = None;
+            }
+        }
+    }
+
+    fn draw_header(
+        &self,
+        ui: &mut egui::Ui,
+        st: &Staged,
+        index: u8,
+        state: Option<&WriteState>,
+    ) {
         let lead = st.draft.dpi.get(st.draft.default_dpi as usize).copied().unwrap_or(0);
         theme::readout(ui, &lead.to_string(), "DPI on this profile");
         ui.add_space(2.0);
@@ -553,11 +627,14 @@ impl ProfileEditor {
                 st.draft.name.clone()
             };
             ui.label(egui::RichText::new(name).size(15.0).strong());
-            if st.dirty() {
-                theme::pill(ui, "unsaved changes", theme::WARN);
-            }
-            if writing {
-                theme::pill(ui, "writing to flash", theme::WARN);
+            match state {
+                // In flight the edits are still unsaved — that is the honest
+                // reading until the device answers — so one pill says so.
+                Some(WriteState::Waiting) => theme::pill(ui, "writing to flash", theme::WARN),
+                Some(WriteState::Failed(_)) => theme::pill(ui, "write failed", theme::BAD),
+                Some(WriteState::Unanswered) => theme::pill(ui, "write unconfirmed", theme::BAD),
+                None if st.dirty() => theme::pill(ui, "unsaved changes", theme::WARN),
+                None => {}
             }
         });
         ui.add_space(14.0);
@@ -982,9 +1059,12 @@ impl ProfileEditor {
         st: &mut Staged,
         original: &Profile,
         index: u8,
+        snap: &Snapshot,
+        state: Option<&WriteState>,
         cmds: &mut Vec<Cmd>,
     ) -> bool {
         let dirty = st.dirty();
+        let waiting = state == Some(&WriteState::Waiting);
         // With no editable buttons the editor never touches the remapping
         // table — it is written back exactly as read — so there is nothing to
         // refuse, and refusing left the save button dead with no way out.
@@ -1021,20 +1101,29 @@ impl ProfileEditor {
             ui.add_space(12.0);
 
             ui.horizontal(|ui| {
+                // Not while one is in flight: a second click would be a second
+                // flash write for the same edits.
                 if ui
-                    .add_enabled(dirty && !blocked, egui::Button::new("Save to mouse"))
+                    .add_enabled(dirty && !blocked && !waiting, egui::Button::new("Save to mouse"))
                     .clicked()
                 {
                     cmds.push(Cmd::WriteProfile {
                         index,
                         profile: Box::new(st.draft.build(original)),
                     });
-                    self.writing = Some((index, Instant::now()));
-                    // The draft is now what the mouse is being told to hold,
-                    // so it stops reading as unsaved without being thrown
-                    // away: the re-read a second from now either confirms it
-                    // or replaces it with what the device actually stored.
-                    st.base = st.draft.clone();
+                    // Read before the command is sent — the host's dispatch
+                    // loop sends it after `ui` returns — so every outcome on
+                    // the books now is older than this write's own.
+                    self.write = Some(Write {
+                        index,
+                        after: snap.newest_outcome_id(),
+                        sent: Instant::now(),
+                        state: WriteState::Waiting,
+                    });
+                    // The draft is deliberately left as it is. It is what was
+                    // sent, and until the outcome says the device took it,
+                    // adopting it as the truth would be a guess — the guess
+                    // that used to discard a failed write's edits.
                 }
                 if ui.add_enabled(dirty, egui::Button::new("Revert")).clicked() {
                     reverted = true; // dropping the staged entry is the revert
@@ -1042,6 +1131,51 @@ impl ProfileEditor {
             });
 
             ui.add_space(8.0);
+            match state {
+                Some(WriteState::Waiting) => {
+                    theme::hint(
+                        ui,
+                        "Written; waiting for the mouse to confirm. The worker re-reads every \
+                         sector after a write, which takes about a second. Your edits stay \
+                         here until it answers.",
+                    );
+                    ui.add_space(8.0);
+                }
+                Some(WriteState::Failed(msg)) => {
+                    ui.label(
+                        egui::RichText::new(format!("The write failed: {msg}"))
+                            .color(theme::BAD)
+                            .size(13.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    theme::hint(
+                        ui,
+                        "Your edits are still here, so nothing has been lost. Save again to \
+                         retry, or Revert to go back to what the mouse holds. Press Refresh in \
+                         the sidebar first if you want to see what that is now: a write that \
+                         reports an error may still have changed the sector.",
+                    );
+                    ui.add_space(8.0);
+                }
+                Some(WriteState::Unanswered) => {
+                    ui.label(
+                        egui::RichText::new("No answer came back for this write.")
+                            .color(theme::BAD)
+                            .size(13.0)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    theme::hint(
+                        ui,
+                        "That says nothing about whether the mouse took it, so your edits are \
+                         kept. Press Refresh in the sidebar to see what the mouse holds now, \
+                         then save again or revert.",
+                    );
+                    ui.add_space(8.0);
+                }
+                None => {}
+            }
             if !dirty {
                 theme::hint(ui, "This profile matches what is on the mouse.");
             } else if blocked {
@@ -1049,7 +1183,7 @@ impl ProfileEditor {
                     ui,
                     "Fix the problem flagged above before saving. Nothing has been written.",
                 );
-            } else {
+            } else if state.is_none() {
                 theme::hint(
                     ui,
                     &format!(
@@ -1065,15 +1199,16 @@ impl ProfileEditor {
 
 /// Which staged entry to draw this frame.
 ///
-/// `writing` means a write for this profile is still in flight. The worker
-/// re-reads every sector after a write, but that is about a second away, so
-/// until it lands `base` is still the pre-write content and adopting it would
-/// put the old values back under the user's nose — which reads as a lost edit
-/// and invites a second flash write.
-fn stage_for(prev: Option<Staged>, base: &Draft, writing: bool) -> Staged {
+/// Edits are never adopted away here, write in flight or not. A write is
+/// cleared only by its own outcome, in `ProfileEditor::resolve_write`, which
+/// removes the staged entry on success so the next frame falls through to the
+/// device's reading. That is why this no longer needs to know about writes:
+/// guessing from a timer is what used to put the pre-write values back under
+/// the user's nose after a failed write.
+fn stage_for(prev: Option<Staged>, base: &Draft) -> Staged {
     match prev {
         // Nothing staged and the device has moved on: adopt the reading.
-        Some(s) if !s.dirty() && !writing && s.base != *base => Staged::new(base.clone()),
+        Some(s) if !s.dirty() && s.base != *base => Staged::new(base.clone()),
         Some(s) => s,
         None => Staged::new(base.clone()),
     }
@@ -1099,6 +1234,7 @@ pub fn default_backup_path() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::Outcome;
     use crate::profile_blob::{OFF_BUTTONS, OFF_CRC, OFF_LEDS, SECTOR_SIZE};
 
     /// A format-2 sector shaped like the one this device actually stores.
@@ -1435,43 +1571,192 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_draft_is_held_until_the_device_catches_up() {
-        let base = draft();
-        let mut st = Staged::new(base.clone());
-        st.draft.name = "Gaming".into();
-        // What draw_save does on the click: the write is in flight, so the
-        // draft stops reading as unsaved but is not thrown away.
-        st.base = st.draft.clone();
-        assert!(!st.dirty());
-
-        // While the write is in flight the pre-write reading must not come
-        // back: that looked like a lost edit and invited a second write.
-        let held = stage_for(Some(st.clone()), &base, true);
-        assert_eq!(held.draft.name, "Gaming");
-
-        // Once the worker has re-read the sector, the device's own reading is
-        // what stands.
-        let mut after = base.clone();
-        after.name = "Gaming".into();
-        let settled = stage_for(Some(st.clone()), &after, false);
-        assert_eq!(settled.draft.name, "Gaming");
-        assert!(!settled.dirty());
-        // And if the write did not land, the truth replaces the draft.
-        let failed = stage_for(Some(st), &base, false);
-        assert_eq!(failed.draft.name, base.name);
-    }
-
-    #[test]
-    fn unsaved_edits_are_kept_while_a_write_to_another_profile_runs() {
+    fn unsaved_edits_are_never_adopted_away_by_a_device_reading() {
         let base = draft();
         let mut st = Staged::new(base.clone());
         st.draft.rate_ms = 4;
         assert!(st.dirty());
-        // Dirty entries are never adopted away, write in flight or not.
-        for writing in [false, true] {
-            let kept = stage_for(Some(st.clone()), &base, writing);
-            assert_eq!(kept.draft.rate_ms, 4);
-            assert!(kept.dirty());
+        let kept = stage_for(Some(st), &base);
+        assert_eq!(kept.draft.rate_ms, 4);
+        assert!(kept.dirty());
+
+        // A clean entry does follow the device: that is how another writer's
+        // change shows up.
+        let clean = Staged::new(base.clone());
+        let mut moved = base.clone();
+        moved.rate_ms = 8;
+        assert_eq!(stage_for(Some(clean), &moved).draft.rate_ms, 8);
+    }
+
+    /// The editor mid-save: edits staged for `index`, the write handed over,
+    /// and `after` standing for whatever was already on the books.
+    fn mid_save(index: u8, after: CmdId) -> ProfileEditor {
+        let mut ed = ProfileEditor::new();
+        let mut st = Staged::new(draft());
+        st.draft.name = "Gaming".into();
+        st.draft.rate_ms = 4;
+        ed.staged.insert(index, st);
+        ed.write = Some(Write {
+            index,
+            after,
+            sent: Instant::now(),
+            state: WriteState::Waiting,
+        });
+        ed
+    }
+
+    fn with_outcomes(outcomes: Vec<Outcome>) -> Snapshot {
+        Snapshot { outcomes, ..Default::default() }
+    }
+
+    #[test]
+    fn a_successful_outcome_hands_the_profile_back_to_the_device() {
+        let mut ed = mid_save(2, 5);
+        assert!(ed.dirty());
+        let snap = with_outcomes(vec![Outcome::ok(
+            6,
+            CmdKind::WriteProfile(2),
+            Some("profile 2 written to flash".into()),
+        )]);
+        ed.resolve_write(&snap);
+        // Nothing left waiting, and no staged entry, so the next frame stages
+        // from the sector the worker re-read before recording this outcome.
+        assert!(ed.write.is_none());
+        assert!(!ed.dirty());
+        assert!(ed.staged.is_empty());
+    }
+
+    #[test]
+    fn a_failed_outcome_keeps_the_edits_and_carries_the_message() {
+        let mut ed = mid_save(2, 5);
+        let snap = with_outcomes(vec![Outcome::failed(
+            6,
+            CmdKind::WriteProfile(2),
+            "readback did not match",
+        )]);
+        ed.resolve_write(&snap);
+        // The whole point: a failed write must not discard the edits.
+        assert_eq!(ed.dirty_profiles(), vec![2]);
+        assert_eq!(ed.staged[&2].draft.name, "Gaming");
+        assert_eq!(
+            ed.write.as_ref().map(|w| w.state.clone()),
+            Some(WriteState::Failed("readback did not match".into()))
+        );
+        // Saving again is a retry, and it starts waiting from a fresh
+        // watermark so the failure just read is not taken for the answer.
+        let mut ed2 = ed;
+        ed2.write = Some(Write {
+            index: 2,
+            after: snap.newest_outcome_id(),
+            sent: Instant::now(),
+            state: WriteState::Waiting,
+        });
+        ed2.resolve_write(&snap);
+        assert_eq!(ed2.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Waiting));
+        assert!(ed2.dirty());
+    }
+
+    #[test]
+    fn a_failed_outcome_with_nothing_to_say_still_reads_as_a_failure() {
+        let mut ed = mid_save(0, 0);
+        let snap = with_outcomes(vec![Outcome {
+            id: 1,
+            kind: CmdKind::WriteProfile(0),
+            ok: false,
+            message: None,
+        }]);
+        ed.resolve_write(&snap);
+        match ed.write.as_ref().map(|w| w.state.clone()) {
+            Some(WriteState::Failed(m)) => assert!(!m.is_empty()),
+            other => panic!("expected a failure, got {other:?}"),
         }
+        assert!(ed.dirty());
+    }
+
+    #[test]
+    fn an_outcome_that_never_arrives_keeps_the_edits() {
+        let mut ed = mid_save(2, 5);
+        let empty = with_outcomes(Vec::new());
+
+        // Inside the bound there is nothing to conclude yet.
+        ed.resolve_write(&empty);
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Waiting));
+        assert!(ed.dirty());
+
+        // Past it, the panel stops waiting — and keeps the edits, because an
+        // answer that never came says nothing about what the mouse stored.
+        if let Some(w) = ed.write.as_mut() {
+            w.sent = Instant::now()
+                .checked_sub(OUTCOME_WAIT + Duration::from_secs(1))
+                .expect("a clock with twenty-one seconds behind it");
+        }
+        ed.resolve_write(&empty);
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Unanswered));
+        assert_eq!(ed.dirty_profiles(), vec![2]);
+        assert_eq!(ed.staged[&2].draft.rate_ms, 4);
+
+        // And it stays there: a settled write is not re-examined, so a later
+        // outcome for some other write cannot clear these edits.
+        ed.resolve_write(&with_outcomes(vec![Outcome::ok(9, CmdKind::WriteProfile(2), None)]));
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Unanswered));
+        assert!(ed.dirty());
+    }
+
+    #[test]
+    fn only_this_writes_own_outcome_answers_it() {
+        // An outcome already on the books when Save was pressed.
+        let mut ed = mid_save(2, 5);
+        ed.resolve_write(&with_outcomes(vec![Outcome::ok(
+            4,
+            CmdKind::WriteProfile(2),
+            None,
+        )]));
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Waiting));
+
+        // A newer write, to another profile. The kind carries the index for
+        // exactly this reason.
+        ed.resolve_write(&with_outcomes(vec![Outcome::ok(
+            6,
+            CmdKind::WriteProfile(3),
+            None,
+        )]));
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Waiting));
+
+        // Another panel's command, newer still.
+        ed.resolve_write(&with_outcomes(vec![Outcome::failed(
+            7,
+            CmdKind::SetButton(2),
+            "no",
+        )]));
+        assert_eq!(ed.write.as_ref().map(|w| w.state.clone()), Some(WriteState::Waiting));
+        assert!(ed.dirty());
+
+        // The real answer, among the rest.
+        ed.resolve_write(&with_outcomes(vec![
+            Outcome::ok(4, CmdKind::WriteProfile(2), None),
+            Outcome::ok(6, CmdKind::WriteProfile(3), None),
+            Outcome::failed(7, CmdKind::SetButton(2), "no"),
+            Outcome::ok(8, CmdKind::WriteProfile(2), None),
+        ]));
+        assert!(ed.write.is_none());
+        assert!(!ed.dirty());
+    }
+
+    #[test]
+    fn a_write_the_device_was_not_there_for_is_answered_too() {
+        // The worker records an outcome even on its device-not-connected
+        // early return, so this path reaches the panel rather than sitting on
+        // the fallback for twenty seconds.
+        let mut ed = mid_save(1, 0);
+        ed.resolve_write(&with_outcomes(vec![Outcome::failed(
+            1,
+            CmdKind::WriteProfile(1),
+            "device not connected",
+        )]));
+        assert_eq!(
+            ed.write.as_ref().map(|w| w.state.clone()),
+            Some(WriteState::Failed("device not connected".into()))
+        );
+        assert!(ed.dirty());
     }
 }
