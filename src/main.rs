@@ -110,10 +110,14 @@ impl From<Error> for CliError {
     }
 }
 
-/// Open the device named by $G502_DEVICE (e.g. "046d:c08b"), or the only one.
+/// The device id in $G502_DEVICE (e.g. "046d:c08b"), if one is set.
+fn wanted_device() -> Option<String> {
+    std::env::var("G502_DEVICE").ok().filter(|s| !s.trim().is_empty())
+}
+
+/// Open the device named by $G502_DEVICE, or the only one.
 fn open() -> Result<discover::Found, CliError> {
-    let want = std::env::var("G502_DEVICE").ok();
-    Ok(discover::open_device_matching(want.as_deref())?)
+    Ok(discover::open_device_matching(wanted_device().as_deref())?)
 }
 
 fn run(args: &[String]) -> Result<(), CliError> {
@@ -499,20 +503,62 @@ fn cmd_effect(args: &[String]) -> Result<(), CliError> {
     }
 }
 
-static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+static RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_interrupt(_sig: libc::c_int) {
     // Only an atomic store, which is async-signal-safe.
-    INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    INTERRUPTED.store(true, Ordering::Relaxed);
+}
+
+extern "C" fn on_hangup(_sig: libc::c_int) {
+    RELOAD.store(true, Ordering::Relaxed);
 }
 
 fn install_interrupt_handler() {
-    // SAFETY: installing a handler that does nothing but one relaxed atomic
-    // store, for two signals whose default action we are deliberately
+    // SAFETY: installing handlers that do nothing but one relaxed atomic
+    // store, for three signals whose default action we are deliberately
     // replacing.
     unsafe {
         libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_interrupt as *const () as libc::sighandler_t);
+        // SIGHUP's default action is to kill us outright, and dying here skips
+        // the teardown that un-silences buttons. Two ordinary things send it:
+        // the installed unit's own `ExecReload=/bin/kill -HUP $MAINPID`, so
+        // `systemctl --user reload logi` would otherwise leave every
+        // replace-bound button dead in the device's remapping table, and a
+        // terminal closing on a foreground `logi bind run`.
+        libc::signal(libc::SIGHUP, on_hangup as *const () as libc::sighandler_t);
+    }
+}
+
+/// Asked to stop: Ctrl-C or SIGTERM.
+fn stopping() -> bool {
+    INTERRUPTED.load(Ordering::Relaxed)
+}
+
+/// Asked to re-read configuration: SIGHUP.
+fn reloading() -> bool {
+    RELOAD.load(Ordering::Relaxed)
+}
+
+/// Any reason to leave a run loop. A hangup ends a foreground command and
+/// restarts the service's inner loop; either way the loop has to exit first so
+/// its teardown runs.
+fn leaving() -> bool {
+    stopping() || reloading()
+}
+
+/// Sleep in one-second steps so a stop or a reload is acted on promptly rather
+/// than a minute later.
+fn nap(secs: u64) {
+    for _ in 0..secs {
+        if leaving() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
 
@@ -530,23 +576,12 @@ fn perform(action: &actions::Action, vd: &mut uinput::VirtualDevice) -> std::io:
         actions::Action::Key { mods, code } => vd.chord(mods, *code),
         actions::Action::Text(t) => vd.type_text(t),
         actions::Action::MouseButton(c) => vd.tap(*c),
-        actions::Action::Command(cmd) => {
-            // Detached and never waited on, so a slow command cannot stall the
-            // event loop. Reaping is left to init by double-forking through
-            // setsid, which also stops a long-running child dying with us.
-            let mut parts = cmd.split_whitespace();
-            let Some(prog) = parts.next() else { return Ok(()) };
-            let args: Vec<&str> = parts.collect();
-            std::process::Command::new("setsid")
-                .arg("--fork")
-                .arg(prog)
-                .args(&args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map(|_| ())
-        }
+        // actions owns how a `command` binding runs. Going through it rather
+        // than splitting the string here is what gives the quoting, pipes and
+        // $VAR the bindings file documents, puts the child in its own process
+        // group, and reaps it on a thread so fifty presses do not leave fifty
+        // zombies behind this process.
+        actions::Action::Command(cmd) => actions::spawn_detached(cmd),
         actions::Action::Nothing => Ok(()),
     }
 }
@@ -624,10 +659,10 @@ fn cmd_bind_run() -> Result<(), CliError> {
     let spy = buttonspy::ButtonSpy::new(&mut f.device)?;
     let mut vd = uinput::VirtualDevice::new("logi virtual input").map_err(|e| {
         CliError::Failed(format!(
-            "{e}
-
-Binding buttons needs /dev/uinput. Install the rules with:
-                 packaging/install.sh
+            "{e}\n\
+             \n\
+             Binding buttons needs /dev/uinput. Install the rules with:\n\
+             \x20   packaging/install.sh\n\
              then re-plug the mouse."
         ))
     })?;
@@ -637,17 +672,24 @@ Binding buttons needs /dev/uinput. Install the rules with:
     // cannot fix by clicking.
     install_interrupt_handler();
     let silence = bindings.to_silence();
-    if !silence.is_empty() {
-        spy.silence(&mut f.device, &silence)?;
-    }
+    let mut silenced = false;
 
     let outcome = (|| -> Result<(), CliError> {
         spy.start(&mut f.device)?;
         let mut listener = f.device.open_listener()?;
+        // Silencing comes last, once the host side is known to work: a
+        // silenced button with nothing listening is a dead button, and it
+        // stays dead until something puts the table back. `silenced` is set
+        // before the write, not after, because a reply lost to the timeout can
+        // hide a write that landed — the teardown below has to run either way.
+        if !silence.is_empty() {
+            silenced = true;
+            spy.silence(&mut f.device, &silence)?;
+        }
         let idx = spy.feature_index();
         println!("logi: acting on {} binding(s); Ctrl-C to stop", bindings.list.len());
         let mut prev: u16 = 0;
-        while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        while !leaving() {
             let Some(report) =
                 listener.read_event(std::time::Duration::from_millis(250))?
             else {
@@ -672,11 +714,11 @@ Binding buttons needs /dev/uinput. Install the rules with:
     if let Err(e) = spy.stop(&mut f.device) {
         eprintln!("logi: could not stop the spy: {e}");
     }
-    if !silence.is_empty() {
+    if silenced {
         match spy.restore(&mut f.device) {
             Ok(()) => println!("logi: button mapping restored"),
             Err(e) => eprintln!(
-                "logi: COULD NOT RESTORE the button mapping: {e}
+                "logi: COULD NOT RESTORE the button mapping: {e}\n\
                  Run `logi bind reset` to put it back."
             ),
         }
@@ -694,24 +736,28 @@ fn cmd_serve() -> Result<(), CliError> {
     eprintln!("logi: service starting");
 
     let path = appwatch::config_path();
-    loop {
-        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
+    // Idling is the steady state with no rules, and repeating the same
+    // sentence into the journal every minute forever buries everything else.
+    let mut announced_idle = false;
+    while !stopping() {
+        // A hangup is the unit's ExecReload. serve_once has already torn down
+        // by the time we get here, so re-reading the file is all it takes.
+        if RELOAD.swap(false, Ordering::Relaxed) {
+            eprintln!("logi: reloading {}", path.display());
+            announced_idle = false;
         }
         let rules = std::fs::read_to_string(&path).ok();
         match rules {
             None => {
-                eprintln!(
-                    "logi: no rules at {}; idling. Run `logi watch` once to write an example.",
-                    path.display()
-                );
-                // Nothing to do, so wait rather than spin or exit.
-                for _ in 0..60 {
-                    if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Ok(());
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(1));
+                if !announced_idle {
+                    eprintln!(
+                        "logi: no rules at {}; idling. Run `logi watch` once to write an example.",
+                        path.display()
+                    );
+                    announced_idle = true;
                 }
+                // Nothing to do, so wait rather than spin or exit.
+                nap(60);
             }
             Some(text) => {
                 let (cfg, problems) = appwatch::parse_rules(&text);
@@ -719,19 +765,18 @@ fn cmd_serve() -> Result<(), CliError> {
                     eprintln!("logi: {}: {p}", path.display());
                 }
                 if cfg.rules.is_empty() && cfg.fallback.is_none() {
-                    eprintln!("logi: {} has no rules yet; idling", path.display());
-                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    if !announced_idle {
+                        eprintln!("logi: {} has no rules yet; idling", path.display());
+                        announced_idle = true;
+                    }
+                    nap(30);
                     continue;
                 }
+                announced_idle = false;
                 if let Err(e) = serve_once(cfg) {
                     // A missing or unplugged device is normal, not fatal.
                     eprintln!("logi: {e}; retrying in 10s");
-                    for _ in 0..10 {
-                        if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
-                            return Ok(());
-                        }
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                    }
+                    nap(10);
                 }
             }
         }
@@ -751,7 +796,10 @@ fn cmd_serve() -> Result<(), CliError> {
 /// Returns when the device goes away or the service is asked to stop, so the
 /// caller can retry.
 fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
-    let mut f = discover::open_device()?;
+    // The same $G502_DEVICE every other command honours: with two Logitech
+    // devices attached, the service must drive the one the user named.
+    let want = wanted_device();
+    let mut f = discover::open_device_matching(want.as_deref())?;
     let name = f.name.clone();
     let has_spy = f.caps.button_spy;
     let dev = &mut f.device;
@@ -876,6 +924,16 @@ struct SpyState {
     silenced: bool,
 }
 
+/// Bring the spy up, or leave the device exactly as it was found.
+///
+/// Order matters and is the whole point of this function. Silencing is done
+/// last, after the spy is running and the listener is open, because a button
+/// silenced while nothing is listening is a button that does nothing at all,
+/// in both memory modes, until something writes the table back. And anything
+/// that fails after the first silencing write unwinds it here: the caller
+/// treats a failure as "no bindings today" and carries on watching, so a
+/// silenced table escaping this function would leave the service running for
+/// hours against a mouse that cannot click.
 fn start_spy(
     dev: &mut hidpp::Device,
     bindings: &actions::Bindings,
@@ -886,14 +944,38 @@ fn start_spy(
             "{e} (install the udev rules with packaging/install.sh)"
         ))
     })?;
-    let silence = bindings.to_silence();
-    let silenced = !silence.is_empty();
-    if silenced {
-        spy.silence(dev, &silence)?;
-    }
     spy.start(dev)?;
-    let listener = dev.open_listener()?;
-    Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced })
+
+    // Set before the write, not after: a reply lost to the timeout can hide a
+    // write that landed, so an attempt is enough to owe a restore.
+    let mut silenced = false;
+    let brought_up = (|| -> Result<hidpp::Device, hidpp::Error> {
+        let listener = dev.open_listener()?;
+        let silence = bindings.to_silence();
+        if !silence.is_empty() {
+            silenced = true;
+            spy.silence(dev, &silence)?;
+        }
+        Ok(listener)
+    })();
+
+    match brought_up {
+        Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced }),
+        Err(e) => {
+            if silenced {
+                if let Err(e2) = spy.restore(dev) {
+                    eprintln!(
+                        "logi: COULD NOT RESTORE the button mapping: {e2}. \
+                         Run `logi bind reset`."
+                    );
+                }
+            }
+            if let Err(e2) = spy.stop(dev) {
+                eprintln!("logi: could not stop the spy: {e2}");
+            }
+            Err(e)
+        }
+    }
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), CliError> {

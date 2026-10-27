@@ -19,7 +19,7 @@
 
 use super::theme;
 use crate::actions::{self, Action, BindMode, Binding, Bindings, FnKeymap, Keymap, MAX_BUTTON};
-use crate::device::{Cmd, Snapshot};
+use crate::device::{Cmd, CmdKind, Snapshot};
 use crate::uinput;
 use eframe::egui;
 
@@ -27,10 +27,14 @@ use eframe::egui;
 /// express yet. One new `Cmd` variant each; see the integration notes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
-    /// Start button reporting, run the host side from the saved config, and
-    /// silence exactly these buttons — every button *not* listed goes back to
-    /// its physical function, which is how Replace is undone. Empty is
-    /// meaningful: it means "silence nothing".
+    /// Silence these buttons in the mouse's own remapping table.
+    ///
+    /// Additive, and the UI copy has to say so: `buttonspy::silence` builds on
+    /// the table already in the mouse, so a button dropped from this list is
+    /// *not* given its click back by sending a shorter list, and an empty list
+    /// writes nothing at all. `RestoreIdentity` is the only thing that
+    /// un-silences. Nor does this start button reporting — the service does
+    /// that — so a Replace applied with no service running is a dead button.
     ApplyBindings { silence: Vec<u8> },
     /// Write the factory identity remapping table. The recovery path for a
     /// mouse whose buttons were silenced with nothing listening.
@@ -232,6 +236,24 @@ fn driver_key_name(egui_name: &str) -> String {
     }
 }
 
+/// Fold one frame's edited copy of a row back into the model.
+///
+/// `mode` is deliberately taken from the model and not from the copy. The copy
+/// is cloned at the top of the frame, before any widget runs, while Augment
+/// and Replace are clicked part-way through it and go straight to the model
+/// through `set_augment` / `want_replace` — they have to, because only those
+/// run the all-Replace refusal and the left-click confirmation. Writing the
+/// copy's stale mode back over the top would undo the click in the same frame,
+/// in both directions: Replace would never take, and — far worse — a button
+/// already silenced could never be put back to Augment, so the one-click way
+/// off Replace would be gone.
+fn merge_row(model: &mut Row, mut edited: Row) {
+    edited.mode = model.mode;
+    if *model != edited {
+        *model = edited;
+    }
+}
+
 /// A captured key press as config syntax: "ctrl+shift+f5".
 ///
 /// egui has no Super modifier on Linux, so a Super chord has to be typed. The
@@ -268,6 +290,9 @@ pub struct BindingsEditor {
     /// Why the last Replace was refused outright.
     refused: Option<String>,
     backup_path: String,
+    /// Whether a backup is known to have been written. Set from the device
+    /// layer's own outcome, never from the click: this flag silences a safety
+    /// warning, so a backup that failed must not be able to clear it.
     backed_up: bool,
     requests: Vec<Request>,
     loaded: bool,
@@ -402,8 +427,23 @@ impl BindingsEditor {
         // leaves half a file — and the service reads this file as the user's
         // bindings, with a half-read Replace line silencing a button.
         let tmp = path.with_extension("conf.tmp");
-        std::fs::write(&tmp, &text)
-            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        // Flushed to the disk, not just to the page cache, before the rename.
+        // The rename is what makes the swap atomic, but an unsynced temporary
+        // can be renamed into place and still come back empty after a power
+        // loss — and an empty bindings file is not "no bindings": it is a
+        // button silenced in the mouse with nothing left on disk saying so.
+        let written = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(text.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = written {
+            // A half-written temporary is never renamed, but leaving it there
+            // is litter in the user's config directory.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("cannot write {}: {e}", tmp.display()));
+        }
         std::fs::rename(&tmp, &path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("cannot replace {}: {e}", path.display())
@@ -762,9 +802,7 @@ impl BindingsEditor {
             });
         });
 
-        if self.rows[idx] != row {
-            self.rows[idx] = row;
-        }
+        merge_row(&mut self.rows[idx], row);
     }
 
     fn draw_safety(
@@ -775,6 +813,13 @@ impl BindingsEditor {
         _count: u8,
         cmds: &mut Vec<Cmd>,
     ) {
+        // The warning beside Restore is only worth anything if it tracks what
+        // actually reached the disk, so it follows the newest backup outcome
+        // rather than the click that asked for one.
+        if let Some(ok) = backup_confirmed(snap) {
+            self.backed_up = ok;
+        }
+
         if let Some(msg) = self.refused.clone() {
             theme::section(ui, "Refused", |ui| {
                 ui.horizontal(|ui| {
@@ -804,8 +849,11 @@ impl BindingsEditor {
                 ui.add_space(8.0);
                 theme::hint(
                     ui,
-                    "These buttons stop working physically once the bindings are applied. \
-                     Every other button is put back to its own function at the same time.",
+                    "These buttons stop working physically once the bindings are applied, \
+                     and stay that way across unplugging. Applying only ever takes clicks \
+                     away: moving a button back to Augment and saving again does not \
+                     return its click. Restore below is the only thing that does, so the \
+                     order for changing which buttons are silenced is Restore, then Save.",
                 );
             } else {
                 theme::hint(
@@ -846,7 +894,6 @@ impl BindingsEditor {
                         .clicked()
                     {
                         cmds.push(Cmd::Backup(self.backup_path.clone()));
-                        self.backed_up = true;
                     }
                 });
                 ui.add_space(6.0);
@@ -882,22 +929,29 @@ impl BindingsEditor {
                             // what the hint at the bottom of the section
                             // promises, so the two must not drift apart.
                             let apply = snap.connected && snap.has_button_spy;
-                            self.status = Some((
-                                if apply {
-                                    self.requests.push(Request::ApplyBindings { silence });
-                                    format!(
-                                        "saved to {}; {n} button(s) to silence",
-                                        path.display()
-                                    )
-                                } else {
-                                    format!(
-                                        "saved to {}; not applied, because no connected \
-                                         mouse can report button presses",
-                                        path.display()
-                                    )
-                                },
-                                true,
-                            ));
+                            // An empty list is not an un-silence: buttonspy
+                            // writes nothing at all for it. Sending it anyway
+                            // would only put a notice about a table nothing
+                            // touched in front of someone whose button is
+                            // still silenced and who needs Restore.
+                            let msg = if !apply {
+                                format!(
+                                    "saved to {}; not applied, because no connected \
+                                     mouse can report button presses",
+                                    path.display()
+                                )
+                            } else if n == 0 {
+                                format!(
+                                    "saved to {}; nothing to silence. A button silenced \
+                                     earlier is still silenced in the mouse — Restore is \
+                                     what gives it back.",
+                                    path.display()
+                                )
+                            } else {
+                                self.requests.push(Request::ApplyBindings { silence });
+                                format!("saved to {}; {n} button(s) silenced", path.display())
+                            };
+                            self.status = Some((msg, true));
                         }
                         Err(e) => self.status = Some((e, false)),
                     }
@@ -950,8 +1004,10 @@ impl BindingsEditor {
             theme::hint(
                 ui,
                 if snap.has_button_spy {
-                    "Saving writes the bindings file and applies it: the mouse starts \
-                     reporting presses and the Replace buttons are silenced."
+                    "Saving writes the bindings file and silences the Replace buttons in \
+                     the mouse. It does not make anything act on the presses: that is the \
+                     background service's job, so check the Service tab before silencing \
+                     a button you need."
                 } else {
                     "Saving writes the bindings file. Nothing is applied, because this \
                      device cannot report button presses."
@@ -987,6 +1043,19 @@ fn mouse_label(code: u16) -> String {
         .find(|(_, c)| *c == code)
         .map(|(n, _)| (*n).to_string())
         .unwrap_or_else(|| format!("code {code}"))
+}
+
+/// Whether the newest backup the device layer reported actually landed.
+///
+/// Newest first, so a failed one is not masked by an older good one. Any
+/// panel's backup counts, because the file it writes is the same safety net
+/// wherever it was asked for.
+fn backup_confirmed(snap: &Snapshot) -> Option<bool> {
+    snap.outcomes
+        .iter()
+        .rev()
+        .find(|o| o.kind == CmdKind::Backup)
+        .map(|o| o.ok)
 }
 
 fn default_backup_path() -> String {
@@ -1220,6 +1289,85 @@ mod tests {
             Action::parse(&format!("key {chord}"), &keys)
                 .unwrap_or_else(|e| panic!("{name} -> {chord}: {e}"));
         }
+    }
+
+    /// The frame's write-back must not be able to undo a mode click.
+    ///
+    /// `draw_row` clones the row before any widget runs, then Augment and
+    /// Replace write straight to the model part-way through the frame, because
+    /// only `set_augment` / `want_replace` run the refusals. Copying the stale
+    /// clone's mode back over the model afterwards reverted every such click
+    /// in the same frame — including the click back off Replace, which is the
+    /// one-step way out of a silenced button.
+    #[test]
+    fn the_frame_write_back_cannot_revert_a_mode_click() {
+        // Replace clicked mid-frame, on a copy taken while it was Augment.
+        let stale = Row::blank(1);
+        let mut model = Row::blank(1);
+        model.mode = BindMode::Replace;
+        merge_row(&mut model, stale.clone());
+        assert_eq!(model.mode, BindMode::Replace, "the Replace click was reverted");
+
+        // And the way back out, which matters more: Augment clicked on a row
+        // the frame cloned while it was Replace.
+        let mut stale_replaced = Row::blank(2);
+        stale_replaced.mode = BindMode::Replace;
+        let mut model = stale_replaced.clone();
+        model.mode = BindMode::Augment;
+        merge_row(&mut model, stale_replaced);
+        assert_eq!(model.mode, BindMode::Augment, "the Augment click was reverted");
+    }
+
+    /// Everything that is not the mode still comes from the frame's copy:
+    /// that is how the text fields and the kind menu get written back at all.
+    #[test]
+    fn the_frame_write_back_still_carries_what_the_widgets_edited() {
+        let mut model = Row::blank(3);
+        model.mode = BindMode::Replace;
+        let mut edited = Row::blank(3);
+        edited.kind = Kind::Text;
+        edited.text = "hello".into();
+        merge_row(&mut model, edited);
+        assert_eq!(model.kind, Kind::Text);
+        assert_eq!(model.text, "hello");
+        assert_eq!(model.mode, BindMode::Replace, "the mode is the model's");
+    }
+
+    /// The pill next to Restore says whether there is a backup to fall back
+    /// on, so it has to follow what the device layer reported, not the click.
+    #[test]
+    fn a_failed_backup_does_not_count_as_a_backup() {
+        use crate::device::Outcome;
+        let mut snap = Snapshot::default();
+        assert_eq!(backup_confirmed(&snap), None, "nothing asked for yet");
+
+        snap.record(Outcome::ok(1, CmdKind::Backup, None));
+        assert_eq!(backup_confirmed(&snap), Some(true));
+
+        // A later failure is what the user is standing in, not the older win.
+        snap.record(Outcome::failed(2, CmdKind::Backup, "read-only"));
+        assert_eq!(backup_confirmed(&snap), Some(false));
+
+        // Another panel's unrelated failure must not read as a bad backup.
+        snap.record(Outcome::failed(3, CmdKind::SetDpi, "nope"));
+        assert_eq!(backup_confirmed(&snap), Some(false));
+    }
+
+    /// Painting must not be able to edit the model. Rows are cloned, edited
+    /// and merged back every frame, so a paint with no input at all has to
+    /// leave the editor exactly where it was — including not-dirty.
+    #[test]
+    fn painting_the_rows_changes_nothing() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(SRC));
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            let keys = keymap();
+            e.draw_rows(ui, 11, &keys);
+        });
+        let e = ed.borrow();
+        assert!(!e.dirty(), "painting made the editor think it had edits");
+        assert_eq!(e.rows, editor(SRC).rows);
     }
 
     #[test]

@@ -201,7 +201,8 @@ impl Model {
         s
     }
 
-    /// Lower the rule's precedence by one. False if it is already first.
+    /// Raise the rule's precedence by one: rows are in precedence order, so
+    /// this moves it one place earlier. False if it is already first.
     pub fn move_up(&mut self, i: usize) -> bool {
         if i == 0 || i >= self.rows.len() {
             return false;
@@ -210,7 +211,7 @@ impl Model {
         true
     }
 
-    /// Raise it by one. False if it is already last.
+    /// Lower it by one. False if it is already last.
     pub fn move_down(&mut self, i: usize) -> bool {
         if i + 1 >= self.rows.len() {
             return false;
@@ -616,6 +617,10 @@ pub struct RulesEditor {
     /// Set once if the thread could not be started; the picker then says so
     /// rather than scanning /proc from inside the paint pass instead.
     no_scanner: bool,
+    /// Why the file could not be read, when it is there but unreadable.
+    /// Saving is blocked while this is set: an empty editor over a config we
+    /// never managed to read would write the user's rules away.
+    unreadable: Option<String>,
     requested: Option<Instant>,
 }
 
@@ -649,6 +654,7 @@ impl RulesEditor {
             scanned: false,
             scanner: None,
             no_scanner: false,
+            unreadable: None,
             requested: None,
         }
     }
@@ -661,11 +667,48 @@ impl RulesEditor {
         &self.model
     }
 
+    /// Read the file, separating "there is no file yet" from "there is one
+    /// and it would not come back".
+    ///
+    /// `read_to_string(..).ok()` collapsed both into `None`, and `adopt(None)`
+    /// reads that as a fresh start: a config the user had chmodded, or one
+    /// holding a byte sequence that is not UTF-8, came up as an empty editor
+    /// saying "No rules file yet", and the next Save overwrote every rule in
+    /// it. Anything that is not `NotFound` has to stop the load instead.
+    fn read_file(&self) -> Result<Option<String>, String> {
+        match std::fs::read_to_string(&self.path) {
+            Ok(t) => Ok(Some(t)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "Could not read {}: {e}. The file is still there, so saving is blocked \
+                 rather than writing an empty one over it. Fix its permissions or its \
+                 contents, or move it aside, then press Reload from file.",
+                self.path.display()
+            )),
+        }
+    }
+
+    /// `read_file`, recording the failure in the panel. `None` means the
+    /// caller must stop: the model is left exactly as it was.
+    fn read_or_record(&mut self) -> Option<Option<String>> {
+        match self.read_file() {
+            Ok(t) => {
+                self.unreadable = None;
+                Some(t)
+            }
+            Err(msg) => {
+                self.unreadable = Some(msg.clone());
+                self.status = Status::Failed(msg);
+                None
+            }
+        }
+    }
+
     /// Load from disk. Safe to call repeatedly: unsaved edits are kept, and
     /// the user is told the file moved under them instead of losing work.
     pub fn load(&mut self) {
         self.loaded_once = true;
-        let text = std::fs::read_to_string(&self.path).ok();
+        let Some(text) = self.read_or_record() else { return };
         if self.dirty() && self.disk_text.is_some() && text != self.disk_text {
             self.status = Status::Note(
                 "This file changed on disk while you were editing. Saving replaces it; \
@@ -683,7 +726,7 @@ impl RulesEditor {
     /// Load from disk and throw away any edits.
     pub fn reload(&mut self) {
         self.loaded_once = true;
-        let text = std::fs::read_to_string(&self.path).ok();
+        let Some(text) = self.read_or_record() else { return };
         self.adopt(text);
     }
 
@@ -716,6 +759,10 @@ impl RulesEditor {
     /// Render, verify, then replace the file. Nothing is written if the
     /// round trip does not match.
     pub fn save(&mut self) {
+        if let Some(why) = self.unreadable.clone() {
+            self.status = Status::Failed(why);
+            return;
+        }
         let model = self.model.normalized();
         match round_trip(&model) {
             Err(e) => self.status = Status::Failed(e),
@@ -786,7 +833,9 @@ impl RulesEditor {
         let n = self.model.rows.len();
         theme::readout(ui, &n.to_string(), if n == 1 { "rule" } else { "rules" });
         ui.horizontal_wrapped(|ui| {
-            if self.dirty() {
+            if self.unreadable.is_some() {
+                theme::pill(ui, "file unreadable", theme::BAD);
+            } else if self.dirty() {
                 theme::pill(ui, "unsaved changes", theme::WARN);
             } else {
                 theme::pill(ui, "matches the file", theme::GOOD);
@@ -1102,10 +1151,12 @@ impl RulesEditor {
             theme::hint(
                 ui,
                 &format!(
-                    "{} program(s) running, {} shown. Clicking one adds a rule for its name \
-                     at the bottom of the list, matching profile {}. Kernel threads and logi \
-                     itself are left out. {}",
+                    "{} program name(s) to choose from{}, {} shown. Clicking one adds a rule \
+                     for that name at the bottom of the list, matching profile {}. Repeats of \
+                     one name are collapsed, and kernel threads and logi itself are left \
+                     out. {}",
                     list.len(),
+                    if self.filter.trim().is_empty() { "" } else { " after the filter" },
                     shown,
                     snap.active_profile,
                     if self.no_scanner {
@@ -1181,7 +1232,7 @@ impl RulesEditor {
             theme::row(ui, "path", &self.path.display().to_string());
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                let can_save = errors == 0 && self.dirty();
+                let can_save = errors == 0 && self.dirty() && self.unreadable.is_none();
                 if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
                     self.save();
                 }
@@ -1751,6 +1802,58 @@ poll_ms = 500
         ed.save();
         assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
         assert!(ed.dirty(), "the edit is still unsaved, so it is still dirty");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_exists_but_will_not_read_is_never_treated_as_no_file() {
+        // The one that would hurt: `read_to_string(..).ok()` turned a config
+        // the process cannot read into `None`, which `adopt` reads as a fresh
+        // start. The user saw "No rules file yet", added a rule, saved, and
+        // the rules already in the file were gone.
+        let dir = temp_dir("unreadable-file");
+        let path = dir.join("rules.conf");
+        // Not UTF-8, so the read fails with the file very much present.
+        std::fs::write(&path, b"csgo = 1\n\xff\xfe not utf 8 \xff\n").unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert!(ed.unreadable.is_some(), "the failure has to block saving");
+
+        // An edit on top of it still must not be written over the file.
+        ed.model.add("blender", 2);
+        assert!(ed.dirty());
+        ed.save();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a save over a file we could not read must not have touched it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_becomes_readable_again_recovers_on_reload() {
+        let dir = temp_dir("unreadable-recover");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, b"\xff\xfe not utf 8\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        assert!(ed.unreadable.is_some());
+
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+        ed.reload();
+        assert!(ed.unreadable.is_none(), "{:?}", ed.status);
+        assert_eq!(ed.model.rows.len(), 1);
+
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

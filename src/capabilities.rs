@@ -28,14 +28,27 @@ impl Capabilities {
         let mut c = Capabilities::default();
         if let Ok(fs) = dev.feature_index(F::FEATURE_SET) {
             if let Ok(p) = dev.call(fs, 0x00, &[]) {
+                // getCount excludes the root feature, so the valid indices
+                // are 0..=count. A device that answers nothing for an index
+                // costs a full reply timeout each time, and `count` is the
+                // device's own claim: give up after a short run of silence
+                // rather than spending minutes on a count of 255.
                 let count = p.first().copied().unwrap_or(0);
+                let mut quiet = 0u8;
                 for i in 0..=count {
-                    if let Ok(q) = dev.call(fs, 0x01, &[i]) {
-                        if q.len() >= 3 {
+                    match dev.call(fs, 0x01, &[i]) {
+                        Ok(q) if q.len() >= 3 => {
+                            quiet = 0;
                             let id = u16::from_be_bytes([q[0], q[1]]);
                             c.features.push((i, id, q[2]));
                             if q[2] & 0x70 != 0 {
                                 c.restricted.push(id);
+                            }
+                        }
+                        _ => {
+                            quiet += 1;
+                            if quiet >= 3 {
+                                break;
                             }
                         }
                     }

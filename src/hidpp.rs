@@ -86,6 +86,19 @@ pub fn error_name(code: u8) -> &'static str {
     }
 }
 
+/// What a poll on the endpoint found.
+///
+/// Readable is kept distinct from Hangup because an unplug can set POLLHUP
+/// while reports are still queued, and those are worth reading; and from Idle
+/// because a timeout means "nothing yet", whereas a hangup means the device is
+/// gone and the caller should stop waiting on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ready {
+    Readable,
+    Idle,
+    Hangup,
+}
+
 /// One open HID++ control endpoint.
 pub struct Device {
     file: File,
@@ -118,7 +131,7 @@ impl Device {
     }
 
     /// Wait up to `timeout` for the fd to become readable.
-    fn wait_readable(&self, timeout: Duration) -> bool {
+    fn wait_readable(&self, timeout: Duration) -> Ready {
         let mut pfd = libc::pollfd {
             fd: self.file.as_raw_fd(),
             events: libc::POLLIN,
@@ -127,14 +140,30 @@ impl Device {
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: a single valid pollfd for a file we own, with a bounded timeout.
         let n = unsafe { libc::poll(&mut pfd, 1, ms) };
-        n > 0 && (pfd.revents & libc::POLLIN) != 0
+        if n < 0 {
+            // A signal landed mid-wait: nothing is known yet, so let the
+            // caller come back round. Any other error is the fd itself.
+            return match std::io::Error::last_os_error().kind() {
+                std::io::ErrorKind::Interrupted => Ready::Idle,
+                _ => Ready::Hangup,
+            };
+        }
+        // Data first: an unplug can set POLLHUP alongside reports that are
+        // still queued, and those are worth reading.
+        if (pfd.revents & libc::POLLIN) != 0 {
+            Ready::Readable
+        } else if (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+            Ready::Hangup
+        } else {
+            Ready::Idle
+        }
     }
 
     /// Discard anything already queued, so a stale event is not mistaken for
     /// our reply.
     pub fn drain(&mut self) {
         let mut buf = [0u8; 64];
-        while self.wait_readable(Duration::from_millis(1)) {
+        while matches!(self.wait_readable(Duration::from_millis(1)), Ready::Readable) {
             if self.file.read(&mut buf).is_err() {
                 break;
             }
@@ -185,8 +214,17 @@ impl Device {
         let mut buf = [0u8; 64];
         while Instant::now() < deadline {
             let left = deadline.saturating_duration_since(Instant::now());
-            if !self.wait_readable(left.min(Duration::from_millis(50))) {
-                continue;
+            match self.wait_readable(left.min(Duration::from_millis(50))) {
+                Ready::Readable => {}
+                Ready::Idle => continue,
+                // The endpoint is gone. Spinning here until the timeout only
+                // delays the error and hides the reason for it.
+                Ready::Hangup => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "device disconnected",
+                    )))
+                }
             }
             let n = match self.file.read(&mut buf) {
                 Ok(n) => n,
@@ -256,8 +294,18 @@ impl Device {
             if left.is_zero() {
                 return Ok(None);
             }
-            if !self.wait_readable(left.min(Duration::from_millis(100))) {
-                continue;
+            match self.wait_readable(left.min(Duration::from_millis(100))) {
+                Ready::Readable => {}
+                Ready::Idle => continue,
+                // Distinct from the timeout above: Ok(None) means "nothing yet,
+                // ask again", and a listener that got that on an unplug would
+                // poll a dead endpoint forever.
+                Ready::Hangup => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "device disconnected",
+                    )))
+                }
             }
             let n = match self.file.read(&mut buf) {
                 Ok(n) => n,

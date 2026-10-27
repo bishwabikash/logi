@@ -97,7 +97,9 @@ impl OnboardProfiles {
     /// Hold the device in host mode for the duration of `f`, then put it back.
     ///
     /// Leaving the mouse in host mode makes its lighting depend on this process
-    /// still running, so the restore runs even if `f` fails or panics.
+    /// still running, so the restore runs even when `f` returns an error. A
+    /// panic is not covered — release builds abort — so `logi mode onboard` is
+    /// the way back if the process dies holding host mode.
     pub fn with_host_mode<T>(
         &self,
         dev: &mut Device,
@@ -154,14 +156,20 @@ impl OnboardProfiles {
                     (offset >> 8) as u8, (offset & 0xFF) as u8,
                 ],
             )?;
-            let take = p.len().min(16);
-            if take == 0 {
-                return Err(Error::Protocol("empty memoryRead reply".into()));
+            // Each reply carries its own 16 bytes and the next one starts 16
+            // further on, so a reply that came up short cannot just be
+            // appended: every byte after it would sit at the wrong offset,
+            // and the sector would decode as plausible nonsense.
+            let want = (length - offset).min(16);
+            if p.len() < want {
+                return Err(Error::Protocol(format!(
+                    "short memoryRead reply for sector {sector} at offset {offset}:                      {} bytes, wanted {want}",
+                    p.len()
+                )));
             }
-            out.extend_from_slice(&p[..take]);
+            out.extend_from_slice(&p[..want]);
             offset += 16;
         }
-        out.truncate(length);
         Ok(out)
     }
 }

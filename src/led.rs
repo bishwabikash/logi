@@ -181,9 +181,15 @@ impl Leds {
         };
         for e in 0..zone.num_effects {
             let q = dev.call(self.idx, GET_ZONE_EFFECT_INFO, &[z, e])?;
-            if q.len() >= 4 {
-                zone.modes.push(u16::from_be_bytes([q[2], q[3]]) as u8);
+            // setZoneEffect addresses an effect by its position in this list,
+            // so dropping an entry would shift every later effect's index and
+            // quietly write the wrong effect. Refuse the zone instead.
+            if q.len() < 4 {
+                return Err(Error::Protocol(format!(
+                    "short getZoneEffectInfo reply for zone {z} effect {e}"
+                )));
             }
+            zone.modes.push(u16::from_be_bytes([q[2], q[3]]) as u8);
         }
         Ok(zone)
     }

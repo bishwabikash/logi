@@ -108,60 +108,123 @@ pub fn frame(name: &str, t: f32, color: [u8; 3], period_s: f32, zones: usize) ->
         .collect()
 }
 
-/// Open the device and run `name` until stopped.
-pub fn start(name: String, color: [u8; 3], period_ms: u32) -> Result<Running, String> {
-    if !is_effect(&name) {
-        return Err(format!("unknown effect {name:?}"));
-    }
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let handle = std::thread::Builder::new()
-        .name("logi-effect".into())
-        .spawn(move || {
-            if let Err(e) = run(&name, color, period_ms, &flag) {
-                eprintln!("logi: effect stopped: {e}");
-            }
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(Running { stop, handle: Some(handle) })
+/// The device, held in host mode for as long as an effect is running.
+///
+/// Opening it, taking host mode and handing the mouse back all live here so
+/// there is exactly one exit path. Dropping a `Session` restores the previous
+/// mode, so a thread that never started, returned early or unwound still gives
+/// the mouse back instead of leaving its lighting owned by a dead process.
+struct Session {
+    dev: hidpp::Device,
+    leds: Leds,
+    profiles: OnboardProfiles,
+    /// The mode the device was in before we touched it.
+    restore: u8,
+    released: bool,
 }
 
-fn run(name: &str, color: [u8; 3], period_ms: u32, stop: &AtomicBool) -> hidpp::Result<()> {
-    let found = discover::open_device()?;
-    let mut dev = found.device;
-    let leds = Leds::new(&mut dev)?;
-    let profiles = OnboardProfiles::new(&mut dev)?;
+impl Session {
+    fn open() -> hidpp::Result<Self> {
+        let found = discover::open_device()?;
+        let mut dev = found.device;
+        let leds = Leds::new(&mut dev)?;
+        if leds.zone_count == 0 {
+            return Err(hidpp::Error::Protocol(
+                "this device reports no lighting zones, so there is nothing to animate".into(),
+            ));
+        }
+        let profiles = OnboardProfiles::new(&mut dev)?;
 
-    let previous = profiles.mode(&mut dev).unwrap_or(MODE_ONBOARD);
-    profiles.set_mode(&mut dev, MODE_HOST)?;
+        let previous = profiles.mode(&mut dev).unwrap_or(MODE_ONBOARD);
+        let restore = if previous == MODE_HOST { MODE_HOST } else { MODE_ONBOARD };
+        let mut me = Session { dev, leds, profiles, restore, released: false };
+        if previous != MODE_HOST {
+            if let Err(e) = me.profiles.set_mode(&mut me.dev, MODE_HOST) {
+                // The switch may have landed even though the reply did not, so
+                // put the device back before giving up. Reporting the failure
+                // and leaving the mouse in host mode is the one outcome worth
+                // ruling out: nothing would ever switch it back.
+                me.release();
+                return Err(e);
+            }
+        }
+        Ok(me)
+    }
 
-    let period_s = period_ms as f32 / 1000.0;
-    let interval = Duration::from_micros(1_000_000 / FPS as u64);
-    let t0 = Instant::now();
-    let mut frames: u64 = 0;
+    /// Hand the mouse back. Idempotent, so Drop after an explicit call is free.
+    fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.released = true;
+        let _ = self.profiles.set_mode(&mut self.dev, self.restore);
+    }
 
-    let outcome = (|| -> hidpp::Result<()> {
+    fn run(
+        &mut self,
+        name: &str,
+        color: [u8; 3],
+        period_ms: u32,
+        stop: &AtomicBool,
+    ) -> hidpp::Result<()> {
+        let period_s = period_ms as f32 / 1000.0;
+        let interval = Duration::from_micros(1_000_000 / FPS as u64);
+        let zones = self.leds.zone_count as usize;
+        let t0 = Instant::now();
+        let mut frames: u64 = 0;
+
         while !stop.load(Ordering::Relaxed) {
             let t = t0.elapsed().as_secs_f32();
-            let colors = frame(name, t, color, period_s, leds.zone_count as usize);
+            let colors = frame(name, t, color, period_s, zones);
             for (z, c) in colors.iter().enumerate() {
-                leds.fixed_nowait(&mut dev, z as u8, *c)?;
+                self.leds.fixed_nowait(&mut self.dev, z as u8, *c)?;
             }
             frames += 1;
             // send_nowait leaves replies queued; drain periodically or they
             // accumulate in the kernel buffer.
             if frames % 32 == 0 {
-                dev.drain();
+                self.dev.drain();
             }
             std::thread::sleep(interval);
         }
         Ok(())
-    })();
+    }
+}
 
-    // Always hand the mouse back, even if the loop failed.
-    let restore = if previous == MODE_HOST { MODE_HOST } else { MODE_ONBOARD };
-    let _ = profiles.set_mode(&mut dev, restore);
-    outcome
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Open the device and run `name` until stopped.
+///
+/// The device is opened and switched to host mode here rather than on the
+/// effect thread, so a device that is missing, busy or has no lighting is an
+/// error the caller sees instead of a `Running` handle for an effect that
+/// never started.
+pub fn start(name: String, color: [u8; 3], period_ms: u32) -> Result<Running, String> {
+    if !is_effect(&name) {
+        return Err(format!("unknown effect {name:?}"));
+    }
+    let mut session = Session::open().map_err(|e| e.to_string())?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let handle = std::thread::Builder::new()
+        .name("logi-effect".into())
+        .spawn(move || {
+            if let Err(e) = session.run(&name, color, period_ms, &flag) {
+                eprintln!("logi: effect stopped: {e}");
+            }
+            // Always hand the mouse back, even if the loop failed. Dropping
+            // the session would do this too; doing it here keeps the restore
+            // visible at the exit it belongs to.
+            session.release();
+        })
+        // The thread never started, so `session` is dropped here and its Drop
+        // is what restores the mode.
+        .map_err(|e| e.to_string())?;
+    Ok(Running { stop, handle: Some(handle) })
 }
 
 #[cfg(test)]

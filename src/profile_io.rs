@@ -91,14 +91,33 @@ pub fn write_sector(
     head.extend_from_slice(&n.to_be_bytes());
     dev.call(idx, MEMORY_ADDR_WRITE, &head)?;
 
+    // Past the addr_write the device has an open write window, so a failure
+    // from here on may already have put bytes into flash. Say so: "it timed
+    // out" reads as "nothing happened", and acting on that is how a sector
+    // ends up half old and half new. The window is deliberately left
+    // unclosed, as libratbag does, rather than committing a partial buffer.
+    let partial = |e: Error| {
+        Error::Protocol(format!(
+            "sector {sector} write stopped part-way ({e}); it may now hold a \
+             mix of old and new bytes. Write it again, or restore a backup, \
+             before trusting it."
+        ))
+    };
     for chunk in payload.chunks(CHUNK) {
-        dev.call(idx, MEMORY_WRITE, chunk)?;
+        dev.call(idx, MEMORY_WRITE, chunk).map_err(partial)?;
     }
     // Short report, matching libratbag's write_end.
-    dev.call_short(idx, MEMORY_WRITE_END, &[])?;
+    dev.call_short(idx, MEMORY_WRITE_END, &[]).map_err(partial)?;
 
     std::thread::sleep(SETTLE);
     let back = profiles.read_sector(dev, sector, None)?;
+    if back.len() != payload.len() {
+        return Err(Error::Protocol(format!(
+            "sector {sector} read back {} bytes, expected {}",
+            back.len(),
+            payload.len()
+        )));
+    }
     if back != payload {
         let at = back
             .iter()
@@ -107,8 +126,7 @@ pub fn write_sector(
             .unwrap_or(0);
         return Err(Error::Protocol(format!(
             "sector {sector} readback differs at offset 0x{at:02x}: wrote 0x{:02x}, read 0x{:02x}",
-            payload[at],
-            back.get(at).copied().unwrap_or(0)
+            payload[at], back[at]
         )));
     }
     Ok(payload)
@@ -127,6 +145,17 @@ pub fn write_profile(
             profiles.info.profile_count - 1
         )));
     }
+    // `serialize` passes the sector's unmodelled bytes straight through, so a
+    // sector that did not check out when it was read would go back with its
+    // corruption blessed by a freshly stamped CRC — which is how one
+    // interrupted write becomes a permanent one, button table included.
+    if !profile.crc_ok() {
+        return Err(Error::Protocol(format!(
+            "profile {index} was read from a sector whose stored CRC does not \
+             match its contents, so writing it back would make that permanent. \
+             Restore a backup first."
+        )));
+    }
     write_sector(dev, profiles, index as u16 + 1, &profile.serialize())
 }
 
@@ -138,10 +167,27 @@ pub fn dump_all(dev: &mut Device, profiles: &OnboardProfiles) -> Vec<(u16, Optio
         .collect()
 }
 
+/// The model name comes off the device, so it is not trusted to be JSON-safe.
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Serialise a dump as JSON without pulling in a serde dependency.
 pub fn dump_to_json(model: &str, dump: &[(u16, Option<Vec<u8>>)]) -> String {
     let mut s = String::from("{\n");
-    s.push_str(&format!("  \"model\": \"{model}\",\n"));
+    s.push_str(&format!("  \"model\": \"{}\",\n", json_escape(model)));
     s.push_str("  \"sectors\": {\n");
     let entries: Vec<String> = dump
         .iter()
@@ -284,6 +330,15 @@ mod tests {
     }
 }
 
+/// Whether writing `p` would actually change the sector it was read from.
+///
+/// Flash has finite endurance, so a save that asks for what is already stored
+/// should cost nothing. Saving the same profile twice is an ordinary thing for
+/// a user to do.
+fn changed(p: &Profile, blob: &[u8]) -> bool {
+    p.serialize().as_slice() != blob
+}
+
 /// Store a report rate into a profile's flash sector.
 ///
 /// The live 0x8060 setter only works in host mode and is lost when the device
@@ -298,10 +353,10 @@ pub fn set_report_rate(
     let ms = crate::rate::ReportRate::interval_ms(hz)?;
     let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
     let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
-    if p.report_rate_ms == ms {
+    p.report_rate_ms = ms;
+    if !changed(&p, &blob) {
         return Ok(hz);
     }
-    p.report_rate_ms = ms;
     write_profile(dev, profiles, index, &p)?;
     Ok(hz)
 }
@@ -314,15 +369,21 @@ pub fn set_button(
     button: u8,
     binding: crate::profile_blob::Button,
 ) -> Result<()> {
-    if button >= profiles.info.button_count {
+    // The second bound is the sector's own: the table has 32 slots whatever a
+    // device claims, and indexing past it would panic.
+    let limit = profiles.info.button_count.min(profile_blob::N_BUTTON_SLOTS as u8);
+    if button >= limit {
         return Err(Error::Protocol(format!(
             "button {button} out of range 0..{}",
-            profiles.info.button_count - 1
+            limit.saturating_sub(1)
         )));
     }
     let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
     let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
     p.buttons[button as usize] = binding;
+    if !changed(&p, &blob) {
+        return Ok(());
+    }
     write_profile(dev, profiles, index, &p)?;
     Ok(())
 }
@@ -338,6 +399,9 @@ pub fn set_lighting(
     let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
     p.leds = leds;
     p.alt_leds = leds;
+    if !changed(&p, &blob) {
+        return Ok(());
+    }
     write_profile(dev, profiles, index, &p)?;
     Ok(())
 }

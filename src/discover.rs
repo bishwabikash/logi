@@ -131,9 +131,16 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
             "no Logitech device found. Is it plugged in?".into(),
         ));
     }
+    // Reported if nothing answers. Taken from sysfs, not from a probe, so it
+    // is true even for the nodes this call never opens.
+    let mut present: Vec<String> = Vec::new();
+    for (_, pid) in &cands {
+        let id = format!("046d:{pid:04x}");
+        if !present.contains(&id) {
+            present.push(id);
+        }
+    }
     let mut permission_problem = None;
-    let mut seen = Vec::new();
-    let mut matched: Option<Found> = None;
 
     for (path, pid) in cands {
         if let Some(w) = want {
@@ -144,11 +151,11 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
         }
         match Device::open(&path) {
             Ok(dev) => {
+                // Stop at the first node that answers. The siblings of a
+                // device we already have add nothing, and every node that
+                // does not answer costs a full reply timeout.
                 if let Some(f) = interrogate(dev, pid, path) {
-                    seen.push(format!("046d:{:04x} {}", f.pid, f.name));
-                    if matched.is_none() {
-                        matched = Some(f);
-                    }
+                    return Ok(f);
                 }
             }
             Err(Error::Permission(m)) => permission_problem = Some(m),
@@ -156,16 +163,13 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
         }
     }
 
-    if let Some(f) = matched {
-        return Ok(f);
-    }
     if let Some(m) = permission_problem {
         return Err(Error::Permission(m));
     }
     match want {
         Some(w) => Err(Error::NotFound(format!(
-            "no Logitech device matching {w:?}. Present: {}",
-            if seen.is_empty() { "none that answered HID++".into() } else { seen.join(", ") }
+            "no Logitech device matching {w:?} answered HID++. Present: {}",
+            present.join(", ")
         ))),
         None => Err(Error::NotFound(
             "found Logitech hardware, but no HID++ endpoint answered. A plain \

@@ -94,7 +94,17 @@ impl VirtualDevice {
         let path = c"/dev/uinput";
         // O_NONBLOCK so a write can never wedge the caller; uinput writes do
         // not block in practice, but a bound button lives on the event loop.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK) };
+        //
+        // O_CLOEXEC because a `command` binding spawns arbitrary programs and
+        // `std::process::Command` only replaces stdio: without it every child
+        // inherits this descriptor. The virtual device stays registered for as
+        // long as any descriptor on it is open, so a child that outlives us —
+        // which is the whole point of a detached command — would keep a ghost
+        // "logi virtual input" device in the compositor after logi is gone,
+        // and a fresh run would add another beside it.
+        let fd = unsafe {
+            libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        };
         if fd < 0 {
             return Err(open_error(io::Error::last_os_error()));
         }

@@ -122,8 +122,10 @@ impl Button {
         }
     }
 
+    /// Mouse button `n`, 1-based. The mask is 16 bits wide, so there is no
+    /// such thing as button 17; clamping beats a shift overflow.
     pub fn mouse(n: u8) -> Self {
-        let mask: u16 = 1 << (n.saturating_sub(1));
+        let mask: u16 = 1 << (n.clamp(1, 16) - 1);
         Button([BTN_HID, HID_MOUSE, (mask >> 8) as u8, (mask & 0xFF) as u8])
     }
 

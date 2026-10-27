@@ -116,8 +116,15 @@ pub enum Decision {
 /// so it can be driven deterministically in tests.
 pub struct Watcher {
     cfg: Config,
-    applied: Option<u8>,
-    candidate: Option<(u8, Option<u16>, String, Instant)>,
+    /// The profile the device was last told to select, and the dpi sent with
+    /// it. The dpi is part of it because two rules can name the same profile
+    /// and differ only in the dpi they carry; tracking the profile alone would
+    /// leave the second rule's dpi unapplied.
+    applied: Option<(u8, Option<u16>)>,
+    /// The profile waiting out the settle window, and when it first appeared.
+    /// Only the profile is held: what else the winning rule carries is read
+    /// when the window closes, not when it opens.
+    candidate: Option<(u8, Instant)>,
 }
 
 impl Watcher {
@@ -142,30 +149,30 @@ impl Watcher {
             },
         };
 
-        if self.applied == Some(want) {
+        if self.applied == Some((want, dpi)) {
             self.candidate = None;
             return Decision::Hold;
         }
 
-        match &self.candidate {
-            // A different candidate replaces the pending one and restarts the
-            // settle window.
-            Some((p, _, _, _)) if *p != want => {
-                self.candidate = Some((want, dpi, reason.clone(), now));
-                Decision::Pending { profile: want, reason }
-            }
-            Some((_, d, r, since)) => {
-                if now.duration_since(*since) >= self.cfg.settle {
-                    let out = Decision::Switch { profile: want, dpi: *d, reason: r.clone() };
-                    self.applied = Some(want);
+        // The settle window is about the profile, so a rule that keeps the
+        // profile and changes only its dpi does not restart it. What gets
+        // applied, and the reason logged for it, are whatever is in force when
+        // the window closes: the rule that opened it may have stopped matching
+        // in the meantime, and applying its dpi would be applying a rule that
+        // is no longer true.
+        match self.candidate {
+            Some((p, since)) if p == want => {
+                if now.duration_since(since) >= self.cfg.settle {
+                    self.applied = Some((want, dpi));
                     self.candidate = None;
-                    out
+                    Decision::Switch { profile: want, dpi, reason }
                 } else {
-                    Decision::Pending { profile: want, reason: r.clone() }
+                    Decision::Pending { profile: want, reason }
                 }
             }
-            None => {
-                self.candidate = Some((want, dpi, reason.clone(), now));
+            // No candidate, or a different one: start the window here.
+            _ => {
+                self.candidate = Some((want, now));
                 Decision::Pending { profile: want, reason }
             }
         }
@@ -399,6 +406,90 @@ mod tests {
             w.tick(&p, t + Duration::from_millis(150)),
             Decision::Switch { profile: 1, dpi: Some(800), reason: "csgo is running".into() }
         );
+    }
+
+    #[test]
+    fn the_rule_in_force_when_the_window_closes_is_the_one_applied() {
+        // Two rules naming the same profile: the first opens the settle
+        // window, the second is what is true when it closes. Applying the
+        // first rule's dpi would be applying a rule that stopped matching.
+        let t = Instant::now();
+        let mut a = Rule::new("csgo", 1);
+        a.dpi = Some(800);
+        let mut b = Rule::new("blender", 1);
+        b.dpi = Some(1600);
+        let mut w = Watcher::new(cfg(vec![a, b], None));
+        assert!(matches!(w.tick(&procs(&["csgo"]), t), Decision::Pending { profile: 1, .. }));
+        assert_eq!(
+            w.tick(&procs(&["blender"]), t + Duration::from_millis(150)),
+            Decision::Switch {
+                profile: 1,
+                dpi: Some(1600),
+                reason: "blender is running".into()
+            },
+            "the settled switch carried the rule that had already stopped matching"
+        );
+    }
+
+    #[test]
+    fn a_same_profile_rule_with_a_different_dpi_still_applies() {
+        // The profile does not change, so nothing would be re-selected if the
+        // watcher tracked the profile alone, and the dpi would never be sent.
+        let t = Instant::now();
+        let mut a = Rule::new("csgo", 1);
+        a.dpi = Some(800);
+        let mut b = Rule::new("blender", 1);
+        b.dpi = Some(1600);
+        let mut w = Watcher::new(cfg(vec![a, b], None));
+        let csgo = procs(&["csgo"]);
+        w.tick(&csgo, t);
+        assert!(matches!(
+            w.tick(&csgo, t + Duration::from_millis(150)),
+            Decision::Switch { dpi: Some(800), .. }
+        ));
+        let blender = procs(&["blender"]);
+        assert!(matches!(
+            w.tick(&blender, t + Duration::from_millis(200)),
+            Decision::Pending { profile: 1, .. }
+        ));
+        assert!(matches!(
+            w.tick(&blender, t + Duration::from_millis(400)),
+            Decision::Switch { profile: 1, dpi: Some(1600), .. }
+        ));
+    }
+
+    #[test]
+    fn an_unchanged_rule_is_not_reapplied_for_its_dpi() {
+        let t = Instant::now();
+        let mut r = Rule::new("csgo", 1);
+        r.dpi = Some(800);
+        let mut w = Watcher::new(cfg(vec![r], None));
+        let p = procs(&["csgo"]);
+        w.tick(&p, t);
+        w.tick(&p, t + Duration::from_millis(150));
+        assert_eq!(w.tick(&p, t + Duration::from_millis(300)), Decision::Hold);
+        assert_eq!(w.tick(&p, t + Duration::from_millis(900)), Decision::Hold);
+    }
+
+    #[test]
+    fn invalidate_lets_the_same_rule_apply_again() {
+        let t = Instant::now();
+        let mut w = Watcher::new(cfg(vec![Rule::new("csgo", 1)], None));
+        let p = procs(&["csgo"]);
+        w.tick(&p, t);
+        assert!(matches!(
+            w.tick(&p, t + Duration::from_millis(150)),
+            Decision::Switch { profile: 1, .. }
+        ));
+        w.invalidate();
+        assert!(matches!(
+            w.tick(&p, t + Duration::from_millis(200)),
+            Decision::Pending { profile: 1, .. }
+        ));
+        assert!(matches!(
+            w.tick(&p, t + Duration::from_millis(400)),
+            Decision::Switch { profile: 1, .. }
+        ));
     }
 
     #[test]

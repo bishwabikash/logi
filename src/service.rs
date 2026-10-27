@@ -182,9 +182,17 @@ pub fn unit_file_exists() -> bool {
 /// on spaces, so an unquoted path under a directory like
 /// `~/Desktop/My Project/` would be read as a command plus two arguments and
 /// fail with "No such file or directory".
+///
+/// A backslash forces the quoted form too, and is doubled inside it. systemd
+/// runs C-style escapes over `ExecStart` whether the word is quoted or not, so
+/// a path through a directory with a backslash in its name is otherwise either
+/// mangled (`\b` becomes a backspace) or rejected outright as an unknown
+/// escape, which leaves the unit with no ExecStart at all.
 pub fn unit_text(exe: &str) -> String {
-    let quoted = if exe.contains(char::is_whitespace) {
-        format!("\"{}\"", exe.replace('"', "\\\""))
+    let quoted = if exe.contains(char::is_whitespace) || exe.contains(['"', '\\']) {
+        // Backslashes first: doing it the other way round would then escape
+        // the backslashes this step just added.
+        format!("\"{}\"", exe.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         exe.to_string()
     };
@@ -203,8 +211,15 @@ pub fn install_unit(force: bool) -> Result<String, String> {
     let want = unit_text(&exe);
     let path = unit_path();
 
-    if let Ok(have) = std::fs::read_to_string(&path) {
-        if have == want {
+    let have = std::fs::read_to_string(&path);
+    let why = match &have {
+        Err(e) => format!(" ({e})"),
+        Ok(_) => String::new(),
+    };
+    let present = have.is_ok() || path.exists();
+    let v = verdict(have.as_deref().ok(), present, &want, force);
+    match v {
+        Verdict::UpToDate => {
             // Still reload: the file may have been written while systemd was
             // not looking, and reloading twice costs nothing.
             return Ok(format!(
@@ -212,13 +227,22 @@ pub fn install_unit(force: bool) -> Result<String, String> {
                 reload_suffix()
             ));
         }
-        if !force {
+        Verdict::Differs => {
             return Err(format!(
                 "{} already exists and differs from what this app would write. Use \
                  Reinstall to replace it.",
                 path.display()
             ));
         }
+        Verdict::Unreadable => {
+            return Err(format!(
+                "{} already exists but cannot be read back{}, so there is no telling \
+                 what replacing it would lose. Use Reinstall to replace it anyway.",
+                path.display(),
+                why
+            ));
+        }
+        Verdict::Write => {}
     }
 
     let dir = path.parent().ok_or_else(|| "bad unit path".to_string())?;
@@ -228,9 +252,41 @@ pub fn install_unit(force: bool) -> Result<String, String> {
     // systemd with half a unit file.
     let tmp = path.with_extension("service.new");
     std::fs::write(&tmp, &want).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
-        .map_err(|e| format!("cannot install {}: {e}", path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // Otherwise a failed install leaves logi.service.new sitting in the
+        // user's systemd directory for good. systemd ignores it, but it is
+        // still our litter in a directory that is theirs.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot install {}: {e}", path.display()));
+    }
     Ok(format!("Installed {}. It runs {exe} serve.{}", path.display(), reload_suffix()))
+}
+
+/// What to do about whatever is already at the unit path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Write,
+    UpToDate,
+    Differs,
+    Unreadable,
+}
+
+/// Decide whether an install may write, given what was read back.
+///
+/// `have` is the file's text, or `None` when there is nothing there *or* when
+/// something is there that could not be read: unreadable, or not UTF-8.
+/// `present` separates those two. "Differs from what we would write" has to
+/// include "we cannot tell", or a unit file the user chmod'd or wrote in some
+/// other encoding is the one thing a button labelled Install silently destroys.
+fn verdict(have: Option<&str>, present: bool, want: &str, force: bool) -> Verdict {
+    match have {
+        Some(h) if h == want => Verdict::UpToDate,
+        Some(_) if force => Verdict::Write,
+        Some(_) => Verdict::Differs,
+        None if !present => Verdict::Write,
+        None if force => Verdict::Write,
+        None => Verdict::Unreadable,
+    }
 }
 
 /// Reload systemd, and say so only when it did not work.
@@ -680,15 +736,45 @@ impl Watcher {
             s.error = None;
             s.rev = s.rev.wrapping_add(1);
         }
-        self.send(Msg::Do(action));
+        if self.send(Msg::Do(action)) {
+            return;
+        }
+        // Nothing is going to run this, so nothing is going to clear `busy`,
+        // and every control is greyed while it is set. Without this the panel
+        // sits on "starting the service" for the rest of the session with no
+        // way back, and the message `new` left about the missing thread has
+        // just been wiped by the `error = None` above.
+        if let Ok(mut s) = self.shared.lock() {
+            s.busy = None;
+            s.error = Some(
+                "the thread that talks to systemd is not running, so the service cannot \
+                 be controlled from here. Use systemctl --user in a terminal."
+                    .into(),
+            );
+            s.rev = s.rev.wrapping_add(1);
+        }
     }
 
-    fn send(&self, m: Msg) {
-        if let Ok(tx) = self.tx.lock() {
-            // A dead thread is not worth reporting: the cached state simply
-            // stops moving, and every control still renders.
-            let _ = tx.send(m);
+    /// False when the message could not be queued, i.e. the thread is gone.
+    ///
+    /// A dropped refresh is not worth reporting: the cached state simply stops
+    /// moving and every control still renders. A dropped action is, because
+    /// the caller has already set `busy` on the strength of it.
+    fn send(&self, m: Msg) -> bool {
+        match self.tx.lock() {
+            Ok(tx) => tx.send(m).is_ok(),
+            Err(_) => false,
         }
+    }
+
+    /// A watcher with no thread behind it, for the test that the UI does not
+    /// get stuck when there is none. Built here rather than in the test module
+    /// because `Msg` and the fields are private to this one.
+    #[cfg(test)]
+    fn detached() -> Self {
+        let (tx, rx) = mpsc::channel::<Msg>();
+        drop(rx);
+        Watcher { tx: Mutex::new(tx), shared: Arc::new(Mutex::new(Shared::default())) }
     }
 }
 
@@ -1063,6 +1149,49 @@ mod tests {
     }
 
     #[test]
+    fn a_backslash_in_the_path_is_quoted_and_doubled() {
+        // systemd runs C escapes over ExecStart quoted or not, so an unescaped
+        // `\b` would become a backspace and `\D` would void the whole line.
+        let t = unit_text("/home/u/a\\b/logi");
+        assert!(t.contains("ExecStart=\"/home/u/a\\\\b/logi\" serve"), "{t}");
+        // And a quote is still escaped, with the backslash it needs intact.
+        let t = unit_text("/home/u/say \"hi\"/logi");
+        assert!(t.contains("ExecStart=\"/home/u/say \\\"hi\\\"/logi\" serve"), "{t}");
+        // An ordinary path is still left alone.
+        assert!(unit_text("/usr/bin/logi").contains("ExecStart=/usr/bin/logi serve"));
+    }
+
+    // ---- install, deciding what to do with what is already there ----------
+
+    #[test]
+    fn nothing_there_is_simply_written() {
+        assert_eq!(verdict(None, false, "want", false), Verdict::Write);
+        assert_eq!(verdict(None, false, "want", true), Verdict::Write);
+    }
+
+    #[test]
+    fn the_same_text_is_up_to_date_whether_or_not_it_was_forced() {
+        assert_eq!(verdict(Some("want"), true, "want", false), Verdict::UpToDate);
+        assert_eq!(verdict(Some("want"), true, "want", true), Verdict::UpToDate);
+    }
+
+    #[test]
+    fn a_hand_edited_unit_is_kept_until_reinstall() {
+        assert_eq!(verdict(Some("theirs"), true, "ours", false), Verdict::Differs);
+        assert_eq!(verdict(Some("theirs"), true, "ours", true), Verdict::Write);
+    }
+
+    /// The case the plain `if let Ok(have)` missed: a unit file that is there
+    /// but will not read back, because it is chmod 000 or not UTF-8. Falling
+    /// through to the write destroys exactly the file the force flag exists to
+    /// protect.
+    #[test]
+    fn a_unit_file_that_cannot_be_read_is_not_silently_overwritten() {
+        assert_eq!(verdict(None, true, "ours", false), Verdict::Unreadable);
+        assert_eq!(verdict(None, true, "ours", true), Verdict::Write);
+    }
+
+    #[test]
     fn the_embedded_unit_is_the_one_the_installer_uses() {
         assert!(UNIT_TEMPLATE.contains("ExecStart=@BIN@ serve"));
         assert!(UNIT_TEMPLATE.contains("WantedBy=default.target"));
@@ -1115,6 +1244,35 @@ mod tests {
         assert_eq!(exit_suffix(None), " (killed by a signal)");
         assert_eq!(first_line("\n  real problem\nmore\n"), "real problem");
         assert_eq!(first_line(""), "");
+    }
+
+    // ---- the watcher with nothing behind it ------------------------------
+
+    /// `request` sets `busy`, and the panel greys every control while it is
+    /// set. If the message cannot be queued there is no thread to ever clear
+    /// it, so the request has to clear it itself: otherwise the Service tab
+    /// spends the rest of the session saying "starting the service" with no
+    /// button left to press. `new` already handles a thread that would not
+    /// start; this is the other half of it.
+    #[test]
+    fn an_action_nothing_will_run_does_not_grey_the_panel_for_good() {
+        let w = Watcher::detached();
+        w.request(Action::Start);
+        assert_eq!(w.busy(), None, "busy outlived a request nothing can run");
+        let e = w.last_error().expect("the failure should be said out loud");
+        assert!(e.contains("systemd"), "{e}");
+        // And the revision moved, so a tray polling it redraws.
+        assert!(w.revision() > 0);
+    }
+
+    /// A refresh is the other way round: a stale state is not worth an error
+    /// message, so a dropped one stays quiet.
+    #[test]
+    fn a_refresh_that_goes_nowhere_says_nothing() {
+        let w = Watcher::detached();
+        w.refresh();
+        assert_eq!(w.last_error(), None);
+        assert_eq!(w.busy(), None);
     }
 
     // ---- live, so not run by default -------------------------------------

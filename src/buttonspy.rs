@@ -52,6 +52,13 @@ impl ButtonSpy {
     /// gate and replaced by IDENTITY if it fails it: a table the gate would
     /// refuse is not a restore target at all, and a device already zeroed by
     /// something else must not have that state preserved and written back.
+    ///
+    /// Any *individual* zero is healed back to its own button for the same
+    /// reason. A zero means that button is dead, the table is non-volatile, and
+    /// the way a slot comes to be zero is a previous run that silenced it and
+    /// was killed before it could restore. Keeping that zero would make the
+    /// restore target itself carry a dead button, so the only way out would be
+    /// `logi bind reset`.
     pub fn new(dev: &mut Device) -> Result<Self> {
         let idx = dev.feature_index(features::MOUSE_BUTTON_SPY)?;
         let p = dev.call(idx, GET_NB_OF_BUTTONS, &[])?;
@@ -120,29 +127,35 @@ impl ButtonSpy {
         Ok(())
     }
 
-    /// Stop the listed buttons acting physically, leaving the rest untouched,
-    /// so only the host sees them.
+    /// Silence exactly the listed buttons: every button *not* listed goes back
+    /// to its own physical function at the same time.
     ///
-    /// Built on the device's live table rather than the saved one, so
-    /// silencing a second button does not un-silence the first. A live table
-    /// the gate would refuse — all zeros, or entries this device cannot have —
-    /// is not a base to build on, so the saved table is used instead of
-    /// spreading the damage.
+    /// That "exactly" is the contract the callers rely on. All of them pass the
+    /// complete set from `Bindings::to_silence()` and tell the user that the
+    /// rest are restored, so an empty list is meaningful — it means put the
+    /// whole table back — and a shorter list than last time has to un-silence
+    /// the difference. An additive build on the device's live table cannot do
+    /// either: a button dropped from Replace, or a run killed before its
+    /// teardown, would stay dead across unplugging with nothing short of
+    /// `logi bind reset` to recover it.
     ///
-    /// The table is validated before anything is sent, and if the write itself
-    /// fails the saved table is put back: a lost reply can hide a write that
-    /// landed, and a button left dead is worse than one left un-silenced.
+    /// So the table is built from the snapshot `new()` took, which is already
+    /// gated and already healed of dead slots. That preserves any non-identity
+    /// remapping the device genuinely carries while making the silenced set
+    /// exactly what was asked for.
+    ///
+    /// The table is validated before anything is sent, an identical table is
+    /// not rewritten — this one survives unplugging, so a pointless write is
+    /// wear for nothing — and if the write itself fails the saved table is put
+    /// back: a lost reply can hide a write that landed, and a button left dead
+    /// is worse than one left un-silenced.
     pub fn silence(&self, dev: &mut Device, buttons: &[u8]) -> Result<()> {
         check_buttons(buttons, self.count)?;
-        // Nothing asked for, so nothing written: this table is not state to
-        // rewrite for the sake of it.
-        if buttons.is_empty() {
+        let want = silence_table(&self.saved, buttons);
+        check_table(&want, self.count)?;
+        if self.get_remapping(dev)? == want {
             return Ok(());
         }
-        let live = self.get_remapping(dev)?;
-        let base = if check_table(&live, self.count).is_ok() { &live } else { &self.saved };
-        let want = silence_table(base, buttons);
-        check_table(&want, self.count)?;
         if let Err(e) = self.set_remapping(dev, &want) {
             let _ = self.restore(dev);
             return Err(e);
@@ -178,14 +191,35 @@ fn silence_table(base: &[u8], buttons: &[u8]) -> Vec<u8> {
     t
 }
 
-/// Pick a table that `restore` can always write: the device's own if the gate
-/// accepts it, else the factory identity.
+/// Pick a table that `restore` can always write, and that leaves no button
+/// dead: the device's own with any unmapped slot healed back to its own
+/// button, or the factory identity if the gate still refuses it.
+///
+/// Healing matters because this table is non-volatile. A slot reads zero when
+/// a previous run silenced it and did not live to restore it, and carrying
+/// that zero forward would make every later `restore` write the dead button
+/// back again.
 fn restorable(live: Vec<u8>, count: u8) -> Vec<u8> {
-    if check_table(&live, count).is_ok() {
-        live
+    let healed = heal(live, count);
+    if check_table(&healed, count).is_ok() {
+        healed
     } else {
         IDENTITY[..count as usize].to_vec()
     }
+}
+
+/// Put every unmapped slot back to its own button, leaving any other
+/// remapping the device carries alone.
+fn heal(mut table: Vec<u8>, count: u8) -> Vec<u8> {
+    if table.len() != count as usize {
+        return IDENTITY[..count as usize].to_vec();
+    }
+    for (i, b) in table.iter_mut().enumerate() {
+        if *b == 0 {
+            *b = IDENTITY[i];
+        }
+    }
+    table
 }
 
 /// The gate in front of every write to the remapping table.
@@ -376,8 +410,39 @@ mod tests {
     #[test]
     fn a_usable_live_table_is_the_restore_target() {
         assert_eq!(restorable(factory(), 11), factory());
+        // A remapping that is not the identity is genuine device state and is
+        // kept: only dead slots are touched.
+        let mut remapped = factory();
+        remapped[3] = 0x05;
+        assert_eq!(restorable(remapped.clone(), 11), remapped);
+    }
+
+    #[test]
+    fn a_dead_slot_is_never_carried_into_the_restore_target() {
+        // The table survives unplugging, so this is what is read back after a
+        // run that silenced button 6 and was killed before its teardown.
+        // Restoring that verbatim would leave button 6 dead for ever.
         let silenced = silence_table(&factory(), &[6]);
-        assert_eq!(restorable(silenced.clone(), 11), silenced);
+        assert_eq!(restorable(silenced, 11), factory());
+        // Only the dead slot is healed; the rest of the table is untouched.
+        let mut remapped = factory();
+        remapped[3] = 0x05;
+        let silenced = silence_table(&remapped, &[11]);
+        assert_eq!(restorable(silenced, 11), remapped);
+    }
+
+    #[test]
+    fn silencing_nothing_against_the_saved_table_restores_it() {
+        // `silence(&[])` is the GUI's "every button back to its own job": with
+        // the snapshot as the base it writes the whole table back, rather than
+        // being the no-op that leaves earlier Replaces silenced.
+        let saved = factory();
+        assert_eq!(silence_table(&saved, &[]), saved);
+        // And dropping a button from the set un-silences it, because the base
+        // is the snapshot and not the already-silenced live table.
+        let want = silence_table(&saved, &[6]);
+        assert_eq!(want[7], 0x08, "button 8 silenced last time must come back");
+        assert_eq!(want[5], 0x00);
     }
 
     #[test]

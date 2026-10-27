@@ -49,6 +49,10 @@ pub struct App {
 
     /// Pending button edits, keyed by button index, applied on click.
     btn_action: std::collections::HashMap<u8, String>,
+    /// Which profile the pending edits above were chosen against. A choice
+    /// made for one profile must not stay armed over another: Apply writes
+    /// flash.
+    btn_profile: Option<u8>,
 
     themed: bool,
     profile_editor: profile_editor::ProfileEditor,
@@ -61,6 +65,11 @@ pub struct App {
     /// desktop without a tray host. The app works either way.
     tray: Option<crate::tray::Tray>,
     tray_tried: bool,
+    /// Registration in flight. `Tray::spawn` blocks on a session-bus round
+    /// trip, and where the watcher name is activatable but never comes up it
+    /// blocks for the 25s D-Bus reply timeout, so it runs on its own thread
+    /// and the handle arrives through here.
+    tray_rx: Option<std::sync::mpsc::Receiver<Result<crate::tray::Tray, String>>>,
     /// True while the DPI slider is being dragged, so the live readout is not
     /// overwritten by the device's own value mid-drag.
     dpi_touched: bool,
@@ -85,6 +94,7 @@ impl App {
             profile_sel: 0,
             backup_path: default_backup_path(),
             btn_action: std::collections::HashMap::new(),
+            btn_profile: None,
             themed: false,
             profile_editor: profile_editor::ProfileEditor::new(),
             rules: rules_editor::RulesEditor::new(),
@@ -93,6 +103,7 @@ impl App {
             loaded: false,
             tray: None,
             tray_tried: false,
+            tray_rx: None,
             dpi_touched: false,
         }
     }
@@ -157,8 +168,10 @@ impl eframe::App for App {
             self.bindings.load();
             self.loaded = true;
         }
-        self.sync_tray(ctx);
+        // Before the tray, not after: the tray renders this snapshot, and
+        // reading it second had every icon update describing the frame before.
         self.snap = self.dev.snapshot();
+        self.sync_tray(ctx);
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -231,10 +244,34 @@ impl App {
 
         if !self.tray_tried {
             self.tray_tried = true;
-            match crate::tray::Tray::spawn(status.clone()) {
-                Ok(t) => self.tray = Some(t),
+            // Registering blocks: it opens the session bus and waits for the
+            // watcher, which on a desktop where the name is activatable but
+            // never comes up is the full 25s D-Bus timeout. On the frame loop
+            // that is a window that never paints, so this goes on a thread of
+            // its own, exactly as `Tray::spawn` says it must.
+            let (tx, rx) = std::sync::mpsc::channel();
+            let initial = status.clone();
+            match std::thread::Builder::new()
+                .name("logi-tray-register".into())
+                .spawn(move || {
+                    let _ = tx.send(crate::tray::Tray::spawn(initial));
+                }) {
+                Ok(_) => self.tray_rx = Some(rx),
                 Err(e) => eprintln!("logi: no tray icon: {e}"),
             }
+        }
+        // Non-blocking: nothing here waits on the registration.
+        match self.tray_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(Ok(t))) => {
+                self.tray = Some(t);
+                self.tray_rx = None;
+            }
+            Some(Ok(Err(e))) => {
+                eprintln!("logi: no tray icon: {e}");
+                self.tray_rx = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.tray_rx = None,
+            _ => {}
         }
         let Some(tray) = &self.tray else { return };
 
@@ -399,7 +436,10 @@ impl App {
         ui.add_space(40.0);
         let err = self.snap.error.clone().unwrap_or_default();
         theme::card(ui, |ui| {
-            ui.label(egui::RichText::new("No G502 found").size(18.0).strong());
+            // No model whitelist: this app drives any Logitech device that
+            // answers HID++, so naming one model here misreads as "the wrong
+            // mouse is plugged in".
+            ui.label(egui::RichText::new("No Logitech device found").size(18.0).strong());
             ui.add_space(10.0);
             if err.contains("permission") {
                 theme::hint(
@@ -417,7 +457,7 @@ impl App {
                      keeps its old permissions, so the replug is what matters.",
                 );
             } else {
-                theme::hint(ui, "Plug in a Logitech G502 over USB.");
+                theme::hint(ui, "Plug in a Logitech mouse that speaks HID++ over USB.");
                 if !err.is_empty() {
                     ui.add_space(8.0);
                     theme::hint(ui, &err);
@@ -435,12 +475,41 @@ impl App {
             Some(Capability::Range { min, max, step }) => (min, max, step),
             _ => (100, 25600, 50),
         };
+        // A list sensor accepts only its own values: `Dpi::set` rejects
+        // anything else outright. A slider over an invented continuous range
+        // would offer nothing but commands the device refuses.
+        let stages: Option<Vec<u16>> = match &self.snap.dpi_cap {
+            Some(Capability::List(v)) => Some(v.clone()),
+            _ => None,
+        };
         if !self.dpi_touched && self.snap.dpi != 0 {
             self.dpi = self.snap.dpi;
         }
 
         if !self.snap.has_dpi {
             theme::section(ui, "Sensor", |ui| theme::unsupported(ui, "adjustable DPI"));
+        } else if let Some(stages) = stages {
+            theme::section(ui, "Sensor", |ui| {
+                theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+                ui.add_space(10.0);
+                if stages.is_empty() {
+                    theme::hint(ui, "The sensor reported no DPI values, so there is \
+                                     nothing to choose from here.");
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for v in &stages {
+                        if ui.selectable_label(self.snap.dpi == *v, format!("{v}")).clicked() {
+                            self.dpi = *v;
+                            self.dpi_touched = false;
+                            self.dev.send(Cmd::SetDpi(*v));
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+                theme::hint(ui, "This sensor reports fixed stages rather than a range, \
+                                 so these are the only values it accepts.");
+            });
         } else {
         theme::section(ui, "Sensor", |ui| {
             theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
@@ -448,6 +517,12 @@ impl App {
             let resp = ui.add(
                 egui::Slider::new(&mut self.dpi, min..=max)
                     .step_by(step as f64)
+                    // Not the default `Always`: that clamps and step-snaps the
+                    // existing value during the paint pass and reports it as
+                    // changed, which the code below would send to the device.
+                    // A mouse whose DPI is off this grid would be rewritten by
+                    // nothing more than the window being drawn.
+                    .clamping(egui::SliderClamping::Edits)
                     .show_value(false),
             );
             if resp.changed() {
@@ -633,7 +708,25 @@ impl App {
                         led::CYCLE => Led::cycle(self.period_ms, self.intensity),
                         _ => Led::fixed(c),
                     };
-                    self.dev.send(Cmd::PersistLighting { leds: [rec, rec] });
+                    // This writes flash. With one zone selected, keep the
+                    // other exactly as the mouse already stores it: pushing
+                    // this record into both slots silently discarded stored
+                    // lighting the user never touched. Record slot and zone
+                    // position line up, which is the same pairing the profile
+                    // editor uses.
+                    let stored = self
+                        .snap
+                        .profiles
+                        .get(self.snap.active_profile as usize)
+                        .map(|p| p.leds);
+                    let leds = match (self.all_zones, stored) {
+                        (false, Some(mut keep)) if self.zone_sel < keep.len() => {
+                            keep[self.zone_sel] = rec;
+                            keep
+                        }
+                        _ => [rec, rec],
+                    };
+                    self.dev.send(Cmd::PersistLighting { leds });
                 }
             });
             ui.add_space(8.0);
@@ -816,6 +909,15 @@ impl App {
             return;
         };
 
+        // A pending choice belongs to the profile it was made against. Left
+        // over across a switch it shows up as a change to this profile that
+        // the user never made, with Apply already armed — and Apply writes
+        // flash.
+        if self.btn_profile != Some(idx) {
+            self.btn_action.clear();
+            self.btn_profile = Some(idx);
+        }
+
         let mut choices: Vec<String> = SPECIALS.iter().map(|(_, n)| n.to_string()).collect();
         for n in 1..=5u8 {
             choices.push(format!("button {n}"));
@@ -962,12 +1064,37 @@ impl App {
         });
         ui.add_space(14.0);
         theme::section(ui, "What this hardware can and cannot do", |ui| {
+            // Read off the attached device, not written in. These lines claim
+            // facts about the mouse in front of the user, and this app has no
+            // model whitelist, so a fixed list of numbers would be a lie on
+            // anything but the one it was written for.
+            let modes: Vec<&str> = self
+                .snap
+                .zones
+                .first()
+                .map(|z| z.modes.iter().map(|m| led::mode_name(*m)).collect())
+                .unwrap_or_default();
+            let lighting = if modes.is_empty() {
+                "This device reports no lighting zones.".to_string()
+            } else {
+                format!("The firmware implements {} lighting modes: {}.",
+                        modes.len(), modes.join(", "))
+            };
+            let dpi = match &self.snap.dpi_cap {
+                Some(Capability::Range { min, max, step }) =>
+                    format!("DPI is continuous, {min}-{max} in steps of {step}."),
+                Some(Capability::List(v)) if !v.is_empty() => format!(
+                    "DPI comes in fixed stages: {}.",
+                    v.iter().map(|d| d.to_string()).collect::<Vec<_>>().join(", ")
+                ),
+                _ => "This device did not report what DPI values it accepts.".to_string(),
+            };
             for line in [
-                "The firmware implements four lighting modes: off, fixed, breathing, cycle.",
-                "Wave, starlight, ripple and frame streaming are in HID++ but absent here.",
+                lighting.as_str(),
+                "Wave, starlight, ripple and frame streaming are in HID++ but may be absent.",
                 "Only fixed and breathing can be set live; cycle has to be stored or streamed.",
                 "Animated effects are streamed from this app and stop when it stops.",
-                "DPI is continuous, 100-25600 in steps of 50.",
+                dpi.as_str(),
                 "Report rate cannot be set live in onboard mode, so it is written to flash.",
                 "Surface tuning and lift-off distance are out of scope: they sit behind",
                 "engineering-flagged features that can brick the mouse.",

@@ -26,8 +26,13 @@ impl Capability {
                 if dpi < *min || dpi > *max {
                     return Err(Error::Protocol(format!("dpi {dpi} outside {min}-{max}")));
                 }
-                let steps = ((dpi - min) as f32 / *step as f32).round() as u16;
-                Ok(min + steps * step)
+                // In u32, and clamped: a device whose range is not a whole
+                // number of steps would otherwise round the top of the range
+                // up past max, and a wide range with a coarse step overflows
+                // a u16 on the way.
+                let steps = ((dpi - min) as f32 / *step as f32).round() as u32;
+                let snapped = (*min as u32 + steps * *step as u32).min(*max as u32);
+                Ok(snapped as u16)
             }
             Capability::List(v) => {
                 if v.contains(&dpi) {
