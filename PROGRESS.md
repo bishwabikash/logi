@@ -95,3 +95,37 @@ Each of these cost real debugging; they are written up in PROTOCOL.md.
   setters. It has caused two incidents here. Resolve each function first.
 * Profile sector DPI stages are little-endian; the sector CRC is big-endian
   CRC-16/CCITT-FALSE over bytes 0..253.
+
+## Next: the app should follow the device live
+
+Today nothing the mouse does on its own reaches the app. The worker waits for
+commands and only re-reads state after running one, so pressing the DPI button
+on the mouse, or the background service switching profile for a rule, leaves
+the GUI and the tray showing the old value until something is clicked.
+
+**What the hardware offers.** Per Solaar's notification handler, 0x8100
+announces two things unprompted: the current profile changed (byte 3 = 0x00,
+payload a big-endian u16 profile sector) and the current DPI index changed
+(byte 3 = 0x10, payload the new stage index). The event carries the index, not
+the DPI, so the value still has to be read afterwards. Nothing else in the
+references announces a DPI change. **Not yet confirmed on a G502 HERO.**
+
+**Design.**
+* A listener thread on `Device::open_listener()`, because `call` drains the
+  queue before every request and would eat events on the control handle. It
+  decodes 0x8100 events and nudges the worker.
+* The worker stays the only owner of the control handle: on a nudge it re-reads
+  the cheap state (about five round trips) and publishes. No outcome is
+  recorded, since nobody asked.
+* A slow reconcile poll while idle, as the safety net: events might not fire in
+  every mode, and other software (or the service in another process) can change
+  state too. Publish only when something actually differs.
+* Skip both while an effect owns the device.
+* Show which DPI stage is active, not just the number.
+* The GUI already repaints every 500 ms and reads the snapshot each frame, and
+  the tray is fed from the same snapshot, so neither needs to change.
+
+**Waiting on:** the review workflow, which is editing device.rs, hidpp.rs and
+gui/mod.rs. Building on files other agents are mid-edit in is how two earlier
+rounds ended with a tree that would not compile.
+
