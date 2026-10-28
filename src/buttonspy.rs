@@ -7,8 +7,10 @@
 //!     unmaps every button: the mouse still moves but nothing clicks, in
 //!     either memory mode, and it survives unplugging. That happened during
 //!     development. So `set_remapping` refuses an all-zero table, `new()`
-//!     captures the table before anything else so there is always something to
-//!     restore, and `restore_identity` exists to dig a device out of that hole.
+//!     captures the table before anything else so a restore has a target, and
+//!     `restore_identity` exists to dig a device out of that hole. That last
+//!     one is the escape hatch, so it is deliberately the one operation here
+//!     that needs nothing but the button count.
 //!   * Function 1 is `startSpy`, not a getter, and function 4 is a setter.
 //!     Never sweep this feature's functions with empty parameters.
 //!
@@ -41,17 +43,26 @@ pub const IDENTITY: [u8; 16] = [
 pub struct ButtonSpy {
     idx: u8,
     count: u8,
-    saved: Vec<u8>,
+    /// The table as `new()` found it, or None when that read did not answer.
+    ///
+    /// None is survivable on purpose. `restore_identity` is the escape hatch
+    /// for a mouse that cannot click, and it needs only `count`, so one
+    /// dropped reply to `getRemapping` must not be what stands between the
+    /// user and a working mouse. What None does forbid is `silence` and
+    /// `restore`: both would have to invent a restore target, and inventing
+    /// one means either leaving a button dead or flattening a remapping the
+    /// device genuinely carries.
+    saved: Option<Vec<u8>>,
 }
 
 impl ButtonSpy {
     /// Read the button count and snapshot the remapping table.
     ///
     /// The snapshot happens before anything else is sent, so a later
-    /// `restore` always has a target. The snapshot is run through the write
-    /// gate and replaced by IDENTITY if it fails it: a table the gate would
-    /// refuse is not a restore target at all, and a device already zeroed by
-    /// something else must not have that state preserved and written back.
+    /// `restore` has a target. The snapshot is run through the write gate and
+    /// replaced by IDENTITY if it fails it: a table the gate would refuse is
+    /// not a restore target at all, and a device already zeroed by something
+    /// else must not have that state preserved and written back.
     ///
     /// Any *individual* zero is healed back to its own button for the same
     /// reason. A zero means that button is dead, the table is non-volatile, and
@@ -59,6 +70,14 @@ impl ButtonSpy {
     /// was killed before it could restore. Keeping that zero would make the
     /// restore target itself carry a dead button, so the only way out would be
     /// `logi bind reset`.
+    ///
+    /// A snapshot that does not answer is *not* fatal, and that is the whole
+    /// point of `saved` being an Option. Both recovery paths — `logi bind
+    /// reset` and the panel's restore button — construct a ButtonSpy and then
+    /// call `restore_identity`, which needs only the count. Failing here on a
+    /// single lost `getRemapping` reply would take the escape hatch away from
+    /// exactly the device that needs it: one whose buttons do nothing. The
+    /// count stays fatal, because without it no table can be built at all.
     pub fn new(dev: &mut Device) -> Result<Self> {
         let idx = dev.feature_index(features::MOUSE_BUTTON_SPY)?;
         let p = dev.call(idx, GET_NB_OF_BUTTONS, &[])?;
@@ -68,10 +87,9 @@ impl ButtonSpy {
                 "0x8110 reports {count} buttons, which cannot be right"
             )));
         }
-        let mut me = ButtonSpy { idx, count, saved: Vec::new() };
-        let live = me.get_remapping(dev)?;
-        me.saved = restorable(live, count);
-        Ok(me)
+        let probe = ButtonSpy { idx, count, saved: None };
+        let live = probe.get_remapping(dev).ok();
+        Ok(ButtonSpy { idx, count, saved: live.map(|t| restorable(t, count)) })
     }
 
     /// The feature index on this device. Events carry it in byte 2; it is not
@@ -84,9 +102,28 @@ impl ButtonSpy {
         self.count
     }
 
-    /// The remapping table as it was when new() ran. The restore target.
-    pub fn saved_remapping(&self) -> &[u8] {
-        &self.saved
+    /// The remapping table as it was when new() ran. The restore target, or
+    /// None if that read did not answer.
+    pub fn saved_remapping(&self) -> Option<&[u8]> {
+        self.saved.as_deref()
+    }
+
+    /// The restore target, or the reason there is none.
+    ///
+    /// Everything that writes a table built from the device's own state goes
+    /// through here, so a missing snapshot refuses the write rather than
+    /// guessing. The message names the escape hatch because that is the one
+    /// thing still available.
+    fn snapshot(&self) -> Result<&[u8]> {
+        self.saved.as_deref().ok_or_else(|| {
+            Error::Protocol(
+                "could not read the button remapping table when this device \
+                 was opened, so there is nothing to restore it to and nothing \
+                 has been silenced. Try again, or run `logi bind reset` to put \
+                 the factory mapping back."
+                    .into(),
+            )
+        })
     }
 
     pub fn start(&self, dev: &mut Device) -> Result<()> {
@@ -151,7 +188,7 @@ impl ButtonSpy {
     /// is worse than one left un-silenced.
     pub fn silence(&self, dev: &mut Device, buttons: &[u8]) -> Result<()> {
         check_buttons(buttons, self.count)?;
-        let want = silence_table(&self.saved, buttons);
+        let want = silence_table(self.snapshot()?, buttons);
         check_table(&want, self.count)?;
         if self.get_remapping(dev)? == want {
             return Ok(());
@@ -165,9 +202,10 @@ impl ButtonSpy {
 
     /// Put the table back to what new() saved. Must be callable repeatedly,
     /// and cannot be refused by the gate: new() only ever saves a table the
-    /// gate accepts.
+    /// gate accepts. Errors only if there was no snapshot to save, which is
+    /// also the case where nothing was ever silenced.
     pub fn restore(&self, dev: &mut Device) -> Result<()> {
-        self.set_remapping(dev, &self.saved)
+        self.set_remapping(dev, self.snapshot()?)
     }
 
     /// Force the factory identity table, for recovering a device whose table
@@ -463,6 +501,34 @@ mod tests {
         for live in [factory(), vec![0u8; 11], vec![0xff; 11], vec![], vec![1, 2]] {
             check_table(&restorable(live, 11), 11).unwrap();
         }
+    }
+
+    #[test]
+    fn a_read_snapshot_is_what_silence_and_restore_build_on() {
+        let spy = ButtonSpy { idx: 0x0d, count: 11, saved: Some(factory()) };
+        assert_eq!(spy.saved_remapping(), Some(factory().as_slice()));
+        assert_eq!(spy.snapshot().unwrap(), factory().as_slice());
+    }
+
+    #[test]
+    fn a_failed_snapshot_blocks_silencing_but_not_the_escape_hatch() {
+        // What `new()` builds when getRemapping does not answer. Erroring out
+        // of `new()` instead would take `logi bind reset` and the panel's
+        // restore button away from the one device that needs them: both go
+        // through ButtonSpy::new, and both want only restore_identity.
+        let blind = ButtonSpy { idx: 0x0d, count: 11, saved: None };
+        assert_eq!(blind.saved_remapping(), None);
+
+        // Nothing that has to invent a restore target may proceed: guessing
+        // would either leave a button dead or flatten a remapping the device
+        // genuinely carries.
+        let e = blind.snapshot().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("nothing has been silenced"), "{msg}");
+        assert!(msg.contains("logi bind reset"), "{msg}");
+
+        // restore_identity needs only the count, so it is still writable.
+        check_table(&IDENTITY[..blind.count as usize], blind.count).unwrap();
     }
 
     #[test]

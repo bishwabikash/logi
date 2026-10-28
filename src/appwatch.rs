@@ -533,9 +533,36 @@ mod tests {
 
     #[test]
     fn scanning_proc_finds_this_process() {
+        // `/proc/self/comm` is the process's name, not the calling thread's,
+        // so this is the same string the scan reads back for our own pid.
+        let me = fs::read_to_string("/proc/self/comm")
+            .expect("/proc/self/comm")
+            .trim()
+            .to_string();
         let ps = scan_processes();
         assert!(!ps.is_empty(), "/proc scan returned nothing");
-        // the test binary itself must be in there somewhere
-        assert!(ps.iter().any(|p| !p.comm.is_empty()));
+        // Asserting only that some entry had a non-empty `comm` proved
+        // nothing: `scan_processes` skips the ones that do not, so that held
+        // however much of /proc the scan had missed.
+        assert!(
+            ps.iter().any(|p| p.comm == me),
+            "the scan did not find this process ({me:?})"
+        );
+    }
+
+    #[test]
+    fn a_scanned_process_is_matchable() {
+        // The two halves have to fit: whatever `scan_processes` puts in `comm`
+        // is what a rule's pattern is tested against.
+        let ps = scan_processes();
+        let me = fs::read_to_string("/proc/self/comm")
+            .expect("/proc/self/comm")
+            .trim()
+            .to_string();
+        let c = cfg(vec![Rule::new(me.to_ascii_uppercase(), 1)], None);
+        assert!(
+            select(&c, &ps).is_some(),
+            "a rule naming a running process did not match it"
+        );
     }
 }

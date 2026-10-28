@@ -472,6 +472,36 @@ fn read_state(l: &mut Live, into: &mut Snapshot) {
     }
 }
 
+/// Decode a run of sector reads into profiles, one slot per profile index.
+///
+/// Position in `Snapshot::profiles` *is* the profile index. It is the number
+/// the editor labels, the slot the Lighting panel reads the stored LED records
+/// out of before `Cmd::PersistLighting`, and the index the editor hands back
+/// in `Cmd::WriteProfile`. So a sector that will not read or will not decode
+/// has to end the run rather than be skipped: skipping it slid every later
+/// profile down one slot, which showed profile 3 under "profile 2" and wrote
+/// profile 3's edits into profile 2's sector. One transient `busy` or one
+/// short memoryRead reply was enough. Stopping short leaves the tail absent
+/// instead, which every panel already renders as "not read off the mouse yet;
+/// press Refresh".
+///
+/// Lazy on purpose: the iterator only issues the next read when this asks for
+/// one, so a device that has stopped answering is not ground through four more
+/// profiles at 16 calls and 800ms apiece — close to a minute in which no
+/// queued command runs.
+fn decode_profiles(
+    sectors: impl IntoIterator<Item = crate::hidpp::Result<Vec<u8>>>,
+) -> Vec<Profile> {
+    let mut out = Vec::new();
+    for read in sectors {
+        match read.map(|blob| Profile::parse(&blob)) {
+            Ok(Ok(parsed)) => out.push(parsed),
+            _ => break,
+        }
+    }
+    out
+}
+
 /// The expensive part: every profile sector, 80 round trips. Only worth doing
 /// on an explicit refresh or after something wrote flash.
 fn read_profiles(l: &mut Live, into: &mut Snapshot) {
@@ -480,29 +510,64 @@ fn read_profiles(l: &mut Live, into: &mut Snapshot) {
     // different one, and guessing at it would print nonsense.
     if p.info.profile_format_id == 2 && p.info.sector_size as usize == crate::profile_blob::SECTOR_SIZE
     {
-        let mut out = Vec::new();
-        for i in 0..into.profile_count {
-            match p.read_sector(&mut l.dev, i as u16 + 1, None) {
-                Ok(blob) => {
-                    if let Ok(parsed) = Profile::parse(&blob) {
-                        out.push(parsed);
-                    }
-                }
-                // A device that has stopped answering will not answer the
-                // next sector either, and one sector is 16 calls at 800ms
-                // apiece. Grinding through the remaining four is a minute in
-                // which no queued command runs. A malformed reply is
-                // different: that is one bad sector, so keep reading.
-                Err(crate::hidpp::Error::Timeout { .. })
-                | Err(crate::hidpp::Error::Io(_)) => break,
-                Err(_) => {}
-            }
-        }
+        let count = into.profile_count;
+        let dev = &mut l.dev;
+        let out = decode_profiles((0..count).map(|i| p.read_sector(dev, i as u16 + 1, None)));
         if !out.is_empty() {
             into.profiles = out;
         }
     }
     l.profiles = Some(p);
+}
+
+/// Write a sector dump to `path`, or leave the file alone and say why.
+///
+/// Both guards here are the ones `logi backup` already carries, and the GUI's
+/// Backup button needs them more: it defaults to one fixed path, so it is the
+/// same file every time, and it sits next to the controls that write flash —
+/// it is the way back from them. Being told "backup written" over a file that
+/// no longer holds a usable backup is the worst outcome available.
+///
+/// `dump_all` records a sector it could not read as absent rather than
+/// failing, so a dump can come back entirely empty without any error.
+fn write_backup(
+    path: &str,
+    model: &str,
+    dump: &[(u16, Option<Vec<u8>>)],
+) -> crate::hidpp::Result<Option<String>> {
+    let readable = dump.iter().filter(|(_, d)| d.is_some()).count();
+    // A dump where every sector is absent is not a backup — `restore` rejects
+    // one — so writing it can only destroy the good backup already there.
+    if readable == 0 {
+        return Err(crate::hidpp::Error::Protocol(format!(
+            "no sector could be read, so {path} was left alone"
+        )));
+    }
+    // Written beside the target and renamed into place. `fs::write` truncates
+    // first, so a write that failed or was interrupted halfway left the user
+    // with neither the old backup nor a usable new one.
+    let tmp = format!("{path}.part");
+    let wrote = std::fs::write(&tmp, profile_io::dump_to_json(model, dump))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&tmp);
+        // Not Error::Io: that is the class the worker loop reads as "the
+        // device vanished", so an unwritable backup path used to drop a
+        // perfectly good handle and pay for a full reconnect and re-read.
+        return Err(crate::hidpp::Error::Protocol(format!("writing {path}: {e}")));
+    }
+    // A partial backup is still worth keeping, but the user has to know it is
+    // partial before they trust it as the way back from a flash write.
+    Ok(Some(if readable < dump.len() {
+        format!(
+            "backup written to {path}; {} of {} sectors would not read and are \
+             recorded as absent",
+            dump.len() - readable,
+            dump.len()
+        )
+    } else {
+        format!("backup written to {path}")
+    }))
 }
 
 /// Hand the worker's snapshot to the UI.
@@ -722,21 +787,11 @@ fn worker(
                         .map(|_| Some(format!("profile {index} written to flash")))
                 })
             }
-            Cmd::Backup(path) => {
-                feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+            Cmd::Backup(path) => feat!(l, profiles, "onboard profiles")
+                .and_then(|(p, dev)| {
                     let dump = profile_io::dump_all(dev, p);
-                    let json = profile_io::dump_to_json(&name_for_backup, &dump);
-                    std::fs::write(&path, json)
-                        .map(|_| Some(format!("backup written to {path}")))
-                        // Not Error::Io: that is the class this loop reads as
-                        // "the device vanished", so an unwritable backup path
-                        // used to drop a perfectly good handle and pay for a
-                        // full reconnect and re-read.
-                        .map_err(|e| {
-                            crate::hidpp::Error::Protocol(format!("writing {path}: {e}"))
-                        })
-                })
-            }
+                    write_backup(&path, &name_for_backup, &dump)
+                }),
             Cmd::StartEffect { name, color, period_ms } => {
                 match effects::start(name.clone(), color, period_ms) {
                     Ok(r) => {
@@ -814,10 +869,142 @@ fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::profile_blob::{Button, Led, LED_RECORD};
+    use crate::profile_blob::{Button, Led, LED_RECORD, OFF_CRC, OFF_RATE, SECTOR_SIZE};
 
     fn ok(id: CmdId, kind: CmdKind) -> Outcome {
         Outcome::ok(id, kind, Some(format!("outcome {id}")))
+    }
+
+    /// A decodable format-2 sector, tagged in the report-rate byte so one
+    /// profile can be told apart from another by the slot it lands in.
+    fn sector(tag: u8) -> Vec<u8> {
+        let mut b = vec![0xFFu8; SECTOR_SIZE];
+        b[OFF_RATE] = tag;
+        let crc = crate::profile_blob::crc_ccitt(&b[..OFF_CRC]);
+        b[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn a_refused_sector_truncates_the_profiles_instead_of_shifting_them() {
+        // Position is the profile index everywhere that matters: the label in
+        // the editor, the slot the Lighting panel reads stored LED records
+        // out of, and the index `Cmd::WriteProfile` carries back to flash.
+        // Dropping the refused sector and carrying on slid 4 and 5 into slots
+        // 3 and 4, so saving slot 3 wrote profile 4's edits over profile 3.
+        let reads = vec![
+            Ok(sector(1)),
+            Ok(sector(2)),
+            Err(crate::hidpp::Error::Device { code: 0x08, feature: 0x0f, function: 5 }),
+            Ok(sector(4)),
+            Ok(sector(5)),
+        ];
+        let got = decode_profiles(reads);
+        assert_eq!(got.len(), 2, "the tail must be absent, not renumbered");
+        assert_eq!(got[0].report_rate_ms, 1);
+        assert_eq!(got[1].report_rate_ms, 2);
+    }
+
+    #[test]
+    fn a_sector_that_will_not_decode_ends_the_run_too() {
+        // A short memoryRead reply is the other way a slot goes missing, and
+        // it shifts the tail exactly the same way.
+        let reads = vec![Ok(sector(1)), Ok(vec![0u8; 17]), Ok(sector(3))];
+        let got = decode_profiles(reads);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].report_rate_ms, 1);
+    }
+
+    #[test]
+    fn decode_profiles_stops_reading_once_a_sector_fails() {
+        // One sector is 16 calls at the 800ms default timeout, so asking a
+        // device that has stopped answering for four more profiles is close to
+        // a minute in which the worker runs nothing that is queued.
+        let mut asked = 0usize;
+        let got = decode_profiles((0..5).map(|i| {
+            asked += 1;
+            if i < 2 {
+                Ok(sector(i as u8 + 1))
+            } else {
+                Err(crate::hidpp::Error::Timeout { feature: 0x0f, function: 5 })
+            }
+        }));
+        assert_eq!(got.len(), 2);
+        assert_eq!(asked, 3, "the sectors after the failure were still read");
+    }
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logi-device-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn full_dump() -> Vec<(u16, Option<Vec<u8>>)> {
+        (0..6u16).map(|i| (i, Some(sector(i as u8)))).collect()
+    }
+
+    #[test]
+    fn a_backup_with_no_readable_sector_leaves_the_old_one_alone() {
+        // The Backup button defaults to one fixed path, so this is the same
+        // file every time, and it is the way back from a flash write. Writing
+        // a dump with nothing in it — `restore` refuses one — over a good
+        // backup and reporting success is the worst outcome available.
+        let dir = temp_dir("backup-empty");
+        let path = dir.join("logi-backup.json");
+        std::fs::write(&path, "the good backup").unwrap();
+        let empty: Vec<(u16, Option<Vec<u8>>)> = (0..6u16).map(|i| (i, None)).collect();
+
+        let err = write_backup(path.to_str().unwrap(), "G502", &empty).unwrap_err();
+        assert!(
+            matches!(err, crate::hidpp::Error::Protocol(_)),
+            "a filesystem or dump problem must not read as a vanished device: {err:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "the good backup");
+    }
+
+    #[test]
+    fn a_backup_lands_whole_and_leaves_no_part_file() {
+        let dir = temp_dir("backup-whole");
+        let path = dir.join("logi-backup.json");
+        let msg = write_backup(path.to_str().unwrap(), "G502", &full_dump())
+            .unwrap()
+            .unwrap();
+        assert!(msg.contains("backup written"), "{msg}");
+        assert!(!msg.contains("absent"), "a whole backup must not warn: {msg}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"model\": \"G502\""), "{text}");
+        assert!(!dir.join("logi-backup.json.part").exists());
+    }
+
+    #[test]
+    fn a_partial_backup_is_kept_but_says_so() {
+        // Worth keeping — restoring it leaves the unread sectors as they are —
+        // but a user about to write flash has to know it is not the whole
+        // device before they treat it as the way back.
+        let dir = temp_dir("backup-partial");
+        let path = dir.join("logi-backup.json");
+        let mut dump = full_dump();
+        dump[3].1 = None;
+        dump[4].1 = None;
+        let msg = write_backup(path.to_str().unwrap(), "G502", &dump).unwrap().unwrap();
+        assert!(msg.contains("2 of 6 sectors"), "{msg}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn an_unwritable_path_is_not_reported_as_a_lost_device() {
+        // The worker reads Error::Io as "the mouse vanished" and drops the
+        // device handle, which costs a reconnect and an 80-round-trip re-read
+        // and tells the user about a disconnect that never happened.
+        let dir = temp_dir("backup-unwritable");
+        let path = dir.join("no-such-directory/logi-backup.json");
+        let err = write_backup(path.to_str().unwrap(), "G502", &full_dump()).unwrap_err();
+        assert!(matches!(err, crate::hidpp::Error::Protocol(_)), "{err:?}");
+        // The half-written temporary must not be left behind as litter that
+        // looks like a backup.
+        assert!(!dir.join("no-such-directory").exists());
     }
 
     #[test]

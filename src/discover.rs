@@ -122,6 +122,26 @@ pub fn list_devices() -> Vec<Found> {
     found
 }
 
+/// Strip `prefix` from the front of `s`, ignoring case. `s` is returned
+/// unchanged when it does not start with it.
+fn strip_ci<'a>(s: &'a str, prefix: &str) -> &'a str {
+    match s.get(..prefix.len()) {
+        Some(head) if head.eq_ignore_ascii_case(prefix) => &s[prefix.len()..],
+        _ => s,
+    }
+}
+
+/// Reduce a device id to the bare four hex digits of the product id.
+///
+/// The vendor prefix and an `0x` are both optional, and neither case nor
+/// surrounding whitespace is significant. The comparison against the device's
+/// own id is case-insensitive, so the prefix has to be matched the same way:
+/// `Found::id` hands out the lowercase form, but someone typing an id back
+/// into `$G502_DEVICE` has no reason to know which case it was in.
+fn wanted_pid(want: &str) -> &str {
+    strip_ci(strip_ci(want.trim(), "046d:"), "0x")
+}
+
 /// Open one device: the only one present, or the one whose id matches `want`
 /// (e.g. "046d:c08b").
 pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
@@ -141,10 +161,10 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
         }
     }
     let mut permission_problem = None;
+    let target = want.map(wanted_pid);
 
     for (path, pid) in cands {
-        if let Some(w) = want {
-            let w = w.trim_start_matches("046d:").trim_start_matches("0x");
+        if let Some(w) = target {
             if !format!("{pid:04x}").eq_ignore_ascii_case(w) {
                 continue;
             }
@@ -181,4 +201,45 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
 
 pub fn open_device() -> Result<Found> {
     open_device_matching(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_id_is_matched_whatever_case_it_is_typed_in() {
+        // `Found::id` hands out the lowercase form, but the id also appears in
+        // lsusb output and in the user's own notes. Every spelling of the same
+        // device has to reduce to the same product id.
+        for w in ["046d:c08b", "046D:C08B", "046d:C08B", "c08b", "C08B", "0xc08b", " 046d:c08b "]
+        {
+            assert!(
+                wanted_pid(w).eq_ignore_ascii_case("c08b"),
+                "{w:?} did not reduce to the product id, so it would match no device"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_logitech_prefix_is_left_alone() {
+        // Only 046d is ever discovered, so another vendor's prefix must not be
+        // silently stripped and read as a product id.
+        assert_eq!(wanted_pid("1532:c08b"), "1532:c08b");
+    }
+
+    #[test]
+    fn stripping_a_prefix_does_not_split_a_character() {
+        // The id comes from the environment, so it can be arbitrary text.
+        assert_eq!(wanted_pid("\u{00e9}\u{00e9}\u{00e9}"), "\u{00e9}\u{00e9}\u{00e9}");
+        assert_eq!(wanted_pid("0\u{00e9}"), "0\u{00e9}");
+    }
+
+    #[test]
+    fn fallback_names_are_only_a_last_resort() {
+        // An untested device must still get a usable label rather than an
+        // empty string, and no model entry may claim to be the generic one.
+        assert_eq!(fallback_name(0x0000), "Logitech HID++ device");
+        assert_ne!(fallback_name(0xC08B), fallback_name(0x0000));
+    }
 }

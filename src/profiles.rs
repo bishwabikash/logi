@@ -126,7 +126,7 @@ impl OnboardProfiles {
         if index >= self.info.profile_count {
             return Err(Error::Protocol(format!(
                 "profile {index} out of range 0..{}",
-                self.info.profile_count - 1
+                self.info.profile_count.saturating_sub(1)
             )));
         }
         dev.call(self.idx, SET_CURRENT_PROFILE, &[0x00, index + 1])?;
@@ -163,7 +163,8 @@ impl OnboardProfiles {
             let want = (length - offset).min(16);
             if p.len() < want {
                 return Err(Error::Protocol(format!(
-                    "short memoryRead reply for sector {sector} at offset {offset}:                      {} bytes, wanted {want}",
+                    "short memoryRead reply for sector {sector} at offset {offset}: \
+                     {} bytes, wanted {want}",
                     p.len()
                 )));
             }

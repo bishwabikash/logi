@@ -51,6 +51,20 @@ fn check_writable(p: &OnboardProfiles) -> Result<()> {
     Ok(())
 }
 
+/// Whether a sector's trailing CRC matches the rest of it.
+fn sector_crc_ok(data: &[u8]) -> bool {
+    data.len() == SECTOR_SIZE
+        && u16::from_be_bytes([data[profile_blob::OFF_CRC], data[profile_blob::OFF_CRC + 1]])
+            == profile_blob::crc_ccitt(&data[..profile_blob::OFF_CRC])
+}
+
+/// Whether a sector holds a profile in the layout this codec decodes. Profile
+/// N is sector N + 1; sector 0 is the directory and the sectors past the
+/// profiles hold macros, neither of which is decoded here.
+fn is_profile_sector(profile_count: u8, sector: u16) -> bool {
+    sector >= 1 && sector <= profile_count as u16
+}
+
 /// Stamp a correct CRC over the payload, ignoring whatever the caller left in
 /// the last two bytes.
 pub fn stamp_crc(data: &[u8]) -> Result<[u8; SECTOR_SIZE]> {
@@ -68,6 +82,12 @@ pub fn stamp_crc(data: &[u8]) -> Result<[u8; SECTOR_SIZE]> {
 }
 
 /// Write one sector and verify the readback. Returns the bytes written.
+///
+/// `data` goes down exactly as given, CRC included. That is deliberate: this
+/// is also the path a backup is restored through, and restamping the last two
+/// bytes of a sector that came off the device would turn a corruption nobody
+/// noticed into one the device accepts. Callers that build a sector stamp it
+/// themselves; `write_profile` does.
 pub fn write_sector(
     dev: &mut Device,
     profiles: &OnboardProfiles,
@@ -78,11 +98,28 @@ pub fn write_sector(
     if sector >= profiles.info.sector_count as u16 {
         return Err(Error::Protocol(format!(
             "sector {sector} out of range 0..{}",
-            profiles.info.sector_count - 1
+            profiles.info.sector_count.saturating_sub(1)
         )));
     }
-    let payload = stamp_crc(data)?;
+    if data.len() != SECTOR_SIZE {
+        return Err(Error::Protocol(format!(
+            "sector must be {SECTOR_SIZE} bytes, got {}",
+            data.len()
+        )));
+    }
+    let mut payload = [0u8; SECTOR_SIZE];
+    payload.copy_from_slice(data);
     let idx = profiles.feature_index();
+
+    // Flash has finite endurance, so a write that asks for what is already
+    // stored must not cost an erase cycle. The comparison is against the
+    // device and not against whatever the caller last read, because every
+    // write funnels through here and some callers arrive with a sector they
+    // staged earlier or with a button the user pressed twice. A read that
+    // fails tells us nothing, so it falls through and writes.
+    if profiles.read_sector(dev, sector, None).ok().as_deref() == Some(payload.as_slice()) {
+        return Ok(payload);
+    }
 
     let n = payload.len() as u16;
     let mut head = Vec::with_capacity(6);
@@ -142,7 +179,7 @@ pub fn write_profile(
     if index >= profiles.info.profile_count {
         return Err(Error::Protocol(format!(
             "profile {index} out of range 0..{}",
-            profiles.info.profile_count - 1
+            profiles.info.profile_count.saturating_sub(1)
         )));
     }
     // `serialize` passes the sector's unmodelled bytes straight through, so a
@@ -156,7 +193,9 @@ pub fn write_profile(
              Restore a backup first."
         )));
     }
-    write_sector(dev, profiles, index as u16 + 1, &profile.serialize())
+    // write_sector writes verbatim, so the CRC is stamped here, over the
+    // sector this codec just built.
+    write_sector(dev, profiles, index as u16 + 1, &stamp_crc(&profile.serialize())?)
 }
 
 /// Every readable sector, for a backup. Unreadable sectors are recorded as
@@ -221,15 +260,21 @@ pub fn dump_from_json(text: &str) -> Result<Vec<(u16, Vec<u8>)>> {
         if val == "null" {
             continue;
         }
-        let hex = val.trim_matches('"');
+        // Taken byte by byte rather than by slicing the &str: one stray
+        // multi-byte character in a hand-edited or half-copied backup puts
+        // `hex[i..i + 2]` inside a character, and the panic that follows is a
+        // crash where the user should have been told the file is bad.
+        let hex = val.trim_matches('"').as_bytes();
         if hex.len() % 2 != 0 {
             return Err(Error::Protocol(format!("sector {sector}: odd hex length")));
         }
-        let bytes: Result<Vec<u8>> = (0..hex.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&hex[i..i + 2], 16)
-                    .map_err(|_| Error::Protocol(format!("sector {sector}: bad hex")))
+        let bytes: Result<Vec<u8>> = hex
+            .chunks(2)
+            .map(|pair| {
+                match ((pair[0] as char).to_digit(16), (pair[1] as char).to_digit(16)) {
+                    (Some(hi), Some(lo)) => Ok((hi * 16 + lo) as u8),
+                    _ => Err(Error::Protocol(format!("sector {sector}: bad hex"))),
+                }
             })
             .collect();
         out.push((sector, bytes?));
@@ -258,6 +303,18 @@ pub fn restore_all(
             return Err(Error::Protocol(format!(
                 "backup names sector {sector}, device has {}",
                 profiles.info.sector_count
+            )));
+        }
+        // A profile sector carries a CRC over its own contents, so a mismatch
+        // means the file is not what the device handed out: a flipped byte in
+        // the button table reads as a perfectly valid binding and leaves a
+        // mouse that moves but does not click. Checked before anything is
+        // written, so a bad file costs nothing.
+        if is_profile_sector(profiles.info.profile_count, *sector) && !sector_crc_ok(data) {
+            return Err(Error::Protocol(format!(
+                "sector {sector} of this backup does not match its own stored CRC, so \
+                 it is not the sector the mouse saved. Nothing was written. Use a \
+                 backup that checks out."
             )));
         }
     }
@@ -320,6 +377,28 @@ mod tests {
     }
 
     #[test]
+    fn a_stamped_sector_matches_its_own_crc() {
+        assert!(sector_crc_ok(&stamp_crc(&[0x5Au8; SECTOR_SIZE]).unwrap()));
+    }
+
+    #[test]
+    fn one_flipped_byte_fails_the_crc_check() {
+        let mut bad = stamp_crc(&[0x5Au8; SECTOR_SIZE]).unwrap();
+        bad[profile_blob::OFF_BUTTONS] ^= 0x01;
+        assert!(!sector_crc_ok(&bad), "a corrupt button table must not pass");
+        assert!(!sector_crc_ok(&bad[..200]), "a short sector has no CRC to match");
+    }
+
+    #[test]
+    fn profile_sectors_are_the_ones_after_the_directory() {
+        assert!(!is_profile_sector(5, 0), "sector 0 is the directory");
+        assert!(is_profile_sector(5, 1));
+        assert!(is_profile_sector(5, 5));
+        assert!(!is_profile_sector(5, 6), "past the profiles is macro space");
+        assert!(!is_profile_sector(0, 1), "a device claiming no profiles has none");
+    }
+
+    #[test]
     fn json_parse_rejects_empty() {
         assert!(dump_from_json("{}").is_err());
     }
@@ -327,6 +406,20 @@ mod tests {
     #[test]
     fn json_parse_rejects_odd_hex() {
         assert!(dump_from_json("{\n\"0\": \"abc\"\n}").is_err());
+    }
+
+    #[test]
+    fn json_parse_rejects_non_ascii_hex_without_panicking() {
+        // An even byte length whose second byte is inside a character: this
+        // used to panic on a non-boundary &str slice.
+        assert!(dump_from_json("{\n\"0\": \"a\u{0905}\"\n}").is_err());
+        assert!(dump_from_json("{\n\"1\": \"\u{00ff}\u{00ff}\"\n}").is_err());
+    }
+
+    #[test]
+    fn json_parse_rejects_a_signed_byte() {
+        // from_str_radix accepted "+f"; the sector bytes are plain hex.
+        assert!(dump_from_json("{\n\"0\": \"+f\"\n}").is_err());
     }
 }
 

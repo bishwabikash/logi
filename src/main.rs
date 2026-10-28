@@ -43,9 +43,15 @@ logi — control a Logitech mouse over HID++ 2.0
   logi profile show <n>       decode one stored profile
   logi led <spec>             lighting, live (needs host mode)
                                 off | <colour> | breathing <colour> | cycle
-  logi effect [list|<name>]   stream a host-side animation until Ctrl-C
+  logi effect [list|<name> [<colour>]]
+                              stream a host-side animation until Ctrl-C
   logi watch [--dry-run]      switch profiles per running application, from
                               ~/.config/logi/rules.conf
+  logi bind [list]            host actions bound to buttons, from
+                              ~/.config/logi/bindings.conf
+  logi bind run               act on those bindings until Ctrl-C
+  logi bind reset             put the factory button mapping back. The escape
+                              hatch if a button has stopped responding.
   logi backup <file>          dump every sector to JSON
   logi restore <file>         write a backup back to flash
   logi --help
@@ -107,6 +113,22 @@ impl From<Error> for CliError {
             )),
             other => CliError::Failed(other.to_string()),
         }
+    }
+}
+
+/// Refuse any `--flag` a command does not know.
+///
+/// Silently skipping one is not harmless here: for both commands that take a
+/// flag, the flag is what holds back the consequential behaviour. A mistyped
+/// `--live` writes a flash sector instead of setting the rate in RAM, and a
+/// mistyped `--dry-run` switches the user's profiles for real.
+fn reject_unknown_flags(args: &[String], known: &[&str]) -> Result<(), CliError> {
+    match args.iter().find(|a| a.starts_with("--") && !known.contains(&a.as_str())) {
+        Some(bad) => Err(CliError::Usage(format!(
+            "unknown option {bad:?}; this command takes {}",
+            known.join(" ")
+        ))),
+        None => Ok(()),
     }
 }
 
@@ -289,6 +311,12 @@ fn cmd_dpi(arg: Option<&String>) -> Result<(), CliError> {
 }
 
 fn cmd_rate(args: &[String]) -> Result<(), CliError> {
+    // Checked before the device is opened, and before anything is written.
+    // Every unrecognised flag used to be skipped silently, and the flag that
+    // got skipped decided whether the new rate went to RAM or to flash: `logi
+    // rate 500 --liv` quietly wrote the profile sector instead of setting the
+    // rate live.
+    reject_unknown_flags(args, &["--live"])?;
     let mut f = open()?;
     let dev = &mut f.device;
     let r = rate::ReportRate::new(dev)?;
@@ -326,8 +354,13 @@ fn cmd_rate(args: &[String]) -> Result<(), CliError> {
             } else {
                 let p = profiles::OnboardProfiles::new(dev)?;
                 let idx = p.current(dev)?;
+                // "stored in", not "written to": set_report_rate skips the
+                // flash write when the sector already holds this rate, and it
+                // does not say which of the two happened. Claiming a write
+                // that did not occur is the wrong way round to be wrong about
+                // flash.
                 profile_io::set_report_rate(dev, &p, idx, hz)?;
-                println!("{hz} (written to onboard profile {idx})");
+                println!("{hz} (stored in onboard profile {idx})");
             }
             Ok(())
         }
@@ -397,8 +430,12 @@ fn cmd_button(args: &[String]) -> Result<(), CliError> {
             ))
         })?,
     };
+    // Not "written to flash": set_button leaves the sector alone when it
+    // already holds this binding, and it does not report which way it went.
+    // The command does write flash, which is what USAGE says; this line is
+    // about one invocation, and it must not claim a write that did not happen.
     profile_io::set_button(dev, &p, idx, n, binding)?;
-    println!("button {n} -> {} (profile {idx}, written to flash)", binding.describe());
+    println!("button {n} -> {} (onboard profile {idx})", binding.describe());
     Ok(())
 }
 
@@ -544,7 +581,13 @@ fn cmd_effect(args: &[String]) -> Result<(), CliError> {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             running.stop();
-            println!("\nstopped; mouse returned to onboard mode");
+            // Not "returned to onboard mode". effects restores whichever mode
+            // it found, so after `logi led <colour>` — which leaves the mouse
+            // in host mode on purpose — this hands it back to host, and saying
+            // onboard would tell the user their stored profile is applied when
+            // it is not.
+            println!("\nstopped; the mouse is back in the mode it was in before");
+            println!("`logi mode` says which, and `logi mode onboard` applies its stored profile");
             Ok(())
         }
     }
@@ -618,6 +661,20 @@ fn nap(secs: u64) {
     nap_for(std::time::Duration::from_secs(secs));
 }
 
+/// The endpoint itself is broken, as opposed to the device answering with an
+/// error or not answering in time.
+///
+/// `hidpp` only raises `Io` from the node's own read, write or poll, so it
+/// means this file descriptor will never work again. That matters for the
+/// foreground commands, which hold one open handle and never reopen it: a loop
+/// that treats an unplug like a transient failure keeps polling /proc and
+/// re-reporting the same error for as long as the user leaves it running,
+/// looking for all the world like it is still watching. `logi serve` is the
+/// one that reconnects, and it does so by returning from serve_once.
+fn endpoint_gone(e: &hidpp::Error) -> bool {
+    matches!(e, hidpp::Error::Io(_))
+}
+
 /// A Keymap over uinput's tables, which is what actions.rs expects.
 fn keymap() -> actions::FnKeymap<fn(&str) -> Option<u16>, fn(u16) -> Option<String>> {
     actions::FnKeymap::new(
@@ -658,12 +715,35 @@ fn cmd_bind(args: &[String]) -> Result<(), CliError> {
         }
         Some("run") => cmd_bind_run(),
         None | Some("list") => {
-            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            // Only a file that is genuinely absent or genuinely blank gets the
+            // example written over it. `unwrap_or_default()` here conflated
+            // every other read failure with "empty": a bindings file with one
+            // stray non-UTF-8 byte in a `text` action, or one whose
+            // permissions had gone wrong, came back as "" and was then
+            // replaced by the example, and the user's bindings were gone.
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    return Err(CliError::Failed(format!(
+                        "reading {}: {e}\n\
+                         Left alone rather than overwritten with the example.",
+                        path.display()
+                    )))
+                }
+            };
             if text.trim().is_empty() {
                 if let Some(d) = path.parent() {
-                    let _ = std::fs::create_dir_all(d);
+                    std::fs::create_dir_all(d).map_err(|e| {
+                        CliError::Failed(format!("creating {}: {e}", d.display()))
+                    })?;
                 }
-                let _ = std::fs::write(&path, actions::EXAMPLE);
+                // Reported, not ignored: claiming the example was written when
+                // the write failed sends the user to edit a file that is not
+                // there.
+                std::fs::write(&path, actions::EXAMPLE).map_err(|e| {
+                    CliError::Failed(format!("writing {}: {e}", path.display()))
+                })?;
                 println!("Wrote an example binding file to {}.", path.display());
                 println!("Edit it, or use the Buttons tab in the app, then `logi bind run`.");
                 return Ok(());
@@ -807,7 +887,23 @@ fn cmd_serve() -> Result<(), CliError> {
             announced_idle = false;
             announced_problem = None;
         }
-        let rules = std::fs::read_to_string(&path).ok();
+        // A file that is there but unreadable is not the same as no file, and
+        // saying "no rules" about it sends the user to write an example over
+        // rules they already have. `.ok()` reported a wrong-permissions or
+        // non-UTF-8 rule file as absent and then idled on it forever.
+        let rules = match std::fs::read_to_string(&path) {
+            Ok(t) => Some(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                let msg = format!("reading {}: {e}", path.display());
+                if announced_problem.as_deref() != Some(msg.as_str()) {
+                    eprintln!("logi: {msg}; retrying every 60s until it clears");
+                    announced_problem = Some(msg);
+                }
+                nap(60);
+                continue;
+            }
+        };
         match rules {
             None => {
                 if !announced_idle {
@@ -1054,6 +1150,9 @@ fn start_spy(
 }
 
 fn cmd_watch(args: &[String]) -> Result<(), CliError> {
+    // A mistyped --dry-run used to be skipped in silence, and the run it was
+    // asked to rehearse went ahead and switched profiles for real.
+    reject_unknown_flags(args, &["--dry-run"])?;
     let dry = args.iter().any(|a| a == "--dry-run");
     let path = appwatch::config_path();
     let text = match std::fs::read_to_string(&path) {
@@ -1124,6 +1223,15 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
             if !dry {
                 if let Err(e) = profiles.set_current(dev, *profile) {
                     eprintln!("logi: switching to profile {profile}: {e}");
+                    if endpoint_gone(&e) {
+                        return Err(CliError::Failed(
+                            "the endpoint is gone, and this command holds one open\n\
+                             handle, so nothing it does from here can work. Re-plug the\n\
+                             mouse and run `logi watch` again, or use `logi serve`, which\n\
+                             reconnects on its own."
+                                .into(),
+                        ));
+                    }
                     // Let the next match try again rather than believing it stuck.
                     watcher.invalidate();
                 }
@@ -1183,7 +1291,24 @@ fn cmd_restore(path: &str) -> Result<(), CliError> {
     let mut f = open()?;
     let dev = &mut f.device;
     let p = profiles::OnboardProfiles::new(dev)?;
-    let n = profile_io::restore_all(dev, &p, &backup)?;
+    // restore_all validates the whole file before it writes anything, but once
+    // writing has started it stops at the first sector that fails and the
+    // count is lost with the error. Saying only what went wrong leaves the
+    // user unable to tell "nothing happened" from "half the flash is the
+    // backup and half is what was there before" — and that second state is one
+    // sector away from a profile whose buttons do not match its CRC. Re-running
+    // is the way out: it skips every sector that already matches.
+    let n = profile_io::restore_all(dev, &p, &backup).map_err(|e| {
+        CliError::Failed(format!(
+            "{e}\n\
+             \n\
+             Some sectors may already have been written, so the mouse can be\n\
+             part way between this backup and what it held before. Run\n\
+             \x20   logi restore {path}\n\
+             again once the device answers: it rewrites only the sectors that\n\
+             still differ."
+        ))
+    })?;
     println!("{n} sector(s) written; the rest already matched");
     Ok(())
 }
@@ -1191,6 +1316,56 @@ fn cmd_restore(path: &str) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
+
+    fn flags(args: &[&str], known: &[&str]) -> Result<(), super::CliError> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        super::reject_unknown_flags(&owned, known)
+    }
+
+    #[test]
+    fn a_mistyped_flag_is_refused_rather_than_skipped() {
+        // Both flags in this CLI hold back the consequential behaviour, so a
+        // flag that is quietly dropped is a flash write the user asked not to
+        // make, or a dry run that switched their profiles for real.
+        assert!(matches!(
+            flags(&["500", "--liv"], &["--live"]),
+            Err(super::CliError::Usage(_))
+        ));
+        assert!(matches!(
+            flags(&["--dry-rune"], &["--dry-run"]),
+            Err(super::CliError::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn known_flags_and_bare_values_pass() {
+        assert!(flags(&["500", "--live"], &["--live"]).is_ok());
+        assert!(flags(&["--live"], &["--live"]).is_ok());
+        assert!(flags(&[], &["--live"]).is_ok());
+        // A value is not a flag, however odd it looks. `-1` reaching the
+        // parser is what produces "bad rate"; refusing it here would report it
+        // as an unknown option instead.
+        assert!(flags(&["-1"], &["--live"]).is_ok());
+    }
+
+    #[test]
+    fn only_an_endpoint_failure_counts_as_gone() {
+        use crate::hidpp::Error;
+        // The distinction cmd_watch turns on. A device that answers with an
+        // error, or does not answer in time, is still there and the next poll
+        // can try again; an Io failure is the node itself, and nothing in a
+        // foreground command reopens it.
+        assert!(super::endpoint_gone(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        ))));
+        assert!(super::endpoint_gone(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::NotConnected
+        ))));
+        assert!(!super::endpoint_gone(&Error::Timeout { feature: 1, function: 2 }));
+        assert!(!super::endpoint_gone(&Error::Device { code: 8, feature: 1, function: 2 }));
+        assert!(!super::endpoint_gone(&Error::Protocol("short reply".into())));
+        assert!(!super::endpoint_gone(&Error::NoSuchFeature(0x8110)));
+    }
 
     #[test]
     fn nap_for_honours_sub_second_durations() {

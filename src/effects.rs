@@ -9,7 +9,7 @@
 //! including on error, because otherwise its lighting would stay dependent on
 //! a process that is no longer running.
 
-use crate::led::Leds;
+use crate::led::{self, Leds};
 use crate::profiles::{OnboardProfiles, MODE_HOST, MODE_ONBOARD};
 use crate::{discover, hidpp};
 
@@ -132,6 +132,16 @@ impl Session {
             return Err(hidpp::Error::Protocol(
                 "this device reports no lighting zones, so there is nothing to animate".into(),
             ));
+        }
+        // Every frame is a FIXED write to every zone. A zone whose firmware has
+        // no fixed mode fails on the first one, and by then host mode has been
+        // taken and the caller is holding a handle for an effect that will never
+        // draw anything. Rule it out here, before the device is touched at all.
+        if let Some(z) = (0..leds.zone_count).find(|z| !leds.supports(*z, led::FIXED)) {
+            return Err(hidpp::Error::Protocol(format!(
+                "zone {z} of this device has no fixed-colour mode, so a host-driven \
+                 effect cannot drive its lighting"
+            )));
         }
         let profiles = OnboardProfiles::new(&mut dev)?;
 

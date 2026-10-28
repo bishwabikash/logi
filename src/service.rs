@@ -373,8 +373,12 @@ fn verb(v: &str) -> Result<(), String> {
              logi from your desktop session."
                 .to_string()
         }
+        // Names what installs it, not a control: the Service panel has the
+        // instructions and no install button, so "install it from this panel"
+        // sent the user looking for something that is not there.
         Some(State::NotInstalled) => format!(
-            "{UNIT} is not installed. Install it from this panel; it writes one file to {}.",
+            "{UNIT} is not installed, so there is nothing to start. packaging/install.sh \
+             writes it to {}.",
             unit_path().display()
         ),
         _ => {

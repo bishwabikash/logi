@@ -57,13 +57,17 @@ pub struct Status {
 impl Default for Status {
     /// Not derived.
     ///
-    /// `service::State`'s own `Default` is `NoSystemd`, and the GUI registers
-    /// the tray with `Status::default()` before the service watcher has
-    /// polled. Deriving it would have the first icon the user ever sees say
-    /// there is no systemd user session on a machine that has one, and grey
-    /// the start/stop items with it. `service::Watcher` uses `Inactive` as its
-    /// own pre-poll placeholder for that reason; match it, so the worst the
-    /// tray says before the first answer is "stopped".
+    /// `service::State`'s own `Default` is `NoSystemd`, which is a claim about
+    /// the machine, not an absence of one. A `Status` built without asking
+    /// systemd would therefore say there is no systemd user session on a
+    /// machine that has one, and grey the start/stop items with it.
+    /// `service::Watcher` uses `Inactive` as its own pre-poll placeholder for
+    /// that reason; match it, so the worst this says before anything has been
+    /// asked is "stopped".
+    ///
+    /// The GUI does not rely on this: it registers with a real status built
+    /// from its snapshot, because registering with a default one made the
+    /// first icon the user ever saw report a state nothing had looked at.
     fn default() -> Self {
         Status {
             device: None,
@@ -136,7 +140,10 @@ impl Status {
     /// never sent to a terminal to find out.
     pub fn service_note(&self) -> Option<&'static str> {
         match self.service {
-            State::NotInstalled => Some("Install it from the Service panel in the app."),
+            // Not "install it from the Service panel": that panel has no
+            // install control, it has the instructions for one. A menu line
+            // that names a button the app does not have strands the user.
+            State::NotInstalled => Some("Not installed: the Service panel in the app says how."),
             State::Failed => Some("Read the log in the Service panel in the app."),
             State::NoSystemd => {
                 Some("No systemd user session: start logi from your desktop session.")
@@ -460,7 +467,10 @@ impl Tray {
         let handle = model.spawn().map_err(describe)?;
 
         let (tx, rx) = mpsc::channel::<Status>();
-        std::thread::Builder::new()
+        // Kept out of the closure, for the one path where the closure is
+        // dropped without ever running.
+        let orphan = handle.clone();
+        let started = std::thread::Builder::new()
             .name("logi-tray".into())
             .spawn(move || {
                 while let Ok(mut s) = rx.recv() {
@@ -477,8 +487,17 @@ impl Tray {
                 // and returning from this thread before the service has
                 // unregistered leaves a dead icon in the panel.
                 handle.shutdown().wait();
-            })
-            .map_err(|e| format!("could not start the tray thread: {e}"))?;
+            });
+        if let Err(e) = started {
+            // The item is registered by this point, and dropping the handle
+            // does not unregister it: ksni's service task owns its own state
+            // and its receiver going quiet only disables that one branch of
+            // its loop. Without this the panel keeps an icon that nothing can
+            // update, hide or remove for the life of the process, while the
+            // caller is told it has no tray at all.
+            orphan.shutdown().wait();
+            return Err(format!("could not start the tray thread: {e}"));
+        }
 
         Ok(Tray { tx, events: Mutex::new(ev_rx), last: Mutex::new(initial) })
     }
@@ -662,9 +681,9 @@ mod tests {
         assert!(base.differs_from(&s));
     }
 
-    /// The GUI calls `Tray::spawn(Status::default())` on its first frame,
-    /// before the service watcher has polled, so the default must not assert
-    /// anything about systemd. `service::State`'s own default does.
+    /// A `Status` nobody has filled in must not assert anything about
+    /// systemd. `service::State`'s own default does, so this one cannot be
+    /// derived from it.
     #[test]
     fn the_default_status_claims_nothing_about_systemd() {
         let s = Status::default();
@@ -734,7 +753,10 @@ mod tests {
         let out = s.menu_outline();
         assert!(out.contains(&"Start service (disabled)".to_string()));
         assert!(out.contains(&"Restart service (disabled)".to_string()));
-        assert!(out.contains(&"Install it from the Service panel in the app.".to_string()));
+        assert!(out.contains(&"Not installed: the Service panel in the app says how.".to_string()));
+        // And it does not send the user looking for an install button, because
+        // the Service panel does not have one.
+        assert!(!out.iter().any(|l| l.starts_with("Install it from")), "{out:?}");
     }
 
     /// The preset list comes from the app, not the mouse, so it is there even
