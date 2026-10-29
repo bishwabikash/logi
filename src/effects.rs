@@ -43,6 +43,17 @@ pub struct Running {
 }
 
 impl Running {
+    /// True once the effect thread has exited, whatever the reason.
+    ///
+    /// The thread ends on its own when a write keeps failing, not only when it
+    /// is asked to stop. The worker uses this to notice, because a thread that
+    /// is gone while the device node is still in place leaves the worker
+    /// believing in an effect that is not running, and with that belief set it
+    /// never reconnects.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().map_or(true, |h| h.is_finished())
+    }
+
     pub fn stop(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
@@ -276,6 +287,41 @@ pub fn start(name: String, color: [u8; 3], period_ms: u32) -> Result<Running, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn a_thread_that_exits_on_its_own_reads_as_finished() {
+        let r = Running {
+            stop: Arc::new(AtomicBool::new(false)),
+            handle: Some(std::thread::spawn(|| {})),
+        };
+        assert!(wait_until(|| r.is_finished()), "an exited thread never read as finished");
+    }
+
+    #[test]
+    fn a_running_thread_is_not_finished_until_stopped() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let r = Running {
+            stop,
+            handle: Some(std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })),
+        };
+        assert!(!r.is_finished());
+        r.stop(); // joins; returning at all means the thread exited
+    }
 
     #[test]
     fn hue_wheel_hits_primaries() {

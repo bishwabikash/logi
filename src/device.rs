@@ -675,16 +675,32 @@ fn worker(
                     // empty, a state the reconnect guard above cannot leave.
                     // Retire it here so the next pass reconnects and the
                     // snapshot stops claiming an effect that is not running.
-                    if effect.is_some() && effect_node_gone(effect_node, &snap.path) {
+                    //
+                    // The thread can also exit while the node stays in place,
+                    // when a write keeps failing for a reason other than an
+                    // unplug, so ask the thread itself as well as the node.
+                    let finished = effect.as_ref().map_or(false, |r| r.is_finished());
+                    let gone = effect.is_some() && effect_node_gone(effect_node, &snap.path);
+                    if finished || gone {
                         if let Some(r) = effect.take() {
                             r.stop();
                         }
                         effect_node = None;
                         snap.effect_running = None;
-                        snap.connected = false;
-                        snap.error = Some(
-                            "the effect ended because the mouse was disconnected".to_string(),
-                        );
+                        if gone {
+                            snap.connected = false;
+                            snap.error = Some(
+                                "the effect ended because the mouse was disconnected"
+                                    .to_string(),
+                            );
+                        } else {
+                            // Still connected, so do not say otherwise. The
+                            // loop top reconnects now that `effect` is clear.
+                            snap.error = Some(
+                                "the effect stopped on its own; start it again to retry"
+                                    .to_string(),
+                            );
+                        }
                         publish(&shared, &snap);
                     }
                     continue;
