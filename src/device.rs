@@ -35,6 +35,10 @@ pub enum Cmd {
     StartEffect { name: String, color: [u8; 3], period_ms: u32 },
     StopEffect,
     Backup(String),
+    /// The safety backup taken once per launch, before any automatic flash
+    /// write. Goes to the app's own data directory, and writes nothing when
+    /// the newest backup there already holds exactly what the mouse holds.
+    AutoBackup,
     WriteProfile { index: u8, profile: Box<Profile> },
     SetButton { index: u8, button: u8, binding: crate::profile_blob::Button },
     /// Silence exactly these physical buttons and un-silence every other one.
@@ -70,6 +74,7 @@ pub enum CmdKind {
     StartEffect,
     StopEffect,
     Backup,
+    AutoBackup,
     WriteProfile(u8),
     SetButton(u8),
     ApplyBindings,
@@ -92,6 +97,7 @@ impl Cmd {
             Cmd::StartEffect { .. } => CmdKind::StartEffect,
             Cmd::StopEffect => CmdKind::StopEffect,
             Cmd::Backup(_) => CmdKind::Backup,
+            Cmd::AutoBackup => CmdKind::AutoBackup,
             Cmd::WriteProfile { index, .. } => CmdKind::WriteProfile(*index),
             Cmd::SetButton { index, .. } => CmdKind::SetButton(*index),
             Cmd::ApplyBindings { .. } => CmdKind::ApplyBindings,
@@ -886,6 +892,45 @@ fn write_backup(
     }))
 }
 
+/// Take the safety backup, or say that the newest one already covers this.
+///
+/// A partial dump is refused, not written. The point of this backup is to be
+/// the way back from a flash write, and a file with sectors missing is not
+/// that: restoring it would leave the absent ones as they were, which may be
+/// the very ones a bad write damaged.
+fn auto_backup(
+    model: &str,
+    dump: &[(u16, Option<Vec<u8>>)],
+) -> crate::hidpp::Result<Option<String>> {
+    use crate::hidpp::Error;
+    let readable = dump.iter().filter(|(_, d)| d.is_some()).count();
+    if readable < dump.len() {
+        return Err(Error::Protocol(format!(
+            "{} of {} sectors would not read, so no safety backup was taken",
+            dump.len() - readable,
+            dump.len()
+        )));
+    }
+    let json = profile_io::dump_to_json(model, dump);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Not Error::Io: the worker reads that as "the device vanished" and drops
+    // a good handle, and a backup directory that cannot be written has nothing
+    // to do with the mouse.
+    let plan = crate::backups::plan(&crate::backups::dir(), &json, now).map_err(|e| {
+        Error::Protocol(format!("preparing {}: {e}", crate::backups::dir().display()))
+    })?;
+    match plan {
+        crate::backups::Plan::Same(p) => Ok(Some(format!(
+            "already backed up: {} holds exactly what the mouse holds",
+            p.display()
+        ))),
+        crate::backups::Plan::Write(p) => write_backup(&p.to_string_lossy(), model, dump),
+    }
+}
+
 /// Hand the worker's snapshot to the UI.
 ///
 /// The worker keeps the authoritative copy and is its only writer, so every
@@ -1298,6 +1343,10 @@ fn worker(
                     let dump = profile_io::dump_all(dev, p);
                     write_backup(&path, &name_for_backup, &dump)
                 }),
+            Cmd::AutoBackup => feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
+                let dump = profile_io::dump_all(dev, p);
+                auto_backup(&name_for_backup, &dump)
+            }),
             Cmd::StartEffect { name, color, period_ms } => {
                 match effects::start(name.clone(), color, period_ms) {
                     Ok(r) => {

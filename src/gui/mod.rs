@@ -1,12 +1,13 @@
 //! egui front end. All device work goes through `device::Handle`, which talks
 //! to a worker thread, so nothing here can block the frame loop.
 
-use crate::device::{self, Cmd, Snapshot};
+use crate::device::{self, Cmd, CmdId, CmdKind, Snapshot};
 use crate::dpi::Capability;
 use crate::led;
 use crate::profile_blob::{Button, Led, BTN_HID, HID_MOUSE, SPECIALS};
 use eframe::egui;
 
+pub mod autosend;
 pub mod bindings_editor;
 pub mod profile_editor;
 pub mod rules_editor;
@@ -65,6 +66,10 @@ pub struct App {
     /// date: two button changes that each leave a left click behind can,
     /// together, leave none. So writes wait for the previous one's answer.
     flash_inflight: Option<(device::CmdId, std::time::Instant)>,
+    /// The once-per-launch safety backup that automatic flash writes wait on.
+    backup: BackupState,
+    /// The user said to send changes even though the backup failed.
+    backup_override: bool,
 
     themed: bool,
     profile_editor: profile_editor::ProfileEditor,
@@ -109,6 +114,8 @@ impl App {
             btn_action: std::collections::HashMap::new(),
             btn_profile: None,
             flash_inflight: None,
+            backup: BackupState::NotStarted,
+            backup_override: false,
             themed: false,
             profile_editor: profile_editor::ProfileEditor::new(),
             rules: rules_editor::RulesEditor::new(),
@@ -119,6 +126,50 @@ impl App {
             tray_tried: false,
             tray_rx: None,
             dpi_touched: false,
+        }
+    }
+
+    /// Take the safety backup once the mouse's profiles have been read, and
+    /// watch for its answer. Called every frame; does nothing once settled.
+    ///
+    /// Before any edit is possible, deliberately: automatic sends wait two
+    /// seconds after an edit and the backup takes about one, so by the time
+    /// the first flash write is due the backup has long since finished.
+    fn drive_backup(&mut self) {
+        match self.backup.clone() {
+            BackupState::NotStarted => {
+                if self.snap.connected && self.snap.has_profiles && !self.snap.profiles.is_empty() {
+                    let after = self.snap.newest_outcome_id();
+                    self.dev.send(Cmd::AutoBackup);
+                    self.backup = BackupState::Waiting { after };
+                }
+            }
+            BackupState::Waiting { after } => {
+                if let Some(o) = self.snap.outcome_after(after, CmdKind::AutoBackup) {
+                    self.backup = if o.ok {
+                        BackupState::Ready
+                    } else {
+                        BackupState::Failed(
+                            o.message.clone().unwrap_or_else(|| "the backup failed".into()),
+                        )
+                    };
+                }
+            }
+            BackupState::Ready | BackupState::Failed(_) => {}
+        }
+    }
+
+    /// Whether a change that writes flash may be sent without being asked.
+    fn safety(&self) -> autosend::Safety {
+        // Nothing to protect, and nothing automatic to send.
+        if !self.snap.connected || !self.snap.has_profiles {
+            return autosend::Safety::Ready;
+        }
+        match &self.backup {
+            BackupState::Ready => autosend::Safety::Ready,
+            BackupState::Failed(_) if self.backup_override => autosend::Safety::Ready,
+            BackupState::Failed(why) => autosend::Safety::Failed(why.clone()),
+            BackupState::NotStarted | BackupState::Waiting { .. } => autosend::Safety::Pending,
         }
     }
 
@@ -187,6 +238,18 @@ impl App {
                 .unwrap_or_default()
         }
     }
+}
+
+/// Where the safety backup stands. See `autosend::Safety`.
+#[derive(Debug, Clone, PartialEq)]
+enum BackupState {
+    /// Nothing sent yet: waiting for a mouse whose profiles have been read.
+    NotStarted,
+    /// Sent. `after` is the newest outcome id read before sending, so the
+    /// backup's own answer is the first `AutoBackup` outcome newer than it.
+    Waiting { after: CmdId },
+    Ready,
+    Failed(String),
 }
 
 /// True if this binding presses the left mouse button.
@@ -545,6 +608,7 @@ impl eframe::App for App {
         // Before the tray, not after: the tray renders this snapshot, and
         // reading it second had every icon update describing the frame before.
         self.snap = self.dev.snapshot();
+        self.drive_backup();
         if !self.snap.connected {
             // A choice armed against a mouse that has gone is not one for
             // whatever comes back: Apply writes flash.
@@ -839,6 +903,26 @@ impl App {
                         });
                     }
                 });
+                // Changes that write flash wait for a backup, so when it could
+                // not be taken that has to be said where it cannot be missed,
+                // with the way past it. Otherwise edits would sit unsent with
+                // no explanation.
+                if let autosend::Safety::Failed(why) = self.safety() {
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Changes to the profile are not being sent, because the \
+                                 safety backup could not be taken: {why}"
+                            ))
+                            .color(theme::WARN)
+                            .size(12.5),
+                        );
+                        if ui.button("Send anyway").clicked() {
+                            self.backup_override = true;
+                        }
+                    });
+                }
             });
     }
 

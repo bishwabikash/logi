@@ -5,6 +5,7 @@
 
 mod actions;
 mod appwatch;
+mod backups;
 mod buttonspy;
 mod capabilities;
 mod deviceinfo;
