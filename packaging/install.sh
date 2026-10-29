@@ -96,10 +96,14 @@ fi
 
 # ----------------------------------------------------------------- bin -----
 if [ "$DO_BIN" = 1 ]; then
-    install -d "$PREFIX/bin" "$PREFIX/share/applications"
+    ICONS="$PREFIX/share/icons/hicolor/scalable/apps"
+    install -d "$PREFIX/bin" "$PREFIX/share/applications" "$ICONS"
     install -m 0755 "$BIN" "$PREFIX/bin/logi"
     install -m 0644 "$HERE/logi.desktop" "$PREFIX/share/applications/logi.desktop"
-    echo "Installed $PREFIX/bin/logi and its desktop entry."
+    install -m 0644 "$HERE/logi.svg" "$ICONS/logi.svg"
+    echo "Installed $PREFIX/bin/logi, its desktop entry and its icon."
+    command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+        gtk-update-icon-cache -q -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
     command -v update-desktop-database >/dev/null 2>&1 &&
         update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
     case ":$PATH:" in

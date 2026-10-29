@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="256" height="256">
+  <!-- The same mouse glyph the panel icon is drawn from (src/tray.rs), on the
+       app's own dark ground and accent colour. -->
+  <rect width="22" height="22" rx="5" fill="#14181d"/>
+  <path fill="#2dd4d4" fill-rule="evenodd"
+        d="M11 3.5c3.04 0 5.5 2.46 5.5 5.5v5.5c0 3.04-2.46 5.5-5.5 5.5S5.5 17.54 5.5 14.5V9c0-3.04 2.46-5.5 5.5-5.5Z
+           M11 4.4c-.47 0-.85.38-.85.85v3.3a.85.85 0 0 0 1.7 0v-3.3c0-.47-.38-.85-.85-.85Z"/>
+</svg>

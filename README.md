@@ -128,7 +128,7 @@ added, and a node that is already open keeps its old permissions.
   work without root, loads the `uinput` module and arranges for it at boot
   (this is the only part needing sudo, and the only one that cannot be done
   from inside the app);
-* copies the binary and a desktop entry under `~/.local`;
+* copies the binary, a desktop entry and an icon under `~/.local`;
 * installs a systemd user service, enables it and starts it.
 
 You can skip it entirely and run `./target/release/logi`; the rules are only
@@ -138,10 +138,18 @@ not narrower is explained in the rule file.
 
 To remove it: `systemctl --user disable --now logi`, then delete
 `~/.config/systemd/user/logi.service`, `~/.local/bin/logi`,
-`~/.local/share/applications/logi.desktop`, `~/.config/logi/`, the two
+`~/.local/share/applications/logi.desktop`,
+`~/.local/share/icons/hicolor/scalable/apps/logi.svg`, `~/.config/logi/`, the two
 `/etc/udev/rules.d/99-logi*.rules` files, and `/etc/modules-load.d/uinput.conf`.
 
 ## Using it
+
+Closing the window does not end the program when the desktop has a panel icon
+area: the window really closes (a Wayland application cannot hide its own
+window, so there is no half-hidden one left in the dock) and the icon stays.
+"Open Logi" in its menu, a click on it, or starting `logi` again shows the
+window; "Quit" in the menu ends it. Without a panel icon area, closing the
+window quits, since nothing would be left to reopen it from.
 
 The window has tabs for Sensor, Lighting, Profiles, Buttons, Apps, Service and
 About. The sidebar has the **memory mode** switch. In onboard mode the mouse

@@ -164,6 +164,20 @@ edit. Checked on the G502 HERO with the CLI: a rate stored in a profile applies
 once the mouse returns to onboard mode (500 Hz read back after host then
 onboard), and the original state was restored byte for byte.
 
+## Closing the window
+
+The window closes for real and the process stays as the panel icon
+(`src/gui/host.rs`, `run` in `src/gui/mod.rs`). A background loop with a worker
+of its own serves the icon's menu until it asks for a window; starting `logi`
+again signals the running one (`src/gui/instance.rs`, a lock file and SIGUSR1)
+instead of making a second icon. Checked on GNOME (the session is Wayland; the
+window was driven through XWayland so it could be closed and found from a
+script): close leaves the process and icon, the icon's click and its "Open
+Logi" item open a new window, a second launch does the same, and "Quit" ends
+the process and removes the icon with the mouse left in onboard mode. **Not
+checked:** the look of the icon in the dock, which needs the desktop entry and
+icon installed by `packaging/install.sh`.
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or

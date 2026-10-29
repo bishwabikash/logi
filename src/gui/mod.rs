@@ -8,6 +8,8 @@ use crate::profile_blob::{Button, Led, BTN_HID, HID_MOUSE, SPECIALS};
 use eframe::egui;
 
 pub mod autosend;
+pub mod host;
+pub mod instance;
 pub mod bindings_editor;
 pub mod profile_editor;
 pub mod rules_editor;
@@ -94,25 +96,17 @@ pub struct App {
     profile_editor: profile_editor::ProfileEditor,
     rules: rules_editor::RulesEditor,
     bindings: bindings_editor::BindingsEditor,
-    service: crate::service::Watcher,
+    /// The panel icon and the service watcher, which outlive this window.
+    host: std::sync::Arc<host::Host>,
     /// Editors read their config files once, off the first paint.
     loaded: bool,
-    /// None when there is no StatusNotifierWatcher, which is normal on a
-    /// desktop without a tray host. The app works either way.
-    tray: Option<crate::tray::Tray>,
-    tray_tried: bool,
-    /// Registration in flight. `Tray::spawn` blocks on a session-bus round
-    /// trip, and where the watcher name is activatable but never comes up it
-    /// blocks for the 25s D-Bus reply timeout, so it runs on its own thread
-    /// and the handle arrives through here.
-    tray_rx: Option<std::sync::mpsc::Receiver<Result<crate::tray::Tray, String>>>,
     /// True while the DPI slider is being dragged, so the live readout is not
     /// overwritten by the device's own value mid-drag.
     dpi_touched: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(host: std::sync::Arc<host::Host>) -> Self {
         App {
             dev: device::spawn(),
             tab: Tab::Sensor,
@@ -146,11 +140,8 @@ impl App {
             profile_editor: profile_editor::ProfileEditor::new(),
             rules: rules_editor::RulesEditor::new(),
             bindings: bindings_editor::BindingsEditor::new(),
-            service: crate::service::Watcher::new(),
+            host,
             loaded: false,
-            tray: None,
-            tray_tried: false,
-            tray_rx: None,
             dpi_touched: false,
         }
     }
@@ -702,6 +693,9 @@ impl eframe::App for App {
                 ctx.request_repaint_after(w);
             }
         }
+        if instance::take_raise() {
+            self.show(ctx);
+        }
         self.sync_tray(ctx);
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
@@ -748,105 +742,40 @@ const PALETTE: &[[u8; 3]] = &[
 ];
 
 impl App {
-    /// Register the tray once, then keep it in step and act on its menu.
+    /// Keep the panel icon in step with the mouse, and act on its menu.
     fn sync_tray(&mut self, ctx: &egui::Context) {
-        use crate::tray::{Event, Status};
+        use host::Signal;
 
-        // Build the real status first: registering with Status::default()
-        // made the first icon claim a service state nothing had looked at yet.
-        let status = Status {
-            device: self.snap.connected.then(|| self.snap.model.clone()),
-            service: self.service.state(),
-            active_profile: self.snap.active_profile,
-            profile_count: self.snap.profile_count,
-            dpi: self.snap.dpi,
-            // The device's own range, not a fixed list: with no mouse attached
-            // there is nothing to offer, and offering it anyway produced a DPI
-            // menu that could not work.
-            dpi_presets: match (self.snap.connected, &self.snap.dpi_cap) {
-                (true, Some(Capability::Range { min, max, .. })) => {
-                    [400u16, 800, 1600, 3200, 6400]
-                        .into_iter()
-                        .filter(|p| p >= min && p <= max)
-                        .collect()
-                }
-                (true, Some(Capability::List(v))) => v.clone(),
-                _ => Vec::new(),
-            },
-        };
-
-        if !self.tray_tried {
-            self.tray_tried = true;
-            // Registering blocks: it opens the session bus and waits for the
-            // watcher, which on a desktop where the name is activatable but
-            // never comes up is the full 25s D-Bus timeout. On the frame loop
-            // that is a window that never paints, so this goes on a thread of
-            // its own, exactly as `Tray::spawn` says it must.
-            let (tx, rx) = std::sync::mpsc::channel();
-            let initial = status.clone();
-            match std::thread::Builder::new()
-                .name("logi-tray-register".into())
-                .spawn(move || {
-                    let _ = tx.send(crate::tray::Tray::spawn(initial));
-                }) {
-                Ok(_) => self.tray_rx = Some(rx),
-                Err(e) => eprintln!("logi: no tray icon: {e}"),
-            }
+        let host = std::sync::Arc::clone(&self.host);
+        let snap = self.snap.clone();
+        let mut cmds: Vec<Cmd> = Vec::new();
+        let signal = host.sync(&snap, &mut |c| cmds.push(c));
+        for c in cmds {
+            self.send_tracked(c);
         }
-        // Non-blocking: nothing here waits on the registration.
-        match self.tray_rx.as_ref().map(|rx| rx.try_recv()) {
-            Some(Ok(Ok(t))) => {
-                self.tray = Some(t);
-                self.tray_rx = None;
+        match signal {
+            Some(Signal::Open) => self.show(ctx),
+            Some(Signal::Quit) => {
+                host.request_quit();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            Some(Ok(Err(e))) => {
-                eprintln!("logi: no tray icon: {e}");
-                self.tray_rx = None;
-            }
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => self.tray_rx = None,
-            _ => {}
+            None => {}
         }
-        let Some(tray) = &self.tray else { return };
+    }
 
-        // update() is a no-op when nothing changed, so this is cheap per frame.
-        tray.update(status);
-
-        for ev in tray.poll() {
-            match ev {
-                Event::Open => {
-                    // Un-minimise first. Focus does not restore a minimised
-                    // window on most compositors, and a minimised window is
-                    // the usual reason someone reaches for the tray at all,
-                    // so without this the one menu item that has to work did
-                    // nothing.
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                }
-                Event::ToggleService | Event::RestartService => {
-                    // The same gate the Service tab puts on its buttons. The
-                    // menu has no greyed state of its own, so without it a
-                    // click before the first poll acted on a default, one
-                    // during an action queued a second systemctl, and one
-                    // with no unit or no systemd could only produce an error.
-                    if let Some(a) = tray_service_action(
-                        matches!(ev, Event::ToggleService),
-                        self.service.known(),
-                        self.service.state(),
-                        self.service.busy().is_some(),
-                    ) {
-                        self.service.request(a);
-                    }
-                }
-                Event::SetProfile(p) => {
-                    self.send_tracked(Cmd::SetProfile(p));
-                }
-                Event::SetDpi(d) => {
-                    self.dev.send(Cmd::SetDpi(d));
-                }
-                Event::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            }
-        }
+    /// Bring this window forward.
+    fn show(&self, ctx: &egui::Context) {
+        // Un-minimise first. Focus does not restore a minimised window on most
+        // compositors, and a minimised window is the usual reason someone
+        // reaches for the icon at all.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        // A compositor may refuse to move focus to a window that was not asked
+        // for by the user; this at least makes the shell flag it.
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
     }
 
     fn draw_sidebar(&mut self, ctx: &egui::Context) {
@@ -1821,12 +1750,12 @@ impl App {
 
     fn draw_service(&mut self, ui: &mut egui::Ui) {
         use crate::service::{self as svc, Action, State};
-        let st = self.service.state();
+        let st = self.host.service.state();
         // The first poll runs journalctl, which can outlast the first frames.
         // Until it lands the cached state is only a default, and printing it
         // tells the user the unit is installed and stopped without anything
         // having looked. Saying so is what `Watcher::known` is for.
-        let known = self.service.known();
+        let known = self.host.service.known();
         let colour = match st {
             State::Active => theme::GOOD,
             State::Failed => theme::BAD,
@@ -1841,10 +1770,10 @@ impl App {
                 } else {
                     theme::pill(ui, "checking", theme::FAINT);
                 }
-                if known && self.service.is_enabled() {
+                if known && self.host.service.is_enabled() {
                     theme::pill(ui, "starts at login", theme::DIM);
                 }
-                if let Some(a) = self.service.busy() {
+                if let Some(a) = self.host.service.busy() {
                     theme::pill(ui, a.describe(), theme::ACCENT);
                 }
             });
@@ -1855,33 +1784,33 @@ impl App {
             );
             ui.add_space(12.0);
 
-            let can = known && svc::can_control(st) && self.service.busy().is_none();
+            let can = known && svc::can_control(st) && self.host.service.busy().is_none();
             ui.horizontal(|ui| {
                 if ui.add_enabled(can && st != State::Active, egui::Button::new("Start")).clicked() {
-                    self.service.request(Action::Start);
+                    self.host.service.request(Action::Start);
                 }
                 if ui.add_enabled(can && st == State::Active, egui::Button::new("Stop")).clicked() {
-                    self.service.request(Action::Stop);
+                    self.host.service.request(Action::Stop);
                 }
                 if ui.add_enabled(can, egui::Button::new("Restart")).clicked() {
-                    self.service.request(Action::Restart);
+                    self.host.service.request(Action::Restart);
                 }
-                let enabled = self.service.is_enabled();
+                let enabled = self.host.service.is_enabled();
                 let label = if enabled { "Don't start at login" } else { "Start at login" };
                 if ui.add_enabled(can, egui::Button::new(label)).clicked() {
-                    self.service.request(if enabled { Action::Disable } else { Action::Enable });
+                    self.host.service.request(if enabled { Action::Disable } else { Action::Enable });
                 }
             });
 
             // The unit file lives in the user's own home, so writing it needs
             // no sudo and no terminal. Only the udev rules do, and those are
             // about the mouse being openable at all, not about this service.
-            let has_unit = self.service.unit_file_exists();
-            let idle = known && self.service.busy().is_none();
+            let has_unit = self.host.service.unit_file_exists();
+            let idle = known && self.host.service.busy().is_none();
             if idle && !has_unit {
                 ui.add_space(10.0);
                 if ui.button("Install the service").clicked() {
-                    self.service.request(Action::Install);
+                    self.host.service.request(Action::Install);
                 }
                 ui.add_space(6.0);
                 theme::hint(
@@ -1896,25 +1825,25 @@ impl App {
             // file is already there: replacing one is the user's call.
             if idle
                 && has_unit
-                && self.service.last_error().is_some_and(|e| e.contains("Reinstall"))
+                && self.host.service.last_error().is_some_and(|e| e.contains("Reinstall"))
             {
                 ui.add_space(10.0);
                 if ui.button("Reinstall (replace the existing file)").clicked() {
-                    self.service.request(Action::Reinstall);
+                    self.host.service.request(Action::Reinstall);
                 }
             }
-            if let Some(e) = self.service.last_error() {
+            if let Some(e) = self.host.service.last_error() {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(e).color(theme::BAD).size(12.5));
             }
-            if let Some(n) = self.service.last_notice() {
+            if let Some(n) = self.host.service.last_notice() {
                 ui.add_space(8.0);
                 ui.label(egui::RichText::new(n).color(theme::GOOD).size(12.5));
             }
         });
 
         theme::section(ui, "Recent log", |ui| {
-            let log = self.service.log();
+            let log = self.host.service.log();
             if log.is_empty() {
                 theme::hint(ui, "Nothing logged yet.");
             } else {
@@ -1926,7 +1855,7 @@ impl App {
             }
             ui.add_space(8.0);
             if ui.button("Refresh").clicked() {
-                self.service.refresh();
+                self.host.service.refresh();
             }
         });
     }
@@ -2018,15 +1947,98 @@ impl App {
     }
 }
 
-pub fn run() -> eframe::Result {
+/// The window's icon, drawn from the same glyph as the panel icon so the two
+/// are recognisably one program. Wayland compositors take the icon from the
+/// desktop entry instead; this is for X11 and for any shell that reads it.
+fn window_icon() -> egui::IconData {
+    let [r, g, b, _] = theme::ACCENT.to_array();
+    let size = 256;
+    let argb = crate::tray::render(crate::tray::Shape::Live, [r, g, b], size);
+    let mut rgba = Vec::with_capacity(argb.data.len());
+    for px in argb.data.chunks_exact(4) {
+        // render() hands back ARGB, egui wants RGBA.
+        rgba.extend_from_slice(&[px[1], px[2], px[3], px[0]]);
+    }
+    egui::IconData { rgba, width: size as u32, height: size as u32 }
+}
+
+/// Open the window and block until it is closed.
+fn window(host: std::sync::Arc<host::Host>) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([940.0, 700.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("Logi"),
+            .with_title("Logi")
+            // The name the desktop entry is matched by (`logi.desktop`), which
+            // is what gives the window its icon and name in the shell on Wayland.
+            .with_app_id("logi")
+            .with_icon(std::sync::Arc::new(window_icon())),
         ..Default::default()
     };
-    eframe::run_native("logi", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+    eframe::run_native("logi", options, Box::new(move |_cc| Ok(Box::new(App::new(host)))))
+}
+
+/// Keep the panel icon alive with no window, until it asks for one.
+///
+/// Has a device worker of its own, so the icon's DPI and profile menus work and
+/// its tooltip stays true. That worker is handed back before the next window
+/// opens its own: two workers on one mouse would race each other's writes.
+fn background(host: &host::Host) -> host::Signal {
+    use host::Signal;
+    let dev = device::spawn();
+    let signal = loop {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        if instance::take_raise() {
+            break Signal::Open;
+        }
+        let snap = dev.snapshot();
+        if let Some(sig) = host.sync(&snap, &mut |c| {
+            dev.send(c);
+        }) {
+            break sig;
+        }
+    };
+    dev.restore_onboard_blocking();
+    signal
+}
+
+/// Show the window; when it is closed, stay as the panel icon if there is one.
+pub fn run() -> eframe::Result {
+    use host::Signal;
+    // Before the lock, not after: the first instance must already be able to
+    // receive SIGUSR1 by the time a second one finds it, because the default
+    // action for that signal is to end the process.
+    instance::listen_for_raise();
+    let _instance = match instance::acquire() {
+        Ok(instance::Acquired::First(i)) => Some(i),
+        Ok(instance::Acquired::Running(pid)) => {
+            if instance::ask_to_show(pid) {
+                eprintln!("logi is already running; asked it to show its window.");
+            } else {
+                eprintln!("logi is already running (pid {pid}).");
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            // Not fatal: better a second window than none.
+            eprintln!("logi: could not take the single-instance lock: {e}");
+            None
+        }
+    };
+    let host = std::sync::Arc::new(host::Host::new());
+    loop {
+        window(std::sync::Arc::clone(&host))?;
+        if !host.quitting() {
+            host.wait_for_tray(std::time::Duration::from_secs(3));
+        }
+        if host.quitting() || !host.has_tray() {
+            return Ok(());
+        }
+        match background(&host) {
+            Signal::Open => continue,
+            Signal::Quit => return Ok(()),
+        }
+    }
 }
 
 #[cfg(test)]
