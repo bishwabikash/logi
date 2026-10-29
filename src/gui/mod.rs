@@ -46,6 +46,9 @@ pub struct App {
 
     profile_sel: usize,
     backup_path: String,
+    /// Paths a backup was sent to from this tab. The file is written later, on
+    /// the device thread, so it may not exist yet when the next click looks.
+    backup_sent: Vec<String>,
 
     /// Pending button edits, keyed by button index, applied on click.
     btn_action: std::collections::HashMap<u8, String>,
@@ -53,8 +56,8 @@ pub struct App {
     /// made for one profile must not stay armed over another: Apply writes
     /// flash.
     btn_profile: Option<u8>,
-    /// The newest flash write sent from here that the worker has not yet
-    /// answered, and when it was sent.
+    /// The newest flash write (or profile switch) sent from here that the
+    /// worker has not yet answered, and when it was sent.
     ///
     /// The panels decide what to offer from the snapshot, and the snapshot only
     /// catches up once the worker has written and read back. A second write
@@ -102,6 +105,7 @@ impl App {
             effect_period_ms: 4000,
             profile_sel: 0,
             backup_path: default_backup_path(),
+            backup_sent: Vec::new(),
             btn_action: std::collections::HashMap::new(),
             btn_profile: None,
             flash_inflight: None,
@@ -120,7 +124,7 @@ impl App {
 
     /// Send a command, and remember it if it writes flash. See `flash_inflight`.
     fn send_tracked(&mut self, cmd: Cmd) {
-        let flash = writes_flash(&cmd);
+        let flash = holds_the_panels(&cmd);
         let id = self.dev.send(cmd);
         if flash {
             self.flash_inflight = Some((id, std::time::Instant::now()));
@@ -182,6 +186,36 @@ fn writes_flash(c: &Cmd) -> bool {
         c,
         Cmd::PersistLighting { .. } | Cmd::WriteProfile { .. } | Cmd::SetButton { .. }
     )
+}
+
+/// Commands the panels wait out before offering another flash write.
+///
+/// The sector writes themselves, and a profile switch: `PersistLighting` is
+/// addressed by whichever profile is active on the device when it runs, so
+/// saving lighting against a switch the snapshot has not caught up with would
+/// merge one profile's other zone into another profile's sector.
+fn holds_the_panels(c: &Cmd) -> bool {
+    writes_flash(c) || matches!(c, Cmd::SetProfile(_))
+}
+
+/// The label a button's menu shows: the user's pending choice if there is one,
+/// otherwise what the device holds.
+///
+/// Only a choice the user made is remembered. Remembering the device's own
+/// description as a default froze it, and when the table then changed
+/// underneath (a write from this grid, the profile editor, a Refresh) the
+/// frozen label no longer matched: Apply came up armed with a change nobody
+/// chose, one that would write the old binding back to flash. A choice that
+/// now matches the device has been applied, so it is dropped.
+fn chosen_label(
+    pending: &mut std::collections::HashMap<u8, String>,
+    index: u8,
+    device: &str,
+) -> String {
+    if pending.get(&index).is_some_and(|s| s == device) {
+        pending.remove(&index);
+    }
+    pending.get(&index).cloned().unwrap_or_else(|| device.to_string())
 }
 
 /// Whether the command sent as `id` is still unanswered.
@@ -339,6 +373,41 @@ fn tray_service_action(
     })
 }
 
+/// `path` with `-n` before its extension: `a/b.json` becomes `a/b-2.json`.
+///
+/// The profile editor numbers its backups the same way; the two tabs share one
+/// default path, so they have to agree on what "beside it" means.
+fn numbered_path(path: &str, n: u32) -> String {
+    let name_at = path.rfind('/').map_or(0, |i| i + 1);
+    match path[name_at..].rfind('.') {
+        // A leading dot is part of the name, not the start of an extension.
+        Some(dot) if dot > 0 => {
+            let at = name_at + dot;
+            format!("{}-{n}{}", &path[..at], &path[at..])
+        }
+        _ => format!("{path}-{n}"),
+    }
+}
+
+/// The first of `path`, `path-2`, `path-3`, ... that `taken` does not claim.
+///
+/// A backup is the way back from a flash write, so one taken after a bad write
+/// must not replace the good one taken before it. The profile editor already
+/// refuses to; this tab used to replace whatever was at the path, and both
+/// default to the same file.
+fn free_backup_path(path: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(path) {
+        return path.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = numbered_path(path, n);
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    numbered_path(path, 1000)
+}
+
 fn default_backup_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     format!("{home}/logi-backup.json")
@@ -397,6 +466,12 @@ impl eframe::App for App {
         // Before the tray, not after: the tray renders this snapshot, and
         // reading it second had every icon update describing the frame before.
         self.snap = self.dev.snapshot();
+        if !self.snap.connected {
+            // A choice armed against a mouse that has gone is not one for
+            // whatever comes back: Apply writes flash.
+            self.btn_action.clear();
+            self.btn_profile = None;
+        }
         if let Some((id, since)) = self.flash_inflight {
             if !still_waiting(id, self.snap.newest_outcome_id(), since.elapsed()) {
                 self.flash_inflight = None;
@@ -536,7 +611,7 @@ impl App {
                     }
                 }
                 Event::SetProfile(p) => {
-                    self.dev.send(Cmd::SetProfile(p));
+                    self.send_tracked(Cmd::SetProfile(p));
                 }
                 Event::SetDpi(d) => {
                     self.dev.send(Cmd::SetDpi(d));
@@ -1108,7 +1183,7 @@ impl App {
                 for i in 0..self.snap.profile_count {
                     let on = self.snap.active_profile == i;
                     if ui.selectable_label(on, format!("{i}")).clicked() {
-                        self.dev.send(Cmd::SetProfile(i));
+                        self.send_tracked(Cmd::SetProfile(i));
                     }
                 }
             });
@@ -1157,7 +1232,19 @@ impl App {
             ui.add_space(14.0);
             let snap = self.snap.clone();
             let sel = self.profile_sel as u8;
-            for cmd in self.profile_editor.ui(ui, &snap, sel) {
+            // The editor builds what it writes from the snapshot, which does
+            // not yet include a flash write sent from the Buttons or Lighting
+            // tab and not answered. Saving then would write the old sector
+            // back over that change. So it waits, as the button grid does.
+            let writing = self.flash_inflight.is_some();
+            let cmds = ui
+                .add_enabled_ui(!writing, |ui| self.profile_editor.ui(ui, &snap, sel))
+                .inner;
+            if writing {
+                ui.add_space(6.0);
+                theme::hint(ui, "Waiting for the mouse to confirm the last write.");
+            }
+            for cmd in cmds {
                 self.send_tracked(cmd);
             }
         }
@@ -1167,15 +1254,28 @@ impl App {
             ui.horizontal(|ui| {
                 let w = (ui.available_width() - 90.0).max(160.0);
                 ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
-                if ui.button("Save").clicked() {
-                    self.dev.send(Cmd::Backup(self.backup_path.clone()));
+                if ui
+                    .add_enabled(!self.backup_path.trim().is_empty(), egui::Button::new("Save"))
+                    .clicked()
+                {
+                    // Never onto a file that is already there. The field shows
+                    // where it actually went.
+                    let target = free_backup_path(&self.backup_path, |p| {
+                        self.backup_sent.iter().any(|s| s == p)
+                            || std::path::Path::new(p).exists()
+                    });
+                    self.backup_path = target.clone();
+                    self.backup_sent.push(target.clone());
+                    self.dev.send(Cmd::Backup(target));
                 }
             });
             ui.add_space(8.0);
             theme::hint(
                 ui,
                 "Dumps all 16 sectors including the profile directory. Take one before \
-                 changing buttons or saving lighting.",
+                 changing buttons or saving lighting. A file already at this path is \
+                 never replaced: the new backup is written beside it with a number on \
+                 the end.",
             );
         });
     }
@@ -1247,11 +1347,7 @@ impl App {
                         ui.label(egui::RichText::new(format!("{i}")).color(theme::DIM).size(12.5));
                         ui.label(egui::RichText::new(&cur_desc).size(13.0));
 
-                        let sel = self
-                            .btn_action
-                            .entry(i)
-                            .or_insert_with(|| cur_desc.clone())
-                            .clone();
+                        let sel = chosen_label(&mut self.btn_action, i, &cur_desc);
                         egui::ComboBox::from_id_salt(("btn", i))
                             .selected_text(&sel)
                             .show_ui(ui, |ui| {
@@ -1305,8 +1401,10 @@ impl App {
         });
 
         if let Some((button, binding)) = pending {
+            // The choice stays: once the write reads back it matches the
+            // device and `chosen_label` drops it, and if the write fails it
+            // is still there to retry. Apply is held until then.
             self.send_tracked(Cmd::SetButton { index: idx, button, binding });
-            self.btn_action.remove(&button);
         }
     }
 
@@ -1646,12 +1744,50 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_switch_holds_the_panels_too() {
+        assert!(holds_the_panels(&Cmd::SetProfile(1)));
+        assert!(holds_the_panels(&Cmd::SetButton { index: 0, button: 1, binding: Button::disabled() }));
+        assert!(!holds_the_panels(&Cmd::SetDpi(800)));
+        assert!(!holds_the_panels(&Cmd::Refresh));
+    }
+
+    #[test]
+    fn only_a_choice_the_user_made_is_remembered() {
+        let mut m = std::collections::HashMap::new();
+        // Nothing chosen: the device's own label, and nothing stored.
+        assert_eq!(chosen_label(&mut m, 3, "button 1"), "button 1");
+        assert!(m.is_empty());
+        // The table changed underneath: no stale label to read as a change.
+        assert_eq!(chosen_label(&mut m, 3, "button 2"), "button 2");
+        // A chosen label is kept while the device differs...
+        m.insert(3, "disabled".to_string());
+        assert_eq!(chosen_label(&mut m, 3, "button 2"), "disabled");
+        // ...and dropped once the device holds it, so it cannot come back as
+        // a pending change after something else rewrites that button.
+        assert_eq!(chosen_label(&mut m, 3, "disabled"), "disabled");
+        assert!(m.is_empty());
+        assert_eq!(chosen_label(&mut m, 3, "button 2"), "button 2");
+    }
+
+    #[test]
     fn only_sector_writes_are_held_for() {
         assert!(writes_flash(&Cmd::SetButton { index: 0, button: 1, binding: Button::disabled() }));
         assert!(writes_flash(&Cmd::PersistLighting { leds: [Led::off(), Led::off()] }));
         assert!(!writes_flash(&Cmd::Refresh));
         assert!(!writes_flash(&Cmd::SetDpi(800)));
         assert!(!writes_flash(&Cmd::Backup(String::new())));
+    }
+
+    #[test]
+    fn a_backup_never_lands_on_one_already_there() {
+        let taken = |p: &str| p == "/h/logi-backup.json" || p == "/h/logi-backup-2.json";
+        assert_eq!(free_backup_path("/h/other.json", taken), "/h/other.json");
+        assert_eq!(free_backup_path("/h/logi-backup.json", taken), "/h/logi-backup-3.json");
+        // No extension, and a dot in a directory name is not one.
+        assert_eq!(numbered_path("/h.d/backup", 2), "/h.d/backup-2");
+        assert_eq!(numbered_path("/h/.hidden", 2), "/h/.hidden-2");
+        // Bounded.
+        assert_eq!(free_backup_path("/h/a.json", |_| true), "/h/a-1000.json");
     }
 
     #[test]

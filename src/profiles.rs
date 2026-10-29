@@ -18,6 +18,28 @@ pub const MEMORY_WRITE_END: u8 = 0x08;
 const GET_CURRENT_DPI_INDEX: u8 = 0x0B;
 const SET_CURRENT_DPI_INDEX: u8 = 0x0C;
 
+/// Fold the outcome of handing the mouse back to its previous mode into the
+/// outcome of the work done while it was held.
+///
+/// A failed hand-back is never dropped: the mouse is then still in host mode,
+/// its stored profile is not applying, and the user has to be told which
+/// command gets them out. A vanished device stays an `Io` error either way,
+/// because that is how the worker knows to drop the handle, and a mouse that
+/// is gone is not being held in host mode by anyone.
+fn finish_host_mode<T>(restored: Result<()>, out: Result<T>) -> Result<T> {
+    const WAY_OUT: &str = "run `logi mode onboard`";
+    match (restored, out) {
+        (Ok(()), out) => out,
+        (Err(e @ Error::Io(_)), _) | (Err(_), Err(e @ Error::Io(_))) => Err(e),
+        (Err(re), Ok(_)) => Err(Error::Protocol(format!(
+            "done, but the mouse could not be handed back to onboard mode ({re}); {WAY_OUT}"
+        ))),
+        (Err(re), Err(e)) => Err(Error::Protocol(format!(
+            "{e}; and the mouse could not be handed back to onboard mode ({re}); {WAY_OUT}"
+        ))),
+    }
+}
+
 /// Device drives itself from stored profiles.
 pub const MODE_ONBOARD: u8 = 0x01;
 /// Host drives it. Required for live 0x8070 lighting.
@@ -111,23 +133,13 @@ impl OnboardProfiles {
             if let Err(e) = self.set_mode(dev, MODE_HOST) {
                 // A setter that timed out may still have been applied, and
                 // then the mouse is in host mode with nobody holding it. Put
-                // it back; the original error is the one worth reporting.
-                let _ = self.set_mode(dev, restore);
-                return Err(e);
+                // it back; the original error is the one worth reporting,
+                // unless the put-back fails as well.
+                return finish_host_mode(self.set_mode(dev, restore), Err(e));
             }
         }
         let out = f(dev);
-        match (self.set_mode(dev, restore), out) {
-            (_, Err(e)) => Err(e),
-            (Ok(()), Ok(v)) => Ok(v),
-            // `f` did its work, but the mouse is still in host mode and its
-            // stored profile is not applying. Say so rather than report a
-            // clean finish.
-            (Err(e), Ok(_)) => Err(Error::Protocol(format!(
-                "done, but the mouse could not be handed back to onboard mode ({e}); \
-                 run `logi mode onboard`"
-            ))),
-        }
+        finish_host_mode(self.set_mode(dev, restore), out)
     }
 
     /// Active profile, 0-based.
@@ -187,5 +199,52 @@ impl OnboardProfiles {
             offset += 16;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timeout() -> Error {
+        Error::Timeout { feature: 0x0c, function: 1 }
+    }
+
+    fn gone() -> Error {
+        Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "device disconnected"))
+    }
+
+    #[test]
+    fn a_clean_hand_back_passes_the_work_result_through() {
+        assert_eq!(finish_host_mode(Ok(()), Ok(7)).unwrap(), 7);
+        assert!(matches!(finish_host_mode::<()>(Ok(()), Err(timeout())), Err(Error::Timeout { .. })));
+    }
+
+    #[test]
+    fn a_failed_hand_back_after_good_work_is_not_a_clean_finish() {
+        let err = finish_host_mode(Err(timeout()), Ok(())).unwrap_err().to_string();
+        assert!(err.contains("could not be handed back") && err.contains("logi mode onboard"), "{err}");
+    }
+
+    #[test]
+    fn a_failed_hand_back_after_failed_work_reports_both() {
+        let err = finish_host_mode::<()>(Err(timeout()), Err(Error::Protocol("write refused".into())))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("write refused"), "{err}");
+        assert!(err.contains("could not be handed back") && err.contains("logi mode onboard"), "{err}");
+    }
+
+    #[test]
+    fn a_vanished_device_stays_an_io_error() {
+        assert!(matches!(finish_host_mode(Err(gone()), Ok(())), Err(Error::Io(_))));
+        assert!(matches!(
+            finish_host_mode::<()>(Err(timeout()), Err(gone())),
+            Err(Error::Io(_))
+        ));
+        assert!(matches!(
+            finish_host_mode::<()>(Err(gone()), Err(timeout())),
+            Err(Error::Io(_))
+        ));
     }
 }

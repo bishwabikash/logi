@@ -81,6 +81,23 @@ pub fn stamp_crc(data: &[u8]) -> Result<[u8; SECTOR_SIZE]> {
     Ok(out)
 }
 
+/// Re-word a failure that came after the device may already have taken bytes,
+/// so it cannot be read as "nothing happened". `template` carries `{e}` where
+/// the original error goes.
+///
+/// A vanished device keeps its `Io` class (and kind): that is how the worker
+/// knows to drop the handle, and a device that is gone mid-write is exactly
+/// when the sector is most likely to be half written.
+fn after_ack(e: Error, template: String) -> Error {
+    match e {
+        Error::Io(io) => {
+            let kind = io.kind();
+            Error::Io(std::io::Error::new(kind, template.replace("{e}", &io.to_string())))
+        }
+        e => Error::Protocol(template.replace("{e}", &e.to_string())),
+    }
+}
+
 /// Write one sector and verify the readback. Returns the bytes written.
 ///
 /// `data` goes down exactly as given, CRC included. That is deliberate: this
@@ -134,11 +151,14 @@ pub fn write_sector(
     // ends up half old and half new. The window is deliberately left
     // unclosed, as libratbag does, rather than committing a partial buffer.
     let partial = |e: Error| {
-        Error::Protocol(format!(
-            "sector {sector} write stopped part-way ({e}); it may now hold a \
-             mix of old and new bytes. Write it again, or restore a backup, \
-             before trusting it."
-        ))
+        after_ack(
+            e,
+            format!(
+                "sector {sector} write stopped part-way ({{e}}); it may now hold a \
+                 mix of old and new bytes. Write it again, or restore a backup, \
+                 before trusting it."
+            ),
+        )
     };
     for chunk in payload.chunks(CHUNK) {
         dev.call(idx, MEMORY_WRITE, chunk).map_err(partial)?;
@@ -147,16 +167,16 @@ pub fn write_sector(
     dev.call_short(idx, MEMORY_WRITE_END, &[]).map_err(partial)?;
 
     std::thread::sleep(SETTLE);
-    let back = profiles.read_sector(dev, sector, None).map_err(|e| match e {
-        // A vanished device stays an Io error: that is how the worker knows
-        // to drop the handle.
-        Error::Io(_) => e,
+    let back = profiles.read_sector(dev, sector, None).map_err(|e| {
         // The write itself was acknowledged, so a bare "no reply" would read
         // as "nothing happened" and invite a blind retry.
-        e => Error::Protocol(format!(
-            "sector {sector} was written but could not be read back to verify it ({e}). \
-             Read it again before trusting it."
-        )),
+        after_ack(
+            e,
+            format!(
+                "sector {sector} was written but could not be read back to verify it ({{e}}). \
+                 Read it again before trusting it."
+            ),
+        )
     })?;
     if back.len() != payload.len() {
         return Err(Error::Protocol(format!(
@@ -172,7 +192,9 @@ pub fn write_sector(
             .position(|(a, b)| a != b)
             .unwrap_or(0);
         return Err(Error::Protocol(format!(
-            "sector {sector} readback differs at offset 0x{at:02x}: wrote 0x{:02x}, read 0x{:02x}",
+            "sector {sector} readback differs at offset 0x{at:02x}: wrote 0x{:02x}, read 0x{:02x}. \
+             The write was acknowledged, so the sector may hold the new bytes, the old \
+             ones or a mix. Read it again before trusting it or retrying.",
             payload[at], back[at]
         )));
     }
@@ -409,6 +431,26 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_after_the_write_started_says_so_and_keeps_its_class() {
+        let t = "sector 1 write stopped part-way ({e}); it may hold a mix".to_string();
+        // A lost reply: a Protocol error that names the risk.
+        let timeout = Error::Timeout { feature: 0x0c, function: 7 };
+        match after_ack(timeout, t.clone()) {
+            Error::Protocol(m) => assert!(m.contains("part-way") && m.contains("no reply"), "{m}"),
+            e => panic!("expected Protocol, got {e:?}"),
+        }
+        // A vanished device: still Io, so the worker drops the handle.
+        let gone = Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "device disconnected"));
+        match after_ack(gone, t) {
+            Error::Io(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe);
+                assert!(io.to_string().contains("part-way") && io.to_string().contains("device disconnected"));
+            }
+            e => panic!("expected Io, got {e:?}"),
+        }
+    }
+
+    #[test]
     fn json_parse_rejects_empty() {
         assert!(dump_from_json("{}").is_err());
     }
@@ -442,6 +484,27 @@ fn changed(p: &Profile, blob: &[u8]) -> bool {
     p.serialize().as_slice() != blob
 }
 
+/// Read profile `index` for a read-modify-write, refusing what cannot be
+/// written back. Checked before any read so that "nothing to change" is never
+/// reported as success for a profile that does not exist or is in a layout this
+/// codec would misread.
+fn load_profile(
+    dev: &mut Device,
+    profiles: &OnboardProfiles,
+    index: u8,
+) -> Result<(Vec<u8>, Profile)> {
+    check_writable(profiles)?;
+    if index >= profiles.info.profile_count {
+        return Err(Error::Protocol(format!(
+            "profile {index} out of range 0..{}",
+            profiles.info.profile_count.saturating_sub(1)
+        )));
+    }
+    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
+    let p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    Ok((blob, p))
+}
+
 /// Store a report rate into a profile's flash sector.
 ///
 /// The live 0x8060 setter only works in host mode and is lost when the device
@@ -454,8 +517,7 @@ pub fn set_report_rate(
     hz: u16,
 ) -> Result<u16> {
     let ms = crate::rate::ReportRate::interval_ms(hz)?;
-    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
-    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    let (blob, mut p) = load_profile(dev, profiles, index)?;
     p.report_rate_ms = ms;
     if !changed(&p, &blob) {
         return Ok(hz);
@@ -481,8 +543,7 @@ pub fn set_button(
             limit.saturating_sub(1)
         )));
     }
-    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
-    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    let (blob, mut p) = load_profile(dev, profiles, index)?;
     p.buttons[button as usize] = binding;
     if !changed(&p, &blob) {
         return Ok(());
@@ -498,8 +559,7 @@ pub fn set_lighting(
     index: u8,
     leds: [crate::profile_blob::Led; 2],
 ) -> Result<()> {
-    let blob = profiles.read_sector(dev, index as u16 + 1, None)?;
-    let mut p = Profile::parse(&blob).map_err(Error::Protocol)?;
+    let (blob, mut p) = load_profile(dev, profiles, index)?;
     p.leds = leds;
     p.alt_leds = leds;
     if !changed(&p, &blob) {

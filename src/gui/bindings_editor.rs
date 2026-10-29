@@ -338,6 +338,9 @@ pub struct BindingsEditor {
     /// cannot report presses), so an earlier apply that answers later is not
     /// news about the file as it now stands.
     tail_unapplied: bool,
+    /// Where the last Save put the file it replaced, when that file held
+    /// something a rewrite would lose. Taken by the caller for the status line.
+    kept_copy: Option<std::path::PathBuf>,
     loaded: bool,
 }
 
@@ -364,6 +367,7 @@ impl BindingsEditor {
             awaiting_apply: None,
             pending_applies: 0,
             tail_unapplied: false,
+            kept_copy: None,
             loaded: false,
         }
     }
@@ -455,20 +459,49 @@ impl BindingsEditor {
         Ok((text, bindings.to_silence()))
     }
 
+    /// Buttons past this mouse's count that are set to Replace.
+    ///
+    /// `buttonspy` only takes 1..count, and the service checks the whole file's
+    /// Replace set against it before it starts: one such line and it brings up
+    /// no bindings at all. Saving anyway would silence the visible Replace
+    /// buttons in the mouse with nothing left to act on them.
+    fn hidden_replaces(&self, count: u8) -> Vec<u8> {
+        self.rows
+            .iter()
+            .filter(|r| r.button > count && r.mode == BindMode::Replace)
+            .map(|r| r.button)
+            .collect()
+    }
+
     /// Write the config file. Returns the buttons to silence on success.
     fn save(&mut self, count: u8) -> Result<Vec<u8>, String> {
+        self.save_to(&actions::config_path(), count)
+    }
+
+    fn save_to(&mut self, path: &std::path::Path, count: u8) -> Result<Vec<u8>, String> {
+        self.kept_copy = None;
         // Belt and braces: the Replace control refuses this already, so
         // reaching it here would mean a bug, and a bug must not be able to
         // write a file that unmaps every button.
         if all_replaced(&self.rows, count) {
             return Err("every button is set to Replace; leave at least one clicking".into());
         }
+        if let Some(e) = hidden_replace_error(&self.hidden_replaces(count), count) {
+            return Err(e);
+        }
         let keys = keymap();
         let (text, silence) = self.render(&keys).map_err(|errs| errs.join("; "))?;
-        let path = actions::config_path();
+        // Through a symlink, not over it: a config kept in a dotfiles
+        // repository is a link, and renaming a temporary onto the link would
+        // replace the link with a plain file and leave the real one stale.
+        let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
+        // Before anything is written: a rewrite drops comments and lines the
+        // editor could not parse, and a file it could not read at all would
+        // be replaced by whatever the rows now say.
+        let kept = keep_previous(&path, &keys)?;
         // Through a temporary in the same directory, then renamed. A plain
         // write truncates first, so a crash or a full disk between the two
         // leaves half a file — and the service reads this file as the user's
@@ -497,6 +530,7 @@ impl BindingsEditor {
         })?;
         self.saved = self.rows.clone();
         self.problems.clear();
+        self.kept_copy = kept;
         Ok(silence)
     }
 
@@ -541,18 +575,27 @@ impl BindingsEditor {
                     first.get_or_insert((key.name(), *modifiers));
                     false
                 }
+                // Only with Ctrl held. A dedicated Copy, Cut or Paste key
+                // arrives as the same event with no modifier, and recording
+                // it as a bare c, x or v would bind a different key.
                 egui::Event::Copy => {
-                    first.get_or_insert(("C", held));
+                    if held.command || held.ctrl {
+                        first.get_or_insert(("C", held));
+                    }
                     false
                 }
                 egui::Event::Cut => {
-                    first.get_or_insert(("X", held));
+                    if held.command || held.ctrl {
+                        first.get_or_insert(("X", held));
+                    }
                     false
                 }
                 // Not left in the queue either: a focused TextEdit would
                 // paste the clipboard into itself on the same press.
                 egui::Event::Paste(_) => {
-                    first.get_or_insert(("V", held));
+                    if held.command || held.ctrl {
+                        first.get_or_insert(("V", held));
+                    }
                     false
                 }
                 // Releases and repeats go too: half a press left behind is
@@ -657,8 +700,9 @@ impl BindingsEditor {
             self.capturing = None;
         }
         let keys = keymap();
-        let (bindings, errs) = self.to_bindings(&keys);
+        let (bindings, mut errs) = self.to_bindings(&keys);
         let silence = bindings.to_silence();
+        errs.extend(hidden_replace_error(&self.hidden_replaces(count), count));
 
         theme::section(ui, "Host bindings", |ui| {
             theme::readout(ui, &bindings.list.len().to_string(), "bound");
@@ -740,9 +784,9 @@ impl BindingsEditor {
                     ui,
                     &format!(
                         "The file also binds button {} — this mouse has {count}, so \
-                         there is no row for that above. It stays in the file as it is; \
-                         a Replace among these cannot be applied to this mouse, so Save \
-                         leaves it out of what it sends.",
+                         there is no row for that above. It stays in the file as it is. \
+                         A Replace among these blocks Save, because the service will not \
+                         run any bindings while one is in the file.",
                         hidden.join(", ")
                     ),
                 );
@@ -841,8 +885,9 @@ impl BindingsEditor {
                                 ui,
                                 "Waiting for a key press. Escape cancels. Super is not \
                                  visible to this window, so type super+l for that one; \
-                                 ctrl+v with an empty clipboard sends this window \
-                                 nothing at all, so type that one too.",
+                                 ctrl+v with an empty clipboard, and a dedicated \
+                                 Copy, Cut or Paste key, send this window nothing \
+                                 usable, so type those.",
                             );
                         }
                     }
@@ -1151,7 +1196,13 @@ impl BindingsEditor {
                             let silence: Vec<u8> =
                                 silence.into_iter().filter(|b| *b <= count).collect();
                             let after = snap.newest_outcome_id();
-                            let msg = self.queue_apply(apply, silence, after);
+                            let mut msg = self.queue_apply(apply, silence, after);
+                            if let Some(k) = self.kept_copy.take() {
+                                msg.push_str(&format!(
+                                    "; the file it replaced is kept as {}",
+                                    k.display()
+                                ));
+                            }
                             self.status = Some((msg, true));
                         }
                         Err(e) => self.status = Some((e, false)),
@@ -1257,6 +1308,54 @@ fn backup_confirmed(snap: &Snapshot) -> Option<bool> {
         .rev()
         .find(|o| o.kind == CmdKind::Backup)
         .map(|o| o.ok)
+}
+
+/// The error shown, and returned by Save, for Replace rows this mouse has no
+/// button for. `None` when there are none.
+fn hidden_replace_error(hidden: &[u8], count: u8) -> Option<String> {
+    if hidden.is_empty() {
+        return None;
+    }
+    let list: Vec<String> = hidden.iter().map(|b| b.to_string()).collect();
+    Some(format!(
+        "button {} is set to Replace, but this mouse has {count}. The service will \
+         not run any bindings while one is, so saving would silence buttons with \
+         nothing to act on them: forget that binding below, or put it back to Augment",
+        list.join(", ")
+    ))
+}
+
+/// Keep the file a Save is about to replace, when replacing it loses something.
+///
+/// The app's own output survives a parse and render unchanged, and then there
+/// is nothing to keep. Anything else (comments, lines the editor could not
+/// read, a file that is not UTF-8) is copied to `bindings.conf.bak` first. If
+/// that copy cannot be made the Save is refused, because the alternative is
+/// destroying a file nothing else holds.
+fn keep_previous(
+    path: &std::path::Path,
+    keys: &dyn Keymap,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {} to keep a copy before replacing it: {e}",
+                path.display()
+            ))
+        }
+    };
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        let (b, problems) = Bindings::parse(text, keys);
+        if problems.is_empty() && format!("{SAVE_HEADER}{}", b.render(keys)) == text {
+            return Ok(None);
+        }
+    }
+    let bak = path.with_extension("conf.bak");
+    std::fs::write(&bak, &bytes)
+        .map_err(|e| format!("cannot keep a copy of {} as {}: {e}", path.display(), bak.display()))?;
+    Ok(Some(bak))
 }
 
 fn default_backup_path() -> String {
@@ -1903,6 +2002,118 @@ mod tests {
         assert!(e.rows.iter().find(|r| r.button == 4).unwrap().key.is_empty());
         assert_eq!(e.rows.iter().find(|r| r.button == 4).unwrap().kind, Kind::None);
         assert_eq!(*left.borrow(), 0);
+    }
+
+    /// A scratch directory per test, so none of them touches the real config.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("logi-bindings-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The service refuses to run any bindings while the file holds a Replace
+    /// for a button the mouse lacks. Saving would still silence the visible
+    /// Replace buttons, leaving them dead with nothing listening.
+    #[test]
+    fn a_replace_past_the_mouse_s_buttons_blocks_save() {
+        let dir = scratch("hidden");
+        let path = dir.join("bindings.conf");
+        let mut e = editor("button 3 replace = nothing\nbutton 14 replace = nothing\n");
+        assert_eq!(e.hidden_replaces(11), vec![14]);
+        assert!(e.hidden_replaces(MAX_BUTTON).is_empty());
+        let err = e.save_to(&path, 11).expect_err("must be refused");
+        assert!(err.contains("14") && err.contains("11"), "{err}");
+        assert!(!path.exists(), "nothing may be written");
+
+        // Forgetting it (what the button under the hint does) lifts the block.
+        *e.rows.iter_mut().find(|r| r.button == 14).unwrap() = Row::blank(14);
+        assert_eq!(e.save_to(&path, 11), Ok(vec![3]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hand-written file is not silently destroyed by the first Save, and
+    /// the app's own output is not backed up over and over.
+    #[test]
+    fn save_keeps_what_a_rewrite_would_lose() {
+        let dir = scratch("keep");
+        let path = dir.join("bindings.conf");
+        let bak = dir.join("bindings.conf.bak");
+        let hand = "# my notes\nbutton 2 = key f5\nnonsense\n";
+        std::fs::write(&path, hand).unwrap();
+
+        let mut e = editor(hand);
+        e.rows.iter_mut().find(|r| r.button == 4).unwrap().kind = Kind::Text;
+        e.rows.iter_mut().find(|r| r.button == 4).unwrap().text = "hi".into();
+        e.save_to(&path, 11).unwrap();
+        assert_eq!(e.kept_copy.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), hand);
+
+        // The file is now the app's own output: saving again keeps nothing,
+        // and the copy of the hand-written one is left alone.
+        e.rows.iter_mut().find(|r| r.button == 4).unwrap().text = "hello".into();
+        e.save_to(&path, 11).unwrap();
+        assert_eq!(e.kept_copy, None);
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), hand);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file that cannot be read as text is what `load` shows as empty. A
+    /// Save from that empty state must not be the end of it.
+    #[test]
+    fn save_over_an_unreadable_file_keeps_its_bytes() {
+        let dir = scratch("binary");
+        let path = dir.join("bindings.conf");
+        let raw: &[u8] = b"button 2 = text caf\xe9\n";
+        std::fs::write(&path, raw).unwrap();
+        let mut e = editor("");
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        assert_eq!(std::fs::read(dir.join("bindings.conf.bak")).unwrap(), raw);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A config kept in a dotfiles repository is a symlink. The save goes
+    /// through it; replacing the link would strand the real file.
+    #[cfg(unix)]
+    #[test]
+    fn save_writes_through_a_symlink() {
+        let dir = scratch("link");
+        let real = dir.join("real.conf");
+        let link = dir.join("bindings.conf");
+        let app_made = format!("{SAVE_HEADER}");
+        std::fs::write(&real, &app_made).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut e = editor("");
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&link, 11).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(std::fs::read_to_string(&real).unwrap().contains("button 5 = mouse"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A dedicated Copy / Cut / Paste key reaches egui as the same event as
+    /// Ctrl+C, with no Ctrl held. Recorded as "c" it would bind a different
+    /// key than the one pressed, so it is swallowed and nothing is recorded.
+    #[test]
+    fn a_dedicated_clipboard_key_is_not_recorded_as_a_letter() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(""));
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            e.capturing = Some(4);
+            ui.input_mut(|i| {
+                i.modifiers = egui::Modifiers::NONE;
+                i.events.push(egui::Event::Copy);
+                i.events.push(egui::Event::Cut);
+                i.events.push(egui::Event::Paste("x".into()));
+            });
+            e.poll_capture(ui);
+            assert_eq!(ui.input(|i| i.events.len()), 0);
+        });
+        let e = ed.borrow();
+        assert_eq!(e.capturing, Some(4), "nothing was captured, so it stays armed");
+        assert!(e.rows.iter().find(|r| r.button == 4).unwrap().key.is_empty());
     }
 
     #[test]

@@ -246,6 +246,15 @@ impl Device {
     }
 
     fn frame(&self, feature: u8, function: u8, params: &[u8], long: bool) -> Result<Vec<u8>> {
+        // The function id is the high nibble of byte 3. Shifted as it stands,
+        // 16 would come out as function 0 and 17 as function 1: a request for
+        // something that does not exist, delivered as a getter or a setter
+        // that does.
+        if function > 0x0F {
+            return Err(Error::Protocol(format!(
+                "function {function} does not fit the 4-bit function field"
+            )));
+        }
         let size = if long { LONG_LEN } else { SHORT_LEN };
         let report = if long { LONG_REPORT } else { SHORT_REPORT };
         if 4 + params.len() > size {
@@ -484,6 +493,20 @@ mod tests {
         // And an error report, whose byte 3 is a feature index that could
         // have a zero low nibble.
         assert!(is_reply(&fault(0x10, 0x34, 0x08)));
+    }
+
+    #[test]
+    fn a_function_id_wider_than_a_nibble_is_refused_not_wrapped() {
+        // /dev/null stands in for the endpoint: `frame` only reads the device
+        // index, and nothing here is written anywhere.
+        let dev = Device::open("/dev/null").unwrap();
+        assert!(matches!(dev.frame(0x05, 16, &[], true), Err(Error::Protocol(_))));
+        assert!(matches!(dev.frame(0x05, 0xFF, &[], false), Err(Error::Protocol(_))));
+        let pkt = dev.frame(0x05, 15, &[7], true).unwrap();
+        assert_eq!(pkt.len(), LONG_LEN);
+        assert_eq!(pkt[2], 0x05);
+        assert_eq!(pkt[3], 0xF0 | software_id());
+        assert_eq!(pkt[4], 7);
     }
 
     #[test]

@@ -337,7 +337,7 @@ fn cmd_rate(args: &[String]) -> Result<(), CliError> {
                 // 0x8060 is rejected in onboard mode, so take host mode first.
                 let p = profiles::OnboardProfiles::new(dev)?;
                 let previous = p.mode(dev).unwrap_or(profiles::MODE_ONBOARD);
-                p.set_mode(dev, profiles::MODE_HOST)?;
+                enter_host_mode(&p, dev, previous)?;
                 if let Err(e) = r.set(dev, hz) {
                     // The rate did not change, so host mode bought nothing;
                     // leaving the mouse in it would stop its stored profile
@@ -365,6 +365,30 @@ fn cmd_rate(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
     }
+}
+
+/// Take host mode for a live write, handing the mouse back if the request
+/// itself fails.
+///
+/// A setter that timed out may still have been applied, and then the mouse is
+/// in host mode with nothing about the failure to say so: its stored profile
+/// stays unapplied until the user works out `logi mode onboard`. An endpoint
+/// that is gone needs no put-back, there being nothing to put it back on.
+fn enter_host_mode(
+    p: &profiles::OnboardProfiles,
+    dev: &mut hidpp::Device,
+    previous: u8,
+) -> Result<(), CliError> {
+    let Err(e) = p.set_mode(dev, profiles::MODE_HOST) else {
+        return Ok(());
+    };
+    if previous != profiles::MODE_HOST && !endpoint_gone(&e) {
+        if let Err(e2) = p.set_mode(dev, previous) {
+            eprintln!("logi: the mouse may be in host mode: {e2}");
+            eprintln!("      run `logi mode onboard` to hand it back.");
+        }
+    }
+    Err(e.into())
 }
 
 fn cmd_mode(arg: Option<&String>) -> Result<(), CliError> {
@@ -505,16 +529,25 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
     let mut f = open()?;
     let dev = &mut f.device;
     let l = led::Leds::new(dev)?;
+    // `cycle` is refused by this firmware whatever is sent, so it is answered
+    // before the mode is touched: taking host mode for it and handing it back
+    // is two setters, either of which can time out and land anyway, for a
+    // request that was never going to apply.
+    if let Spec::Cycle = spec {
+        l.cycle(dev, 0, 8000, 100)?;
+        println!("applied (live).");
+        return Ok(());
+    }
     let p = profiles::OnboardProfiles::new(dev)?;
     // Live lighting is inert in onboard mode, so take host mode first.
     let previous = p.mode(dev).unwrap_or(profiles::MODE_ONBOARD);
-    p.set_mode(dev, profiles::MODE_HOST)?;
+    enter_host_mode(&p, dev, previous)?;
 
     let r = (|| -> hidpp::Result<()> {
         match &spec {
             Spec::Off => l.all_off(dev),
-            // Returns a message explaining the two working routes.
-            Spec::Cycle => l.cycle(dev, 0, 8000, 100),
+            // Answered above, before host mode was taken.
+            Spec::Cycle => Ok(()),
             Spec::Breathing(c) => {
                 for z in 0..l.zone_count {
                     l.breathing(dev, z, *c, 4000, 0, 100)?;
@@ -527,8 +560,7 @@ fn cmd_led(args: &[String]) -> Result<(), CliError> {
     if let Err(e) = r {
         // Nothing was applied, so host mode bought nothing, and leaving the
         // mouse in it would mean its stored profile stays unapplied until the
-        // user works out that `logi mode onboard` is the way back. `cycle`
-        // always lands here: this firmware refuses to set it live.
+        // user works out that `logi mode onboard` is the way back.
         if previous != profiles::MODE_HOST {
             if let Err(e2) = p.set_mode(dev, previous) {
                 eprintln!("logi: the mouse is still in host mode: {e2}");
@@ -577,10 +609,25 @@ fn cmd_effect(args: &[String]) -> Result<(), CliError> {
             // SIGHUP's default of killing us, so a loop that ignored a hangup
             // would survive its terminal closing and hold the mouse in host
             // mode for as long as the session lasted.
-            while !leaving() {
+            //
+            // `is_finished()` too: the effect thread ends on its own when its
+            // writes keep failing, which is what an unplug looks like. A loop
+            // that waited only for Ctrl-C went on printing "running" over a
+            // mouse that was no longer being driven, then reported the
+            // hand-back as done and exited 0.
+            while !leaving() && !running.is_finished() {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            let ended_alone = running.is_finished() && !leaving();
             running.stop();
+            if ended_alone {
+                return Err(CliError::Failed(
+                    "the effect stopped by itself (the message above says why); the mouse \
+                     was handed back if it could be.\n\
+                     `logi mode` says which mode it is in."
+                        .into(),
+                ));
+            }
             // Not "returned to onboard mode". effects restores whichever mode
             // it found, so after `logi led <colour>` — which leaves the mouse
             // in host mode on purpose — this hands it back to host, and saying
@@ -659,6 +706,108 @@ fn nap_for(total: std::time::Duration) {
 
 fn nap(secs: u64) {
     nap_for(std::time::Duration::from_secs(secs));
+}
+
+/// The hidraw node whose button table this process has silenced and not yet
+/// restored.
+static OWED_RESTORE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Record that the table at `path` is about to be written with buttons
+/// silenced. Called before the write, not after: a reply lost to the timeout
+/// can hide a write that landed.
+fn owe_restore(path: &str) {
+    *OWED_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.to_string());
+}
+
+fn restore_done() {
+    *OWED_RESTORE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Put the table back from a panic hook.
+///
+/// Release builds abort on panic, so none of the teardown that follows a loop
+/// runs, and a silenced button outlives the process in non-volatile memory:
+/// the mouse that moves but cannot click. This opens the node afresh. The
+/// snapshot it takes reads the silenced table, but heals every zeroed slot to
+/// its own button, which is exactly the repair needed; and if even that read
+/// fails the factory identity is the fallback.
+fn emergency_restore(path: &str) {
+    // Not eprintln!: that panics when stderr is gone (a closed pipe, a
+    // terminal that hung up), and a panic inside a panic hook aborts at once,
+    // before the restore below has run. The reason for the first panic is very
+    // often exactly that failed print.
+    use std::io::Write as _;
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "logi: crashing with buttons silenced; putting the button mapping back");
+    let r = hidpp::Device::open(path).and_then(|mut d| {
+        let spy = buttonspy::ButtonSpy::new(&mut d)?;
+        spy.restore(&mut d).or_else(|_| spy.restore_identity(&mut d))
+    });
+    match r {
+        Ok(()) => {
+            let _ = writeln!(err, "logi: button mapping restored");
+        }
+        Err(e) => {
+            let _ = writeln!(
+                err,
+                "logi: COULD NOT RESTORE the button mapping: {e}. Run `logi bind reset`."
+            );
+        }
+    }
+}
+
+/// Make a closed pipe an error rather than a death.
+///
+/// `main` restores SIGPIPE's default so `logi info | head` exits quietly. The
+/// commands that silence buttons cannot take that: a default SIGPIPE kills the
+/// process on the spot, and neither the teardown nor the panic hook runs for a
+/// signal death, so `logi bind run 2>&1 | head -1` would leave every
+/// replace-bound button dead in the non-volatile table. Ignored, the failed
+/// print becomes a panic instead, and the hook puts the table back first.
+fn survive_closed_output() {
+    // SAFETY: setting a signal's disposition to ignore; no handler code runs.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+}
+
+/// Whether a table this process silenced is still not known to be put back.
+fn restore_owed() -> bool {
+    OWED_RESTORE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+}
+
+/// Settle a restore that an earlier run could not complete.
+///
+/// A teardown that fails because the mouse was unplugged leaves the silenced
+/// table in the device, and the table is non-volatile. Reconnecting is the first
+/// chance to fix it, and it must not depend on this connection having bindings
+/// to silence: with the file emptied in the meantime nothing else would ever
+/// touch the table again. The live table is compared first, so a silence that
+/// never landed costs no flash write.
+fn settle_owed_restore(dev: &mut hidpp::Device) -> hidpp::Result<()> {
+    let spy = buttonspy::ButtonSpy::new(dev)?;
+    let Some(saved) = spy.saved_remapping().map(|t| t.to_vec()) else {
+        return Err(hidpp::Error::Protocol(
+            "could not read the button remapping table to check it".into(),
+        ));
+    };
+    if spy.get_remapping(dev)? != saved {
+        spy.restore(dev)?;
+        eprintln!("logi: button mapping restored on the reconnected mouse");
+    }
+    Ok(())
+}
+
+/// Make a panic undo any silencing before the process dies.
+fn install_panic_restore() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        let owed = OWED_RESTORE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(path) = owed {
+            emergency_restore(&path);
+        }
+    }));
 }
 
 /// The endpoint itself is broken, as opposed to the device answering with an
@@ -806,8 +955,16 @@ fn cmd_bind(args: &[String]) -> Result<(), CliError> {
 /// device back.
 fn cmd_bind_run() -> Result<(), CliError> {
     let path = actions::config_path();
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| CliError::Failed(format!("reading {}: {e}", path.display())))?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CliError::Failed(format!(
+                "no bindings file at {}; `logi bind` writes an example to start from",
+                path.display()
+            ))
+        } else {
+            CliError::Failed(format!("reading {}: {e}", path.display()))
+        }
+    })?;
     let km = keymap();
     let (bindings, problems) = actions::Bindings::parse(&text, &km);
     for p in &problems {
@@ -836,6 +993,10 @@ fn cmd_bind_run() -> Result<(), CliError> {
         )));
     }
     let spy = buttonspy::ButtonSpy::new(&mut f.device)?;
+    let silence = bindings.to_silence();
+    // Before the spy starts, so a binding for a button this mouse lacks costs
+    // nothing instead of a table write on the way out.
+    silence_fits(&silence, spy.button_count()).map_err(CliError::Failed)?;
     let mut vd = uinput::VirtualDevice::new("logi virtual input").map_err(|e| {
         CliError::Failed(format!(
             "{e}\n\
@@ -850,7 +1011,8 @@ fn cmd_bind_run() -> Result<(), CliError> {
     // because a silenced button that outlives this process is a mouse the user
     // cannot fix by clicking.
     install_interrupt_handler();
-    let silence = bindings.to_silence();
+    install_panic_restore();
+    survive_closed_output();
     let mut silenced = false;
 
     let outcome = (|| -> Result<(), CliError> {
@@ -863,6 +1025,7 @@ fn cmd_bind_run() -> Result<(), CliError> {
         // hide a write that landed — the teardown below has to run either way.
         if !silence.is_empty() {
             silenced = true;
+            owe_restore(&f.device.path);
             spy.silence(&mut f.device, &silence)?;
         }
         let idx = spy.feature_index();
@@ -895,7 +1058,10 @@ fn cmd_bind_run() -> Result<(), CliError> {
     }
     if silenced {
         match spy.restore(&mut f.device) {
-            Ok(()) => println!("logi: button mapping restored"),
+            Ok(()) => {
+                restore_done();
+                println!("logi: button mapping restored")
+            }
             Err(e) => eprintln!(
                 "logi: COULD NOT RESTORE the button mapping: {e}\n\
                  Run `logi bind reset` to put it back."
@@ -929,14 +1095,47 @@ fn service_bindings() -> Option<actions::Bindings> {
     Some(b).filter(|b| !b.list.is_empty())
 }
 
-/// Whether there are bindings for the service to run, without reporting
-/// parse problems a second time.
-fn bindings_configured() -> bool {
-    let Ok(text) = std::fs::read_to_string(actions::config_path()) else {
-        return false;
+/// Whether the file at `path` holds bindings for the service to run, without
+/// reporting parse problems a second time.
+///
+/// Absent is `Ok(false)`; unreadable is an error the caller has to say out
+/// loud. Folding the two together made an idle service claim "no bindings" about
+/// a file the user could see, which is the defect `service_bindings` was fixed
+/// for, reached by the other door.
+fn bindings_in(path: &std::path::Path) -> Result<bool, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     let km = keymap();
-    !actions::Bindings::parse(&text, &km).0.list.is_empty()
+    Ok(!actions::Bindings::parse(&text, &km).0.list.is_empty())
+}
+
+/// True when `now` differs from what was last announced, and remembers it.
+///
+/// The service re-reads its files on every pass of its retry loop, every ten
+/// seconds while no mouse is attached; a bad line in the rules file would put
+/// the identical complaint in the journal on each of them.
+fn changed_since(announced: &mut Vec<String>, now: &[String]) -> bool {
+    if announced.as_slice() == now {
+        return false;
+    }
+    *announced = now.to_vec();
+    true
+}
+
+/// A silenced button must be one the mouse has. Checked before anything is
+/// sent: the table write that would otherwise reject it comes after the spy is
+/// started, and the teardown that follows its failure writes the table again,
+/// to flash, for a mistake in a text file.
+fn silence_fits(silence: &[u8], count: u8) -> Result<(), String> {
+    match silence.iter().find(|b| **b == 0 || **b > count) {
+        Some(b) => Err(format!(
+            "button {b} is bound with `replace`, but this mouse has buttons 1..{count}"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The background service.
@@ -946,9 +1145,12 @@ fn bindings_configured() -> bool {
 /// just flaps under systemd's restart policy and buries the real reason.
 fn cmd_serve() -> Result<(), CliError> {
     install_interrupt_handler();
+    install_panic_restore();
+    survive_closed_output();
     eprintln!("logi: service starting");
 
     let path = appwatch::config_path();
+    let bindings_path = actions::config_path();
     // Idling is the steady state with no rules, and repeating the same
     // sentence into the journal every minute forever buries everything else.
     let mut announced_idle = false;
@@ -956,6 +1158,8 @@ fn cmd_serve() -> Result<(), CliError> {
     // would otherwise put the identical line in the journal every ten seconds
     // for as long as the machine stayed up.
     let mut announced_problem: Option<String> = None;
+    let mut announced_bindings_problem: Option<String> = None;
+    let mut announced_parse: Vec<String> = Vec::new();
     while !stopping() {
         // A hangup is the unit's ExecReload. serve_once has already torn down
         // by the time we get here, so re-reading the file is all it takes.
@@ -963,6 +1167,8 @@ fn cmd_serve() -> Result<(), CliError> {
             eprintln!("logi: reloading {}", path.display());
             announced_idle = false;
             announced_problem = None;
+            announced_bindings_problem = None;
+            announced_parse.clear();
         }
         // A file that is there but unreadable is not the same as no file, and
         // saying "no rules" about it sends the user to write an example over
@@ -985,9 +1191,22 @@ fn cmd_serve() -> Result<(), CliError> {
         // run in it too, and the panel tells the user that with the service
         // up they work with the window closed. Idling on "no rules" alone made
         // that untrue for anyone who bound buttons and never wrote a rule.
+        //
+        // Asked only when there is nothing else to run: with rules present,
+        // serve_once reads the bindings itself and says if it cannot.
+        let mut have_bindings = || match bindings_in(&bindings_path) {
+            Ok(b) => b,
+            Err(msg) => {
+                if announced_bindings_problem.as_deref() != Some(msg.as_str()) {
+                    eprintln!("logi: {msg}; treating it as no bindings until it can be read");
+                    announced_bindings_problem = Some(msg);
+                }
+                false
+            }
+        };
         let cfg = match rules {
             None => {
-                if bindings_configured() {
+                if have_bindings() {
                     Some(appwatch::Config::default())
                 } else {
                     if !announced_idle {
@@ -1005,10 +1224,12 @@ fn cmd_serve() -> Result<(), CliError> {
             }
             Some(text) => {
                 let (cfg, problems) = appwatch::parse_rules(&text);
-                for p in &problems {
-                    eprintln!("logi: {}: {p}", path.display());
+                if changed_since(&mut announced_parse, &problems) {
+                    for p in &problems {
+                        eprintln!("logi: {}: {p}", path.display());
+                    }
                 }
-                if cfg.rules.is_empty() && cfg.fallback.is_none() && !bindings_configured() {
+                if cfg.rules.is_empty() && cfg.fallback.is_none() && !have_bindings() {
                     if !announced_idle {
                         eprintln!("logi: {} has no rules yet; idling", path.display());
                         announced_idle = true;
@@ -1068,6 +1289,25 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
                 have.saturating_sub(1)
             );
         }
+    }
+
+    // A restore an earlier connection could not finish, because the mouse went
+    // away under it. Before the stop check: this is a repair, not bring-up.
+    if has_spy && restore_owed() {
+        match settle_owed_restore(dev) {
+            Ok(()) => restore_done(),
+            Err(e) => eprintln!(
+                "logi: the button mapping may still be silenced from the last run: {e}. \
+                 `logi bind reset` puts it back."
+            ),
+        }
+    }
+
+    // Asked to stop or reload while connecting: bringing the spy up only to
+    // tear it straight down again is two writes to a non-volatile table for
+    // nothing.
+    if leaving() {
+        return Ok(());
     }
 
     // Button bindings are optional: no file, no bindings, or a device without
@@ -1183,7 +1423,10 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
         }
         if s.silenced {
             match s.spy.restore(dev) {
-                Ok(()) => eprintln!("logi: button mapping restored"),
+                Ok(()) => {
+                    restore_done();
+                    eprintln!("logi: button mapping restored")
+                }
                 Err(e) => eprintln!(
                     "logi: COULD NOT RESTORE the button mapping: {e}. \
                      Run `logi bind reset`."
@@ -1218,6 +1461,8 @@ fn start_spy(
     bindings: &actions::Bindings,
 ) -> Result<SpyState, hidpp::Error> {
     let spy = buttonspy::ButtonSpy::new(dev)?;
+    let silence = bindings.to_silence();
+    silence_fits(&silence, spy.button_count()).map_err(hidpp::Error::Protocol)?;
     let vd = uinput::VirtualDevice::new("logi virtual input").map_err(|e| {
         hidpp::Error::Protocol(format!(
             "{e} (install the udev rules with packaging/install.sh)"
@@ -1230,9 +1475,9 @@ fn start_spy(
     let mut silenced = false;
     let brought_up = (|| -> Result<hidpp::Device, hidpp::Error> {
         let listener = dev.open_listener()?;
-        let silence = bindings.to_silence();
         if !silence.is_empty() {
             silenced = true;
+            owe_restore(&dev.path);
             spy.silence(dev, &silence)?;
         }
         Ok(listener)
@@ -1242,11 +1487,12 @@ fn start_spy(
         Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced }),
         Err(e) => {
             if silenced {
-                if let Err(e2) = spy.restore(dev) {
-                    eprintln!(
+                match spy.restore(dev) {
+                    Ok(()) => restore_done(),
+                    Err(e2) => eprintln!(
                         "logi: COULD NOT RESTORE the button mapping: {e2}. \
                          Run `logi bind reset`."
-                    );
+                    ),
                 }
             }
             if let Err(e2) = spy.stop(dev) {
@@ -1516,6 +1762,65 @@ mod tests {
         let took = t.elapsed();
         assert!(took >= Duration::from_millis(100), "returned early, after {took:?}");
         assert!(took < Duration::from_millis(900), "overslept {took:?}");
+    }
+
+    #[test]
+    fn a_silenced_button_must_exist_on_the_mouse() {
+        assert!(super::silence_fits(&[], 11).is_ok());
+        assert!(super::silence_fits(&[1, 11], 11).is_ok());
+        assert!(super::silence_fits(&[12], 11).is_err());
+        assert!(super::silence_fits(&[3, 0], 11).is_err());
+        let msg = super::silence_fits(&[12], 11).unwrap_err();
+        assert!(msg.contains("12") && msg.contains("1..11"), "{msg}");
+    }
+
+    #[test]
+    fn a_complaint_is_repeated_only_when_it_changes() {
+        let mut seen = Vec::new();
+        let a = vec!["line 3: bad".to_string()];
+        assert!(super::changed_since(&mut seen, &a));
+        assert!(!super::changed_since(&mut seen, &a));
+        let b = vec!["line 3: bad".to_string(), "line 5: worse".to_string()];
+        assert!(super::changed_since(&mut seen, &b));
+        // Fixed, then broken the same way again: said again.
+        assert!(super::changed_since(&mut seen, &[]));
+        assert!(super::changed_since(&mut seen, &a));
+    }
+
+    #[test]
+    fn bindings_file_states_are_told_apart() {
+        let dir = std::env::temp_dir().join(format!("logi-main-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Absent is not an error: the service just has no bindings.
+        assert_eq!(super::bindings_in(&dir.join("absent.conf")), Ok(false));
+
+        let empty = dir.join("empty.conf");
+        std::fs::write(&empty, "# nothing here\n").unwrap();
+        assert_eq!(super::bindings_in(&empty), Ok(false));
+
+        let some = dir.join("some.conf");
+        std::fs::write(&some, "button 4 = key ctrl+c\n").unwrap();
+        assert_eq!(super::bindings_in(&some), Ok(true));
+
+        // Present but not readable as text is an error, not "no bindings".
+        let bad = dir.join("bad.conf");
+        std::fs::write(&bad, [0x62u8, 0x75, 0xff, 0xfe]).unwrap();
+        let err = super::bindings_in(&bad).unwrap_err();
+        assert!(err.contains("bad.conf"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unfinished_restore_is_remembered_until_it_is_done() {
+        // The only test that touches the process-wide record, so it cannot
+        // race another.
+        assert!(!super::restore_owed());
+        super::owe_restore("/dev/hidraw-test");
+        assert!(super::restore_owed());
+        super::restore_done();
+        assert!(!super::restore_owed());
     }
 
     #[test]

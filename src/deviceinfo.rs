@@ -4,7 +4,7 @@
 //! table, which is what makes supporting an arbitrary Logitech mouse possible.
 
 use crate::features;
-use crate::hidpp::{Device, Result};
+use crate::hidpp::{Device, Error, Result};
 
 const NAME_COUNT: u8 = 0x00;
 const NAME_GET: u8 = 0x01;
@@ -80,8 +80,24 @@ pub fn firmware(dev: &mut Device) -> Result<Vec<Firmware>> {
     let idx = dev.feature_index(features::DEVICE_FW_VERSION)?;
     let n = dev.call(idx, FW_COUNT, &[])?.first().copied().unwrap_or(0);
     let mut out = Vec::new();
+    // `n` is the device's own claim, and an entity that does not answer costs a
+    // full reply timeout. A vanished endpoint ends the walk at once, and a run
+    // of silence ends it as `Capabilities::probe` does, instead of spending
+    // minutes on a count of 255.
+    let mut quiet = 0u8;
     for e in 0..n {
-        let Ok(p) = dev.call(idx, FW_INFO, &[e]) else { continue };
+        let p = match dev.call(idx, FW_INFO, &[e]) {
+            Ok(p) => p,
+            Err(err @ Error::Io(_)) => return Err(err),
+            Err(_) => {
+                quiet += 1;
+                if quiet >= 3 {
+                    break;
+                }
+                continue;
+            }
+        };
+        quiet = 0;
         if p.len() < 8 {
             continue;
         }

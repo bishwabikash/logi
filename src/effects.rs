@@ -121,25 +121,38 @@ pub fn frame(name: &str, t: f32, color: [u8; 3], period_s: f32, zones: usize) ->
         .collect()
 }
 
-/// Refuse a feature the firmware flags hidden, engineering or manufacturing.
-/// One the device never reported is left to the lookup that follows, which
-/// names it.
+/// Refuse a feature this app may not drive: one the firmware flags hidden,
+/// engineering or manufacturing, and one the device's feature table does not
+/// list at all.
+///
+/// The second case matters because the table is read with a bounded patience
+/// (a run of silent entries ends the walk), so a feature missing from it may
+/// simply not have been reached. Leaving that to the root-feature lookup that
+/// follows would find it, and drive it, with the flag never having been seen.
+/// For a table read in full the outcome is the same error that lookup gives.
 fn require_drivable(caps: &Capabilities, id: u16) -> hidpp::Result<()> {
-    if caps.supports(id) && !caps.usable(id) {
+    if caps.usable(id) {
+        return Ok(());
+    }
+    if caps.supports(id) {
         return Err(hidpp::Error::Protocol(format!(
             "this device flags feature 0x{id:04x} as hidden or engineering, which \
              this app does not drive"
         )));
     }
-    Ok(())
+    Err(hidpp::Error::NoSuchFeature(id))
 }
 
 /// The device, held in host mode for as long as an effect is running.
 ///
 /// Opening it, taking host mode and handing the mouse back all live here so
 /// there is exactly one exit path. Dropping a `Session` restores the previous
-/// mode, so a thread that never started, returned early or unwound still gives
-/// the mouse back instead of leaving its lighting owned by a dead process.
+/// mode, so a thread that never started or returned early still gives the
+/// mouse back instead of leaving its lighting owned by a dead process.
+///
+/// A panic is not covered: release builds abort rather than unwind, so Drop
+/// never runs for one. Nothing on the effect path may panic, and `logi mode
+/// onboard` is the way back if the process dies while holding host mode.
 struct Session {
     dev: hidpp::Device,
     leds: Leds,
@@ -203,7 +216,8 @@ impl Session {
             return;
         }
         self.released = true;
-        for _ in 0..2 {
+        const ATTEMPTS: u32 = 3;
+        for attempt in 0..ATTEMPTS {
             match self.profiles.set_mode(&mut self.dev, self.restore) {
                 Ok(()) => return,
                 // The endpoint is gone; another try is against nothing.
@@ -211,6 +225,11 @@ impl Session {
                 Err(_) => {
                     if matches!(self.profiles.mode(&mut self.dev), Ok(m) if m == self.restore) {
                         return;
+                    }
+                    // A busy device refuses the same request again if it is
+                    // repeated at once.
+                    if attempt + 1 < ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(200));
                     }
                 }
             }
@@ -408,11 +427,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unflagged_or_unreported_feature_is_left_to_the_lookup() {
+    fn an_unflagged_feature_is_driven_and_an_unlisted_one_is_not() {
         let id = features::COLOR_LED_EFFECTS;
         assert!(require_drivable(&caps(&[(id, 0x00)]), id).is_ok());
         assert!(require_drivable(&caps(&[(id, 0x80)]), id).is_ok());
-        assert!(require_drivable(&caps(&[]), id).is_ok());
+        // Not in the table as read: it may be a flagged entry the walk never
+        // reached, so it is refused rather than left to the root lookup.
+        assert!(matches!(
+            require_drivable(&caps(&[]), id),
+            Err(hidpp::Error::NoSuchFeature(f)) if f == id
+        ));
     }
 
     #[test]

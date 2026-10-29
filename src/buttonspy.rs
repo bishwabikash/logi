@@ -224,18 +224,27 @@ impl ButtonSpy {
 /// ApplyBindings has no teardown of its own, so this message is the only
 /// warning its user gets.
 ///
-/// `Error::Io` passes through untouched even then. The device worker reads that
-/// variant as "the mouse vanished" and drops its handle to reconnect; hiding it
-/// inside a Protocol error would leave it holding a dead descriptor.
+/// `Error::Io` stays an `Error::Io` even then, with the same kind. The device
+/// worker reads that variant as "the mouse vanished" and drops its handle to
+/// reconnect; hiding it inside a Protocol error would leave it holding a dead
+/// descriptor. But an unplug or a read error is also the way a write whose
+/// reply was lost looks, and the table is non-volatile, so the warning rides
+/// inside the Io error's message rather than being dropped.
 fn silence_failure(e: Error, put_back: Result<()>) -> Error {
-    match (put_back, e) {
-        (Ok(()), e) => e,
-        (Err(_), e @ Error::Io(_)) => e,
-        (Err(e2), e) => Error::Protocol(format!(
-            "{e}. Putting the previous button mapping back also failed ({e2}), so \
+    let warn = |cause: &dyn std::fmt::Display, e2: &Error| {
+        format!(
+            "{cause}. Putting the previous button mapping back also failed ({e2}), so \
              some buttons may be dead. Use the restore button, or run \
              `logi bind reset`, to put the factory mapping back."
-        )),
+        )
+    };
+    match (put_back, e) {
+        (Ok(()), e) => e,
+        (Err(e2), Error::Io(io)) => {
+            let msg = warn(&io, &e2);
+            Error::Io(std::io::Error::new(io.kind(), msg))
+        }
+        (Err(e2), e) => Error::Protocol(warn(&e, &e2)),
     }
 }
 
@@ -571,11 +580,22 @@ mod tests {
         assert!(msg.contains("dead"), "{msg}");
         assert!(msg.contains("logi bind reset"), "{msg}");
 
-        // An unplug stays an Io error, which is what makes the worker
-        // reconnect.
+        // An unplug stays an Io error of the same kind, which is what makes
+        // the worker reconnect, and still carries the warning: the write may
+        // have landed before the device went.
         let gone = Error::Io(io_err());
         let e = silence_failure(gone, Err(timeout()));
+        match &e {
+            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::BrokenPipe),
+            other => panic!("{other:?}"),
+        }
+        let msg = format!("{e}");
+        assert!(msg.contains("dead") && msg.contains("logi bind reset"), "{msg}");
+
+        // A clean put-back after an Io failure adds nothing.
+        let e = silence_failure(Error::Io(io_err()), Ok(()));
         assert!(matches!(e, Error::Io(_)), "{e:?}");
+        assert!(!format!("{e}").contains("dead"));
     }
 
     fn io_err() -> std::io::Error {

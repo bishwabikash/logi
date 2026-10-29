@@ -111,12 +111,16 @@ fn interrogate(mut dev: Device, pid: u16, path: PathBuf) -> Option<Found> {
 pub fn list_devices() -> Vec<Found> {
     let mut found = Vec::new();
     for (path, pid) in candidates() {
+        // One entry per physical device, not per interface. A device already
+        // found is not opened again through its sibling nodes: each one that
+        // does not answer costs a full reply timeout, and each is a write to
+        // an interface that was never meant to receive HID++.
+        if found.iter().any(|e: &Found| e.pid == pid) {
+            continue;
+        }
         let Ok(dev) = Device::open(&path) else { continue };
         if let Some(f) = interrogate(dev, pid, path) {
-            // One entry per physical device, not per interface.
-            if !found.iter().any(|e: &Found| e.pid == f.pid) {
-                found.push(f);
-            }
+            found.push(f);
         }
     }
     found

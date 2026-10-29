@@ -121,6 +121,14 @@ impl Cmd {
         }
     }
 
+    /// True when running this can change the onboard mode without taking host
+    /// mode: the ones that switch back to onboard. After a failure of one of
+    /// these the mode has to be read again, because the switch may have landed
+    /// without its reply.
+    fn touches_mode(&self) -> bool {
+        matches!(self, Cmd::SetMode(_) | Cmd::PersistLighting { .. })
+    }
+
     /// True when running this leaves the decoded profiles in the snapshot
     /// stale, so they have to be read again. `Refresh` is in here because
     /// that re-read is its whole job.
@@ -214,6 +222,17 @@ impl Snapshot {
             self.error = o.message.clone();
             self.notice = None;
         }
+        self.record_silent(o);
+    }
+
+    /// Record an outcome in the ring only, leaving the status bar's `error`
+    /// and `notice` as they are.
+    ///
+    /// For a command that was answered without being run, such as a Refresh
+    /// folded into the one just executed: it needs an answer so a panel waiting
+    /// on it is not left waiting, but it has nothing to say, and `record` would
+    /// wipe the notice of the command that did the work.
+    pub fn record_silent(&mut self, o: Outcome) {
         if self.outcomes.len() >= OUTCOME_HISTORY {
             let over = self.outcomes.len() + 1 - OUTCOME_HISTORY;
             self.outcomes.drain(..over);
@@ -255,6 +274,69 @@ pub struct ZoneInfo {
     pub live_modes: Vec<u8>,
 }
 
+/// How the exit-time restore gets the device to itself.
+///
+/// The restore opens its own handle on the node, and so does everything the
+/// worker does. Both speak with the same software id, so two handles talking
+/// at once can each take the other's reply for their own, and a worker still
+/// working through a queue would put the mouse back in host mode (a live
+/// lighting command switches into it first) right after the restore took it
+/// out, with the process ending before anything noticed.
+///
+/// So the restore closes the gate and waits for the worker to be between
+/// pieces of work. The worker claims the gate before it touches the device and
+/// is refused once it is closed. Both sides use `SeqCst`, which is what makes
+/// "I set `busy`, then saw `closing` clear" and "I set `closing`, then saw
+/// `busy` clear" impossible together.
+struct Gate {
+    closing: std::sync::atomic::AtomicBool,
+    busy: std::sync::atomic::AtomicBool,
+}
+
+/// Held by the worker for as long as it may be touching the device.
+struct Busy<'a>(&'a Gate);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Gate {
+    fn new() -> Self {
+        Gate {
+            closing: std::sync::atomic::AtomicBool::new(false),
+            busy: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Claim the device for one piece of work. `None` once the gate is closed,
+    /// in which case the caller must leave the device alone.
+    fn enter(&self) -> Option<Busy<'_>> {
+        self.busy.store(true, Ordering::SeqCst);
+        if self.closing.load(Ordering::SeqCst) {
+            self.busy.store(false, Ordering::SeqCst);
+            return None;
+        }
+        Some(Busy(self))
+    }
+
+    /// Refuse all further work, then wait up to `limit` for the piece in
+    /// progress to finish. True if the worker is idle, false if it was still
+    /// busy when the limit ran out.
+    fn close_and_wait(&self, limit: Duration) -> bool {
+        self.closing.store(true, Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + limit;
+        while self.busy.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+}
+
 pub struct Handle {
     tx: Sender<(CmdId, Cmd)>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -264,6 +346,49 @@ pub struct Handle {
     /// Set while the worker holds the device in host mode, so shutdown knows
     /// whether it has to hand the mouse back.
     host_held: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<Gate>,
+}
+
+/// Put the mouse back in onboard mode and make sure it took.
+///
+/// A setter whose reply was lost may still have landed, so after a failure
+/// the mode is read before another try. Stops at once on an Io error: the
+/// endpoint is gone and another try is against nothing.
+fn back_to_onboard(p: &OnboardProfiles, dev: &mut Device) -> crate::hidpp::Result<()> {
+    const ATTEMPTS: u32 = 3;
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        match p.set_mode(dev, MODE_ONBOARD) {
+            Ok(()) => return Ok(()),
+            Err(e @ crate::hidpp::Error::Io(_)) => return Err(e),
+            Err(e) => {
+                if matches!(p.mode(dev), Ok(m) if m == MODE_ONBOARD) {
+                    return Ok(());
+                }
+                last = Some(e);
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    match last {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Whether the mouse should be handed back at exit, given what is known.
+///
+/// `mode` is what was just read off the device, or `None` if the read failed;
+/// a failed read must leave the earlier answer standing. It used to read as
+/// "onboard" by way of a stale snapshot field, which cleared the flag exactly
+/// when the device was misbehaving and a lost mode switch was most likely.
+fn host_held_after(prev: bool, mode: Option<u8>, takes_host: bool) -> bool {
+    match mode {
+        Some(m) => m == crate::profiles::MODE_HOST || takes_host,
+        None => prev || takes_host,
+    }
 }
 
 impl Handle {
@@ -301,25 +426,51 @@ impl Handle {
         self.host_held.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Put the mouse back into onboard mode, synchronously.
+    /// Put the mouse back into onboard mode, synchronously. For exit.
     ///
     /// Host mode leaves the stored profile unapplied, so the mouse would keep
     /// whatever lighting this app last pushed after it exits. Done here rather
     /// than as a command the worker might never reach.
+    ///
+    /// The worker is shut out first and given a moment to finish what it is
+    /// doing; see `Gate`. That also makes `host_held` final by the time it is
+    /// read. After this the worker refuses every command.
     pub fn restore_onboard_blocking(&self) {
+        self.gate.close_and_wait(Duration::from_secs(5));
         if !self.host_held() {
             return;
         }
-        if let Ok(f) = crate::discover::open_device() {
-            let mut dev = f.device;
-            if let Ok(p) = crate::profiles::OnboardProfiles::new(&mut dev) {
-                let _ = p.set_mode(&mut dev, crate::profiles::MODE_ONBOARD);
+        // One lost reply must not be the end of it: the mouse would keep
+        // ignoring its stored profile after the app is gone, and nothing is
+        // left running to switch it back. So the whole sequence, opening the
+        // device included, is tried again, not only the setter. This mirrors
+        // the effect session's release, which hands the mouse back the same
+        // way on its own exit.
+        const ATTEMPTS: u32 = 3;
+        for attempt in 0..ATTEMPTS {
+            if hand_back_once() {
+                return;
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(Duration::from_millis(300));
             }
         }
     }
 
     pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().map(|s| s.clone()).unwrap_or_default()
+    }
+}
+
+/// One try at handing the mouse back on a handle of its own. True when the
+/// job is done or cannot be done by trying again (the endpoint is gone).
+fn hand_back_once() -> bool {
+    let Ok(found) = crate::discover::open_device() else { return false };
+    let mut dev = found.device;
+    let Ok(p) = OnboardProfiles::new(&mut dev) else { return false };
+    match back_to_onboard(&p, &mut dev) {
+        Ok(()) | Err(crate::hidpp::Error::Io(_)) => true,
+        Err(_) => false,
     }
 }
 
@@ -331,12 +482,14 @@ pub fn spawn() -> Handle {
     let shared = Arc::clone(&snapshot);
     let host_held = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let held = Arc::clone(&host_held);
+    let gate = Arc::new(Gate::new());
+    let worker_gate = Arc::clone(&gate);
     std::thread::Builder::new()
         .name("logi-device".into())
-        .spawn(move || worker(rx, shared, held))
+        .spawn(move || worker(rx, shared, held, worker_gate))
         .expect("spawn device thread");
     // Ids start at 1 so that 0 can mean "no outcome recorded yet".
-    Handle { tx, snapshot, next_id: Arc::new(AtomicU64::new(1)), host_held }
+    Handle { tx, snapshot, next_id: Arc::new(AtomicU64::new(1)), host_held, gate }
 }
 
 /// Which node an effect thread is holding open, as the filesystem names it.
@@ -447,7 +600,11 @@ fn connect() -> Result<Live, String> {
 /// Kept separate from the profile sectors deliberately. Reading all five
 /// profiles is 80 round trips, which is over a second of latency; doing that
 /// after every click made the UI feel hung.
-fn read_state(l: &mut Live, into: &mut Snapshot) {
+///
+/// Returns whether the onboard mode was read off the device this time, as
+/// opposed to `into.mode` being left at whatever it held before.
+fn read_state(l: &mut Live, into: &mut Snapshot) -> bool {
+    let mut mode_read = false;
     into.connected = true;
     into.model = l.name.clone();
     into.kind = l.kind.clone();
@@ -479,7 +636,10 @@ fn read_state(l: &mut Live, into: &mut Snapshot) {
         into.button_count = p.info.button_count;
         into.profile_format = p.info.profile_format_id;
         into.active_profile = p.current(&mut l.dev).unwrap_or(into.active_profile);
-        into.mode = p.mode(&mut l.dev).unwrap_or(into.mode);
+        if let Ok(m) = p.mode(&mut l.dev) {
+            into.mode = m;
+            mode_read = true;
+        }
         l.profiles = Some(p);
     }
     if into.zones.is_empty() {
@@ -496,6 +656,21 @@ fn read_state(l: &mut Live, into: &mut Snapshot) {
                 .collect();
             l.leds = Some(leds);
         }
+    }
+    mode_read
+}
+
+/// Read just the onboard mode into the snapshot. True if it was read.
+fn read_mode(l: &mut Live, into: &mut Snapshot) -> bool {
+    let Some(p) = l.profiles.take() else { return false };
+    let read = p.mode(&mut l.dev);
+    l.profiles = Some(p);
+    match read {
+        Ok(m) => {
+            into.mode = m;
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -529,10 +704,30 @@ fn decode_profiles(
     out
 }
 
+/// Replace the snapshot's profiles with what a re-read found.
+///
+/// Always replaces, even with nothing. Keeping the old list when the re-read
+/// came back empty left the pre-write profile standing after a failed flash
+/// write, which is exactly the case the re-read exists for: the sector may have
+/// changed, the device is not answering, and the editor would then edit and
+/// write back a profile that is no longer what the mouse holds. An absent
+/// profile is rendered as "not read off the mouse yet", which is true.
+///
+/// True if every profile that was expected came back.
+fn adopt_profiles(into: &mut Vec<Profile>, read: Vec<Profile>, expected: usize) -> bool {
+    let complete = read.len() >= expected;
+    *into = read;
+    complete
+}
+
 /// The expensive part: every profile sector, 80 round trips. Only worth doing
 /// on an explicit refresh or after something wrote flash.
-fn read_profiles(l: &mut Live, into: &mut Snapshot) {
-    let Some(p) = l.profiles.take() else { return };
+///
+/// True if there is nothing left unread: every profile came back, or the
+/// device has no layout this app decodes so there is nothing to read.
+fn read_profiles(l: &mut Live, into: &mut Snapshot) -> bool {
+    let Some(p) = l.profiles.take() else { return true };
+    let mut complete = true;
     // Only the 256-byte format-2 layout is decodable; another device may use a
     // different one, and guessing at it would print nonsense.
     if p.info.profile_format_id == 2 && p.info.sector_size as usize == crate::profile_blob::SECTOR_SIZE
@@ -540,11 +735,20 @@ fn read_profiles(l: &mut Live, into: &mut Snapshot) {
         let count = into.profile_count;
         let dev = &mut l.dev;
         let out = decode_profiles((0..count).map(|i| p.read_sector(dev, i as u16 + 1, None)));
-        if !out.is_empty() {
-            into.profiles = out;
-        }
+        complete = adopt_profiles(&mut into.profiles, out, count as usize);
     }
     l.profiles = Some(p);
+    complete
+}
+
+/// Say so when a re-read came back short, whatever else the command had to
+/// report. A Refresh that read two profiles of five used to answer with
+/// nothing at all, which reads as success.
+fn note_short_read(notice: Option<String>, got: usize, want: usize) -> Option<String> {
+    Some(match notice {
+        None => format!("read {got} of {want} profiles; the rest would not read"),
+        Some(n) => format!("{n}; only {got} of {want} profiles could be read back"),
+    })
 }
 
 /// Write a sector dump to `path`, or leave the file alone and say why.
@@ -631,6 +835,7 @@ fn worker(
     rx: Receiver<(CmdId, Cmd)>,
     shared: Arc<Mutex<Snapshot>>,
     host_held: Arc<std::sync::atomic::AtomicBool>,
+    gate: Arc<Gate>,
 ) {
     let mut live: Option<Live> = None;
     let mut effect: Option<effects::Running> = None;
@@ -642,26 +847,42 @@ fn worker(
     // The worker's own copy. Mutated freely here and published in one clone,
     // so no device read ever happens with the UI's lock held.
     let mut snap = Snapshot::default();
+    // Why an effect ended, held over the reconnect that follows. Reconnecting
+    // wipes `error` along with everything else read off the device, so a
+    // message set at retirement was gone again before the UI could draw it.
+    let mut carried_error: Option<String> = None;
 
     loop {
         // Reconnect lazily so unplug/replug is handled without crashing.
+        //
+        // Not once the gate is closed: the exit-time restore has the device to
+        // itself, and probing it now would talk over that.
+        let mut back_off = false;
         if live.is_none() && effect.is_none() {
-            match connect() {
-                Ok(mut l) => {
-                    reset_for_connect(&mut snap);
-                    read_state(&mut l, &mut snap);
-                    read_profiles(&mut l, &mut snap);
-                    live = Some(l);
-                    publish(&shared, &snap);
-                }
-                Err(e) => {
-                    snap.connected = false;
-                    snap.error = Some(e);
-                    publish(&shared, &snap);
-                    // Back off; a missing device is the normal idle state.
-                    std::thread::sleep(Duration::from_millis(1500));
+            if let Some(_busy) = gate.enter() {
+                match connect() {
+                    Ok(mut l) => {
+                        reset_for_connect(&mut snap);
+                        read_state(&mut l, &mut snap);
+                        read_profiles(&mut l, &mut snap);
+                        snap.error = carried_error.take();
+                        live = Some(l);
+                        publish(&shared, &snap);
+                    }
+                    Err(e) => {
+                        carried_error = None;
+                        snap.connected = false;
+                        snap.error = Some(e);
+                        publish(&shared, &snap);
+                        back_off = true;
+                    }
                 }
             }
+        }
+        if back_off {
+            // A missing device is the normal idle state. Slept outside the
+            // gate, so a restore at exit is not made to wait out the back-off.
+            std::thread::sleep(Duration::from_millis(1500));
         }
 
         // Anything queued by the previous iteration runs before we block.
@@ -693,6 +914,11 @@ fn worker(
                                 "the effect ended because the mouse was disconnected"
                                     .to_string(),
                             );
+                            // Carried like the message below: if the mouse is
+                            // already back by the time the loop top reconnects,
+                            // the reconnect wipes `error`, and this was the
+                            // only explanation for the effect having stopped.
+                            carried_error = snap.error.clone();
                         } else {
                             // Still connected, so do not say otherwise. The
                             // loop top reconnects now that `effect` is clear.
@@ -700,6 +926,7 @@ fn worker(
                                 "the effect stopped on its own; start it again to retry"
                                     .to_string(),
                             );
+                            carried_error = snap.error.clone();
                         }
                         publish(&shared, &snap);
                     }
@@ -709,6 +936,16 @@ fn worker(
             },
         };
         let kind = cmd.kind();
+
+        // From here until the end of the iteration the device may be touched.
+        // Once the exit-time restore has closed the gate nothing more runs: a
+        // command that put the mouse back in host mode after the restore took
+        // it out would outlive the app.
+        let Some(_busy) = gate.enter() else {
+            snap.record(Outcome::failed(id, kind, "the app is closing"));
+            publish(&shared, &snap);
+            continue;
+        };
 
         // Every command ends a running effect first: the effect thread holds
         // its own handle on the device, and two owners would interleave
@@ -749,6 +986,7 @@ fn worker(
         // flag is set nothing at exit will hand the mouse back. See
         // `Cmd::takes_host_mode`.
         let takes_host = cmd.takes_host_mode();
+        let touches_mode = takes_host || cmd.touches_mode();
         if takes_host {
             host_held.store(true, Ordering::Relaxed);
         }
@@ -816,7 +1054,18 @@ fn worker(
                     prof.leds = recs;
                     prof.alt_leds = recs;
                     profile_io::write_profile(dev, p, idx, &prof)?;
-                    p.set_mode(dev, MODE_ONBOARD)?;
+                    // The flash write is done by now, so a failure here must
+                    // not read as a failed write. It does matter though: the
+                    // mouse is still in host mode and not applying what was
+                    // just stored.
+                    back_to_onboard(p, dev).map_err(|e| match e {
+                        io @ crate::hidpp::Error::Io(_) => io,
+                        other => crate::hidpp::Error::Protocol(format!(
+                            "the lighting was stored, but the mouse could not be \
+                             switched back to onboard mode ({other}); choose Onboard \
+                             under Memory mode"
+                        )),
+                    })?;
                     Ok(Some("stored to onboard profile (survives unplug)".into()))
                 })
             }
@@ -891,18 +1140,33 @@ fn worker(
             Cmd::StopEffect => Ok(None),
         };
 
+        // True once this command has left both the live state and the profile
+        // sectors freshly read, which is what makes a queued Refresh redundant.
+        let mut reread = false;
         match result {
-            Ok(notice) => {
-                read_state(l, &mut snap);
+            Ok(mut notice) => {
+                let mode_read = read_state(l, &mut snap);
                 if wrote_flash || snap.profiles.is_empty() {
-                    read_profiles(l, &mut snap);
+                    // Only a complete re-read makes a queued Refresh
+                    // redundant; one that came back short is worth asking for
+                    // again, and worth saying so.
+                    reread = read_profiles(l, &mut snap);
+                    if !reread {
+                        notice = note_short_read(
+                            notice,
+                            snap.profiles.len(),
+                            snap.profile_count as usize,
+                        );
+                    }
                 }
-                // `snap.mode` is the last mode actually read back, so a failed
-                // read leaves the previous one standing rather than reading as
-                // onboard. Only that, and a command that cannot have taken
-                // host mode, hands the mouse back unprompted at exit.
+                // A mode that could not be read this time says nothing, and
+                // must not clear the flag: the earlier answer stands.
                 host_held.store(
-                    snap.mode == crate::profiles::MODE_HOST || takes_host,
+                    host_held_after(
+                        host_held.load(Ordering::Relaxed),
+                        mode_read.then_some(snap.mode),
+                        takes_host,
+                    ),
                     Ordering::Relaxed,
                 );
                 // Recorded with the re-read in one publish, so a panel that
@@ -917,9 +1181,47 @@ fn worker(
                     e,
                     crate::hidpp::Error::Io(_) | crate::hidpp::Error::NotFound(_)
                 );
+                // A failed flash write says nothing about what the sector now
+                // holds: a reply lost to the timeout hides a write that landed,
+                // and a half-finished one leaves a mix. The snapshot still
+                // shows the profile as it was before, which the editor would
+                // then edit and write back as if it were current. Read it
+                // again so the UI sees the sector as it is, and publish that
+                // with the failure.
+                if !gone
+                    && matches!(
+                        kind,
+                        CmdKind::WriteProfile(_) | CmdKind::SetButton(_) | CmdKind::PersistLighting
+                    )
+                {
+                    read_profiles(l, &mut snap);
+                }
+                // The same goes for the mode: a switch whose reply was lost
+                // may have landed, and the snapshot would go on showing the
+                // old one. The Onboard control only offers itself while the
+                // snapshot says host, so a stale "onboard" here is a mouse the
+                // user has no button to bring back. One read, since the
+                // device may not be answering.
+                if !gone && touches_mode {
+                    let mode_read = read_mode(l, &mut snap);
+                    host_held.store(
+                        host_held_after(
+                            host_held.load(Ordering::Relaxed),
+                            mode_read.then_some(snap.mode),
+                            takes_host,
+                        ),
+                        Ordering::Relaxed,
+                    );
+                }
                 // Recorded before the handle is dropped, so a panel waiting
                 // on this id learns the write failed rather than timing out.
                 snap.record(Outcome::failed(id, kind, e.to_string()));
+                if gone {
+                    // Said before the reconnect, which can spend seconds
+                    // probing nodes: the snapshot should not claim a live
+                    // mouse for that long.
+                    snap.connected = false;
+                }
                 publish(&shared, &snap);
                 if gone {
                     live = None;
@@ -927,15 +1229,27 @@ fn worker(
             }
         }
 
-        // Collapse a run of queued Refreshes, but never drop a real command:
-        // the previous version matched Ok(_) and broke, which silently threw
-        // away whatever it had just received. Two quick clicks lost the second.
+        // Fold a run of queued Refreshes into the command that just re-read
+        // everything, but never drop a real command: the previous version
+        // matched Ok(_) and broke, which silently threw away whatever it had
+        // just received. Two quick clicks lost the second.
+        //
+        // Only after a command that re-read the profile sectors too. A Refresh
+        // queued behind a DPI change is the user asking for those sectors, and
+        // folding it away dropped the request. A folded one is still answered,
+        // so a panel waiting on its id is not left waiting for good.
+        let mut folded = false;
         while let Ok(next) = rx.try_recv() {
-            if matches!(next.1, Cmd::Refresh) {
+            if reread && matches!(next.1, Cmd::Refresh) {
+                snap.record_silent(Outcome::ok(next.0, CmdKind::Refresh, None));
+                folded = true;
                 continue;
             }
             pending.push_back(next);
             break;
+        }
+        if folded {
+            publish(&shared, &snap);
         }
     }
 }
@@ -1129,6 +1443,23 @@ mod tests {
     }
 
     #[test]
+    fn a_folded_refresh_is_answered_without_touching_the_status_bar() {
+        let mut s = Snapshot::default();
+        s.record(Outcome::ok(1, CmdKind::SetDpi, Some("DPI 800".into())));
+        s.record_silent(Outcome::ok(2, CmdKind::Refresh, None));
+        // The Refresh was answered, so whoever waits on it can stop...
+        assert_eq!(s.outcome_after(1, CmdKind::Refresh).unwrap().id, 2);
+        // ...and the notice of the command that did the work is still up.
+        assert_eq!(s.notice.as_deref(), Some("DPI 800"));
+        assert_eq!(s.error, None);
+        // Same ring, same bound.
+        for i in 3..(3 + OUTCOME_HISTORY as u64 * 2) {
+            s.record_silent(ok(i, CmdKind::Refresh));
+        }
+        assert_eq!(s.outcomes.len(), OUTCOME_HISTORY);
+    }
+
+    #[test]
     fn newest_outcome_id_is_zero_before_anything_runs() {
         // Panels bound their search with this before they send, so it has to
         // be a value no command will ever be issued: ids start at 1.
@@ -1255,5 +1586,81 @@ mod tests {
         assert_eq!(Cmd::LedFixed { zone: 0, color: [0; 3] }.kind(), CmdKind::Led);
         assert_eq!(Cmd::SetButton { index: 3, button: 4, binding: Button::disabled() }.kind(), CmdKind::SetButton(3));
         assert_eq!(Cmd::SetMode(1).kind(), CmdKind::SetMode);
+    }
+
+    #[test]
+    fn a_closed_gate_waits_for_the_worker_and_then_refuses_it() {
+        let gate = Gate::new();
+        let busy = gate.enter().expect("an open gate lets the worker in");
+        // The worker is mid-piece: closing cannot report idle yet.
+        assert!(!gate.close_and_wait(Duration::from_millis(30)));
+        // It is shut out from now on, even while the earlier piece runs on.
+        assert!(gate.enter().is_none());
+        drop(busy);
+        assert!(gate.close_and_wait(Duration::from_millis(30)));
+        // A refused entry must not leave the gate looking busy, or the
+        // restore would wait out its whole limit for a worker that is idle.
+        assert!(gate.enter().is_none());
+        assert!(gate.close_and_wait(Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn an_idle_gate_closes_at_once() {
+        let gate = Gate::new();
+        let t = std::time::Instant::now();
+        assert!(gate.close_and_wait(Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_mode_that_could_not_be_read_does_not_clear_the_host_flag() {
+        use crate::profiles::{MODE_HOST, MODE_ONBOARD};
+        // Read and onboard: handed back, flag clears.
+        assert!(!host_held_after(true, Some(MODE_ONBOARD), false));
+        // Read and host: the flag stands.
+        assert!(host_held_after(false, Some(MODE_HOST), false));
+        // Not read: whatever was known before stands, either way.
+        assert!(host_held_after(true, None, false));
+        assert!(!host_held_after(false, None, false));
+        // A command that may have taken host mode sets it regardless, even
+        // when the read says onboard: its reply may have been lost in flight.
+        assert!(host_held_after(false, Some(MODE_ONBOARD), true));
+        assert!(host_held_after(false, None, true));
+    }
+
+    #[test]
+    fn a_re_read_that_finds_nothing_replaces_the_stale_profiles() {
+        let parse = |tag: u8| Profile::parse(&sector(tag)).unwrap();
+        let mut held = vec![parse(1), parse(2), parse(3)];
+        // The device stopped answering after a failed write: the old list is
+        // what the sector held before, which is no longer known to be true.
+        assert!(!adopt_profiles(&mut held, Vec::new(), 3));
+        assert!(held.is_empty());
+
+        let mut held = vec![parse(9)];
+        assert!(!adopt_profiles(&mut held, vec![parse(1), parse(2)], 3));
+        assert_eq!(held.len(), 2);
+        assert_eq!(held[0].report_rate_ms, 1);
+
+        assert!(adopt_profiles(&mut held, vec![parse(1), parse(2), parse(3)], 3));
+        assert_eq!(held.len(), 3);
+    }
+
+    #[test]
+    fn a_short_read_is_said_aloud_and_keeps_the_commands_own_notice() {
+        let bare = note_short_read(None, 2, 5).unwrap();
+        assert!(bare.contains("2 of 5"), "{bare}");
+        let kept = note_short_read(Some("profile 1 written to flash".into()), 0, 5).unwrap();
+        assert!(kept.starts_with("profile 1 written to flash"), "{kept}");
+        assert!(kept.contains("0 of 5"), "{kept}");
+    }
+
+    #[test]
+    fn commands_that_can_change_the_mode_are_the_ones_re_read_after_a_failure() {
+        assert!(Cmd::SetMode(crate::profiles::MODE_ONBOARD).touches_mode());
+        assert!(Cmd::PersistLighting { leds: [Led([0; LED_RECORD]); 2] }.touches_mode());
+        // Not worth a read on a device that may be wedged.
+        assert!(!Cmd::SetDpi(800).touches_mode());
+        assert!(!Cmd::Refresh.touches_mode());
     }
 }

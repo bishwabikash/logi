@@ -260,6 +260,20 @@ impl LedDraft {
         if !self.edited {
             return Led(self.raw);
         }
+        let built = self.build_record();
+        // A zone clicked to another mode or colour and clicked back builds
+        // the record the editor would build for the unmodified one. Handing
+        // back the bytes that were read instead keeps whatever this editor
+        // does not model, which a rebuild would zero: the user undid the
+        // change, so the record should be exactly what the mouse had.
+        if built == LedDraft::from_led(&Led(self.raw)).build_record() {
+            return Led(self.raw);
+        }
+        built
+    }
+
+    /// The record this editor builds from the modelled fields.
+    fn build_record(&self) -> Led {
         match self.mode {
             led::OFF => Led::off(),
             led::FIXED => Led::fixed(self.color),
@@ -272,8 +286,21 @@ impl LedDraft {
         }
     }
 
+    /// Record that the user changed this zone.
+    ///
+    /// A change that lands back on what the mouse had is not a change: the
+    /// draft goes back to exactly the record as read. Left marked, it still
+    /// differed from the reading in the `edited` flag and in whichever hidden
+    /// fields the detour touched, so the profile showed unsaved changes with
+    /// nothing to save, and the save mirrored the primary record over the
+    /// second-mode one, a flash write that did change something the user had
+    /// undone.
     fn mark(&mut self) {
         self.edited = true;
+        let read = LedDraft::from_led(&Led(self.raw));
+        if self.build_record() == read.build_record() {
+            *self = read;
+        }
     }
 }
 
@@ -424,7 +451,10 @@ impl Draft {
         self.shift_dpi = other.shift_dpi;
         for (i, l) in other.leds.iter().enumerate() {
             let mut l = l.clone();
-            l.mark();
+            // Set outright rather than through `mark`: copying is an explicit
+            // act whose second-mode record follows the primary one, even when
+            // the lighting copied happens to match what this profile has.
+            l.edited = true;
             self.leds[i] = l;
         }
         let n = self.editable.min(other.buttons.len());
@@ -512,6 +542,11 @@ pub struct ProfileEditor {
     /// Set once a backup has been asked for this session, so the offer stops
     /// after it has been taken.
     backup_asked: bool,
+    /// Every path a backup has been sent to this session. The write happens
+    /// later, on the device thread, so the file may not exist yet when the
+    /// next click looks for it; this is what keeps a quick second backup from
+    /// landing on the first, even when the field was edited back to it.
+    backup_sent: Vec<String>,
     copy_from: u8,
     /// Writes handed to the worker and not yet answered, keyed by the
     /// profile index each one touches. An entry leaves on success, which is
@@ -537,6 +572,7 @@ impl ProfileEditor {
             staged: HashMap::new(),
             backup_path: default_backup_path(),
             backup_asked: false,
+            backup_sent: Vec::new(),
             copy_from: 0,
             writes: HashMap::new(),
         }
@@ -1191,20 +1227,27 @@ impl ProfileEditor {
         // table — it is written back exactly as read — so there is nothing to
         // refuse, and refusing left the save button dead with no way out.
         let no_click = st.draft.editable > 0 && !st.draft.has_left_click();
-        let blocked = no_click || st.draft.enabled_stages().is_empty();
+        // The flash path refuses a sector whose stored checksum does not match
+        // its contents, so that it does not bless a corruption with a fresh
+        // one. A write that stopped part-way leaves exactly that, which makes
+        // "Save again to retry" a button that can only fail the same way.
+        // Said here, before the click, with the way out.
+        let crc_bad = !original.crc_ok();
+        let blocked = no_click || crc_bad || st.draft.enabled_stages().is_empty();
         let mut reverted = false;
 
         theme::section(ui, "Save", |ui| {
             theme::hint(
                 ui,
                 if self.backup_asked {
-                    "A backup was asked for this session. Taking another overwrites the \
-                     file named below, so point it somewhere else to keep both."
+                    "A backup was asked for this session. Taking another never replaces \
+                     the first: when the file named below already exists, the new one is \
+                     written beside it with a number on the end."
                 } else {
                     "Take a backup before the first write of this session. It dumps every \
                      sector, the profile directory included, so a bad profile can be put \
-                     back. A file already at the path below is replaced, so point it \
-                     somewhere new to keep an older backup."
+                     back. A file already at the path below is never replaced: the new \
+                     backup is written beside it with a number on the end."
                 },
             );
             ui.add_space(6.0);
@@ -1216,8 +1259,25 @@ impl ProfileEditor {
                 // in the status bar afterwards, and hiding the control left no
                 // way to retry the one thing that makes a bad write
                 // recoverable.
-                if ui.button("Save backup").clicked() {
-                    cmds.push(Cmd::Backup(self.backup_path.clone()));
+                if ui
+                    .add_enabled(
+                        !self.backup_path.trim().is_empty(),
+                        egui::Button::new("Save backup"),
+                    )
+                    .clicked()
+                {
+                    // Never onto a file that is already there: the backup
+                    // taken before a write is the way back from it, and a
+                    // second one taken after a bad write would replace the
+                    // good one with the bad state. The field shows where it
+                    // actually went.
+                    let target = free_backup_path(&self.backup_path, |p| {
+                        self.backup_sent.iter().any(|s| s == p)
+                            || std::path::Path::new(p).exists()
+                    });
+                    self.backup_path = target.clone();
+                    self.backup_sent.push(target.clone());
+                    cmds.push(Cmd::Backup(target));
                     self.backup_asked = true;
                 }
             });
@@ -1262,6 +1322,22 @@ impl ProfileEditor {
             });
 
             ui.add_space(8.0);
+            if crc_bad {
+                ui.label(
+                    egui::RichText::new("This profile's stored checksum does not match its contents.")
+                        .color(theme::BAD)
+                        .size(13.0)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "Saving is refused: it would put a fresh checksum on a damaged sector. \
+                     An interrupted write leaves this. Put a backup back with \
+                     `logi restore <file>` in a terminal, then press Refresh in the sidebar.",
+                );
+                ui.add_space(8.0);
+            }
             match state {
                 Some(WriteState::Waiting) => {
                     theme::hint(
@@ -1282,10 +1358,16 @@ impl ProfileEditor {
                     ui.add_space(4.0);
                     theme::hint(
                         ui,
-                        "Your edits are still here, so nothing has been lost. Save again to \
-                         retry, or Revert to go back to what the mouse holds. Press Refresh in \
-                         the sidebar first if you want to see what that is now: a write that \
-                         reports an error may still have changed the sector.",
+                        if crc_bad {
+                            "Your edits are still here, so nothing has been lost, but the \
+                             write left the sector damaged: Save is off until a backup is put \
+                             back, as explained above. Revert drops these edits."
+                        } else {
+                            "Your edits are still here, so nothing has been lost. Save again to \
+                             retry, or Revert to go back to what the mouse holds. Press Refresh \
+                             in the sidebar first if you want to see what that is now: a write \
+                             that reports an error may still have changed the sector."
+                        },
                     );
                     ui.add_space(8.0);
                 }
@@ -1299,9 +1381,15 @@ impl ProfileEditor {
                     ui.add_space(4.0);
                     theme::hint(
                         ui,
-                        "That says nothing about whether the mouse took it, so your edits are \
-                         kept. Press Refresh in the sidebar to see what the mouse holds now, \
-                         then save again or revert.",
+                        if crc_bad {
+                            "That says nothing about whether the mouse took it, so your edits \
+                             are kept, but the sector now reads as damaged: Save is off until a \
+                             backup is put back, as explained above. Revert drops these edits."
+                        } else {
+                            "That says nothing about whether the mouse took it, so your edits \
+                             are kept. Press Refresh in the sidebar to see what the mouse holds \
+                             now, then save again or revert."
+                        },
                     );
                     ui.add_space(8.0);
                 }
@@ -1361,6 +1449,36 @@ fn profile_label(snap: &Snapshot, i: u8) -> String {
         Some(p) if !p.name.is_empty() => format!("{i} - {}", p.name),
         _ => format!("profile {i}"),
     }
+}
+
+/// `path` with `-n` before its extension: `a/b.json` becomes `a/b-2.json`.
+fn numbered_path(path: &str, n: u32) -> String {
+    let name_at = path.rfind('/').map_or(0, |i| i + 1);
+    match path[name_at..].rfind('.') {
+        // A leading dot is part of the name, not the start of an extension.
+        Some(dot) if dot > 0 => {
+            let at = name_at + dot;
+            format!("{}-{n}{}", &path[..at], &path[at..])
+        }
+        _ => format!("{path}-{n}"),
+    }
+}
+
+/// The first of `path`, `path-2`, `path-3`, ... that `taken` does not claim.
+///
+/// Bounded: past a thousand the last candidate is used as it stands, which can
+/// only happen to someone who has a thousand backups beside each other.
+fn free_backup_path(path: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(path) {
+        return path.to_string();
+    }
+    for n in 2..1000 {
+        let candidate = numbered_path(path, n);
+        if !taken(&candidate) {
+            return candidate;
+        }
+    }
+    numbered_path(path, 1000)
 }
 
 /// Where a backup lands unless the user says otherwise.
@@ -1608,6 +1726,66 @@ mod tests {
         assert_eq!(d.waveform, 3);
         assert_eq!(d.intensity, 0x50);
         assert_eq!(d.to_led().0, raw);
+    }
+
+    #[test]
+    fn a_change_that_is_undone_leaves_the_record_as_the_mouse_had_it() {
+        // A fixed record carrying bytes this editor does not model.
+        let mut raw = [0u8; LED_RECORD];
+        raw[0] = led::FIXED;
+        raw[1..4].copy_from_slice(&[0x10, 0x20, 0x30]);
+        raw[4] = 0x02;
+        raw[10] = 0x7f;
+        let mut d = LedDraft::from_led(&Led(raw));
+
+        // Moved to another colour: a real edit, rebuilt from the fields.
+        d.color = [0xff, 0x00, 0x00];
+        d.mark();
+        assert_eq!(d.to_led(), Led::fixed([0xff, 0x00, 0x00]));
+
+        // And put back by clicking the original swatch again. Rebuilding
+        // here used to zero the two bytes above.
+        d.color = [0x10, 0x20, 0x30];
+        d.mark();
+        assert_eq!(d.to_led().0, raw);
+
+        // Another mode and back lands in the same place.
+        d.mode = led::BREATHING;
+        d.mark();
+        assert_ne!(d.to_led().0, raw);
+        d.mode = led::FIXED;
+        d.mark();
+        assert_eq!(d.to_led().0, raw);
+    }
+
+    #[test]
+    fn an_undone_lighting_edit_is_not_an_edit_at_all() {
+        // Primary and second-mode records that differ, as a mouse can have.
+        let mut p = profile();
+        p.leds[0] = Led::fixed([0x10, 0x20, 0x30]);
+        p.alt_leds[0] = Led::fixed([0x01, 0x02, 0x03]);
+        let base = Draft::from_profile(&p, 11);
+
+        // Moved away through a mode with its own fields, and back.
+        let mut d = base.clone();
+        d.leds[0].mode = led::BREATHING;
+        d.leds[0].mark();
+        d.leds[0].period_ms = 9000;
+        d.leds[0].mark();
+        assert_ne!(d, base);
+        d.leds[0].mode = led::FIXED;
+        d.leds[0].mark();
+        assert_eq!(d, base, "the detour left a difference behind");
+
+        // So nothing is unsaved, and a build mirrors nothing over the
+        // second-mode record the user never changed.
+        let st = Staged::new(base.clone());
+        assert!(!Staged { draft: d.clone(), base: base.clone() }.dirty());
+        assert!(!st.dirty());
+        let built = d.build(&p);
+        assert_eq!(built.leds[0], p.leds[0]);
+        assert_eq!(built.alt_leds[0], p.alt_leds[0]);
+        assert_eq!(built.serialize(), p.serialize());
     }
 
     #[test]
@@ -2087,6 +2265,68 @@ mod tests {
         assert!(cmds.borrow().is_empty(), "painting queued {:?}", cmds.borrow());
         assert!(!e.dirty(), "painting made the editor think the profile had edits");
         assert!(e.dirty_profiles().is_empty());
+    }
+
+    #[test]
+    fn a_backup_never_lands_on_a_file_that_is_already_there() {
+        let mut have: Vec<&str> = Vec::new();
+        assert_eq!(
+            free_backup_path("/h/logi-backup.json", |p| have.contains(&p)),
+            "/h/logi-backup.json"
+        );
+        have.push("/h/logi-backup.json");
+        assert_eq!(
+            free_backup_path("/h/logi-backup.json", |p| have.contains(&p)),
+            "/h/logi-backup-2.json"
+        );
+        have.push("/h/logi-backup-2.json");
+        assert_eq!(
+            free_backup_path("/h/logi-backup.json", |p| have.contains(&p)),
+            "/h/logi-backup-3.json"
+        );
+        // No extension, a dot in the directory, a hidden file: the number goes
+        // on the file name and nowhere else.
+        assert_eq!(numbered_path("/h/backup", 2), "/h/backup-2");
+        assert_eq!(numbered_path("/h.d/backup", 2), "/h.d/backup-2");
+        assert_eq!(numbered_path("/h/.bk", 2), "/h/.bk-2");
+        assert_eq!(numbered_path("/h/a.b.json", 2), "/h/a.b-2.json");
+        assert_eq!(numbered_path("rel.json", 5), "rel-5.json");
+        // Bounded even if everything is taken.
+        assert_eq!(free_backup_path("/h/x.json", |_| true), "/h/x-1000.json");
+    }
+
+    #[test]
+    fn a_second_backup_in_a_row_does_not_land_on_the_first() {
+        // The write happens on the device thread, so the first file may not
+        // exist yet when the second click looks. The path sent last counts as
+        // taken.
+        let mut sent = vec!["/h/b.json".to_string()];
+        let got = free_backup_path("/h/b.json", |p| sent.iter().any(|s| s == p));
+        assert_eq!(got, "/h/b-2.json");
+        // And a third click after the field was typed back to the first path
+        // still skips both, not just the one sent last.
+        sent.push(got);
+        let again = free_backup_path("/h/b.json", |p| sent.iter().any(|s| s == p));
+        assert_eq!(again, "/h/b-3.json");
+    }
+
+    #[test]
+    fn a_profile_whose_checksum_is_bad_is_painted_without_queuing_a_write() {
+        let mut sector = fixture();
+        sector[0x40] ^= 0xff; // damage the payload, leave the stored CRC alone
+        let damaged = Profile::parse(&sector).unwrap();
+        assert!(!damaged.crc_ok());
+        let mut snap = paint_snapshot(50);
+        snap.profiles = vec![damaged];
+        let ed = std::cell::RefCell::new(ProfileEditor::new());
+        let sent: std::cell::RefCell<Vec<Cmd>> = std::cell::RefCell::new(Vec::new());
+        egui::__run_test_ui(|ui| {
+            let out = ed.borrow_mut().ui(ui, &snap, 0);
+            sent.borrow_mut().extend(out);
+        });
+        assert!(sent.borrow().is_empty(), "painting queued {:?}", sent.borrow());
+        let ed = ed.into_inner();
+        assert!(!ed.dirty());
     }
 
     #[test]

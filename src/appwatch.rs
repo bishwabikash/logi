@@ -14,6 +14,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::time::{Duration, Instant};
 
+/// The longest poll interval a rules file can ask for: a day.
+///
+/// The callers add the interval to an `Instant`, which panics on overflow.
+/// `poll_ms = 18446744073709551615` is a valid `u64` and would take the
+/// watcher down at startup.
+pub const POLL_CEILING: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// One rule: if a process matches, select this profile.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Rule {
@@ -200,6 +207,10 @@ impl Watcher {
 pub fn parse_rules(text: &str) -> (Config, Vec<String>) {
     let mut cfg = Config::default();
     let mut problems = Vec::new();
+    // A byte-order mark is not whitespace, so a file saved with one by a
+    // Windows editor would glue it to the first key: `fallback` would become a
+    // pattern named "\u{feff}fallback", and a first rule would never match.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -220,7 +231,9 @@ pub fn parse_rules(text: &str) -> (Config, Vec<String>) {
         }
         if key.eq_ignore_ascii_case("poll_ms") {
             match val.parse::<u64>() {
-                Ok(ms) => cfg.poll = Duration::from_millis(ms.max(100)),
+                Ok(ms) => {
+                    cfg.poll = Duration::from_millis(ms.max(100)).min(POLL_CEILING);
+                }
                 Err(_) => problems.push(format!("line {}: bad poll_ms {val:?}", n + 1)),
             }
             continue;
@@ -530,9 +543,28 @@ mod tests {
     }
 
     #[test]
+    fn a_byte_order_mark_does_not_spoil_the_first_line() {
+        let (c, probs) = parse_rules("\u{feff}fallback = 3\ncsgo = 1\n");
+        assert!(probs.is_empty(), "{probs:?}");
+        assert_eq!(c.fallback, Some(3));
+        assert_eq!(c.rules, vec![Rule::new("csgo", 1)]);
+        let (c, _) = parse_rules("\u{feff}csgo = 1\n");
+        assert_eq!(c.rules[0].pattern, "csgo");
+    }
+
+    #[test]
     fn poll_interval_has_a_floor() {
         let (c, _) = parse_rules("poll_ms = 1\n");
         assert_eq!(c.poll, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn poll_interval_has_a_ceiling_an_instant_can_take() {
+        let (c, probs) = parse_rules(&format!("poll_ms = {}\n", u64::MAX));
+        assert!(probs.is_empty(), "{probs:?}");
+        assert_eq!(c.poll, POLL_CEILING);
+        // The addition `nap_for` does with it.
+        assert!(Instant::now().checked_add(c.poll).is_some());
     }
 
     #[test]
