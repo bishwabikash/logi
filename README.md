@@ -92,7 +92,19 @@ mapping.
 
 ## Install
 
-You need a Rust toolchain, 1.89 or newer. The build needs no `-dev` packages:
+**From a release.** Each tagged release on the
+[Releases page](https://github.com/bishwabikash/logi/releases) carries an x86-64
+Linux tarball and its checksum, built on Ubuntu 22.04 so it runs on older
+distributions too. Check it, unpack it, and run the installer from inside:
+
+```
+sha256sum -c logi-*-x86_64-linux.tar.gz.sha256
+tar xzf logi-*-x86_64-linux.tar.gz
+cd logi-*-x86_64-linux
+packaging/install.sh
+```
+
+**From source.** You need a Rust toolchain, 1.89 or newer. The build needs no `-dev` packages:
 the windowing library loads X11, Wayland and xkbcommon at run time.
 
 ```
@@ -218,7 +230,8 @@ verified and what is not.
 
 ## Contributing
 
-`cargo test` runs the suite and needs no hardware. If you have a Logitech mouse
+CI builds and tests every push and pull request. Releases are described in
+[RELEASING.md](RELEASING.md). `cargo test` runs the suite and needs no hardware. If you have a Logitech mouse
 other than the G502 HERO, the most useful thing is the output of `logi devices`
 and `logi info` and a note of what worked. Be careful with anything that
 writes: take `logi backup` first.

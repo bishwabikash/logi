@@ -1,0 +1,73 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds, tests, packages and publishes a release.
+# Running it by hand (Actions tab, "Run workflow") does everything except
+# publish, and leaves the tarball as a downloadable artifact, so the packaging
+# can be checked before a tag exists.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-22.04   # older glibc, so the binary runs on older distros
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the stable toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Read the version
+        id: v
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Check the tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "v${{ steps.v.outputs.version }}" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version ${{ steps.v.outputs.version }}" >&2
+            exit 1
+          fi
+      - name: Test
+        run: cargo test --locked
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="logi-${{ steps.v.outputs.version }}-x86_64-linux"
+          mkdir -p "dist/$name"
+          cp target/release/logi "dist/$name/logi"
+          cp -r packaging LICENSE README.md PROTOCOL.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: logi-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # Separate from the build so the only job that can write to the repository
+  # runs nothing but a download and one gh call, and only for a tag.
+  publish:
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: logi-linux-x86_64
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes

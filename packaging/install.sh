@@ -36,10 +36,14 @@ for arg in "$@"; do
     esac
 done
 
+# A source checkout builds into target/release; a release tarball ships the
+# binary next to packaging/.
 BIN="$ROOT/target/release/logi"
+[ -x "$BIN" ] || BIN="$ROOT/logi"
 if { [ "$DO_BIN" = 1 ] || [ "$DO_SERVICE" = 1 ]; } && [ ! -x "$BIN" ]; then
-    echo "install.sh: $BIN not built yet. Run:" >&2
+    echo "install.sh: no logi binary found. Build one with:" >&2
     echo "    cargo build --release" >&2
+    echo "or run this from an extracted release tarball." >&2
     exit 1
 fi
 
