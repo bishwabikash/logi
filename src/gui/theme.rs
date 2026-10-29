@@ -53,32 +53,32 @@ pub fn apply(ctx: &egui::Context) {
     v.override_text_color = Some(TEXT);
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = ACCENT_FILL;
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
 
     let r = CornerRadius::same(6);
     v.widgets.noninteractive.bg_fill = RAISED;
     v.widgets.noninteractive.weak_bg_fill = RAISED;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, LINE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.noninteractive.corner_radius = r;
 
     // Interactive things get a visible fill so they read as operable.
     v.widgets.inactive.bg_fill = CONTROL;
     v.widgets.inactive.weak_bg_fill = CONTROL;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, LINE);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.inactive.corner_radius = r;
 
     v.widgets.hovered.bg_fill = CONTROL_HI;
     v.widgets.hovered.weak_bg_fill = CONTROL_HI;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, FAINT);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, FAINT);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.hovered.corner_radius = r;
 
     v.widgets.active.bg_fill = ACCENT_FILL;
     v.widgets.active.weak_bg_fill = ACCENT_FILL;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.active.corner_radius = r;
 
     v.widgets.open.bg_fill = CONTROL;
@@ -123,7 +123,7 @@ pub fn section<R>(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::U
     ui.painter().hline(
         r.x_range(),
         ui.cursor().top() - 2.0,
-        Stroke::new(1.0, LINE),
+        Stroke::new(1.0_f32, LINE),
     );
     ui.add_space(9.0);
     let out = body(ui);
@@ -136,7 +136,7 @@ pub fn section<R>(ui: &mut egui::Ui, label: &str, body: impl FnOnce(&mut egui::U
 pub fn card<R>(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::new()
         .fill(RAISED)
-        .stroke(Stroke::new(1.0, LINE))
+        .stroke(Stroke::new(1.0_f32, LINE))
         .corner_radius(CornerRadius::same(8))
         .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
@@ -180,7 +180,7 @@ pub fn value(ui: &mut egui::Ui, value: &str, unit: &str) {
 pub fn pill(ui: &mut egui::Ui, text: &str, colour: Color32) {
     egui::Frame::new()
         .fill(colour.gamma_multiply(0.16))
-        .stroke(Stroke::new(1.0, colour.gamma_multiply(0.5)))
+        .stroke(Stroke::new(1.0_f32, colour.gamma_multiply(0.5)))
         .corner_radius(CornerRadius::same(99))
         .inner_margin(egui::Margin::symmetric(8, 3))
         .show(ui, |ui| {
@@ -222,11 +222,11 @@ pub fn swatch(ui: &mut egui::Ui, rgb: [u8; 3], selected: bool) -> egui::Response
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::same(5), c);
     let stroke = if selected {
-        Stroke::new(2.0, TEXT)
+        Stroke::new(2.0_f32, TEXT)
     } else if resp.hovered() {
-        Stroke::new(1.5, DIM)
+        Stroke::new(1.5_f32, DIM)
     } else {
-        Stroke::new(1.0, LINE)
+        Stroke::new(1.0_f32, LINE)
     };
     p.rect_stroke(rect, CornerRadius::same(5), stroke, egui::StrokeKind::Inside);
     resp

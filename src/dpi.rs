@@ -26,6 +26,14 @@ impl Capability {
                 if dpi < *min || dpi > *max {
                     return Err(Error::Protocol(format!("dpi {dpi} outside {min}-{max}")));
                 }
+                // A zero step would divide to infinity (or NaN at the minimum)
+                // and collapse every request onto `min`: a DPI nobody asked
+                // for, written to the sensor.
+                if *step == 0 {
+                    return Err(Error::Protocol(
+                        "device reported a DPI range with a zero step".into(),
+                    ));
+                }
                 // In u32, and clamped: a device whose range is not a whole
                 // number of steps would otherwise round the top of the range
                 // up past max, and a wide range with a coarse step overflows
@@ -109,5 +117,44 @@ impl Dpi {
             &[sensor, (snapped >> 8) as u8, (snapped & 0xFF) as u8],
         )?;
         Ok(snapped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn g502() -> Capability {
+        Capability::Range { min: 100, max: 25600, step: 50 }
+    }
+
+    #[test]
+    fn snap_rounds_to_the_step_and_stays_in_range() {
+        assert_eq!(g502().snap(1000).unwrap(), 1000);
+        assert_eq!(g502().snap(1020).unwrap(), 1000);
+        assert_eq!(g502().snap(1030).unwrap(), 1050);
+        assert_eq!(g502().snap(25600).unwrap(), 25600);
+        assert!(g502().snap(99).is_err());
+        assert!(g502().snap(25601).is_err());
+    }
+
+    #[test]
+    fn snap_never_exceeds_max_when_the_range_is_not_whole_steps() {
+        let c = Capability::Range { min: 100, max: 190, step: 100 };
+        assert_eq!(c.snap(190).unwrap(), 190);
+    }
+
+    #[test]
+    fn a_zero_step_is_an_error_not_the_minimum() {
+        let c = Capability::Range { min: 100, max: 25600, step: 0 };
+        assert!(c.snap(100).is_err());
+        assert!(c.snap(5000).is_err());
+    }
+
+    #[test]
+    fn a_list_only_accepts_its_own_values() {
+        let c = Capability::List(vec![400, 800]);
+        assert_eq!(c.snap(800).unwrap(), 800);
+        assert!(c.snap(801).is_err());
     }
 }

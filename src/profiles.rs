@@ -106,13 +106,28 @@ impl OnboardProfiles {
         f: impl FnOnce(&mut Device) -> Result<T>,
     ) -> Result<T> {
         let previous = self.mode(dev).unwrap_or(MODE_ONBOARD);
+        let restore = if previous == MODE_HOST { MODE_HOST } else { MODE_ONBOARD };
         if previous != MODE_HOST {
-            self.set_mode(dev, MODE_HOST)?;
+            if let Err(e) = self.set_mode(dev, MODE_HOST) {
+                // A setter that timed out may still have been applied, and
+                // then the mouse is in host mode with nobody holding it. Put
+                // it back; the original error is the one worth reporting.
+                let _ = self.set_mode(dev, restore);
+                return Err(e);
+            }
         }
         let out = f(dev);
-        let restore = if previous == MODE_HOST { MODE_HOST } else { MODE_ONBOARD };
-        let _ = self.set_mode(dev, restore);
-        out
+        match (self.set_mode(dev, restore), out) {
+            (_, Err(e)) => Err(e),
+            (Ok(()), Ok(v)) => Ok(v),
+            // `f` did its work, but the mouse is still in host mode and its
+            // stored profile is not applying. Say so rather than report a
+            // clean finish.
+            (Err(e), Ok(_)) => Err(Error::Protocol(format!(
+                "done, but the mouse could not be handed back to onboard mode ({e}); \
+                 run `logi mode onboard`"
+            ))),
+        }
     }
 
     /// Active profile, 0-based.

@@ -675,6 +675,38 @@ fn endpoint_gone(e: &hidpp::Error) -> bool {
     matches!(e, hidpp::Error::Io(_))
 }
 
+/// Whether a failed profile switch could succeed if tried again.
+///
+/// A lost reply or a busy device can; `Protocol` is `set_current`'s own range
+/// check, which will give the same answer every time. Retrying that one is not
+/// harmless in the service: the failure ends `serve_once`, whose teardown and
+/// bring-up each write the button remapping table, and that table is
+/// non-volatile.
+fn switch_retryable(e: &hidpp::Error) -> bool {
+    matches!(e, hidpp::Error::Timeout { .. } | hidpp::Error::Device { .. })
+}
+
+/// Ask the device something harmless, so an unplug is noticed while nothing
+/// else is using the endpoint.
+///
+/// Without this a loop that only talks to the device when a rule fires holds a
+/// dead descriptor indefinitely after an unplug: the rules are never
+/// re-applied to the re-plugged mouse until some application happens to start
+/// or stop. Only the endpoint failing counts; a slow answer proves nothing.
+/// `current` is a getter.
+fn check_endpoint(
+    p: &profiles::OnboardProfiles,
+    dev: &mut hidpp::Device,
+) -> hidpp::Result<()> {
+    match p.current(dev) {
+        Err(e) if endpoint_gone(&e) => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// How often an otherwise idle loop checks that its device is still there.
+const ENDPOINT_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A Keymap over uinput's tables, which is what actions.rs expects.
 fn keymap() -> actions::FnKeymap<fn(&str) -> Option<u16>, fn(u16) -> Option<String>> {
     actions::FnKeymap::new(
@@ -785,6 +817,17 @@ fn cmd_bind_run() -> Result<(), CliError> {
         return Err(CliError::Failed(format!("{} has no bindings", path.display())));
     }
 
+    // The service acts on this same file. Two listeners means every press is
+    // handled twice, and when this command exits its restore writes the whole
+    // table, which un-silences the buttons the service had silenced.
+    if service::state() == service::State::Active {
+        eprintln!(
+            "logi: warning: the background service is running and acts on these bindings too.\n\
+             \x20     Stop it first, or each press is handled twice:\n\
+             \x20         systemctl --user stop logi"
+        );
+    }
+
     let mut f = open()?;
     if !f.caps.button_spy {
         return Err(CliError::Failed(format!(
@@ -862,6 +905,40 @@ fn cmd_bind_run() -> Result<(), CliError> {
     outcome
 }
 
+/// The bindings the service should act on: none when there is no file, or it
+/// has nothing in it, or it cannot be read.
+///
+/// An unreadable file is said so rather than treated as absent: the service
+/// would otherwise run for hours without the bindings the user can see in the
+/// file, with nothing in the journal to explain why.
+fn service_bindings() -> Option<actions::Bindings> {
+    let path = actions::config_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("logi: reading {}: {e}; running without button bindings", path.display());
+            return None;
+        }
+    };
+    let km = keymap();
+    let (b, problems) = actions::Bindings::parse(&text, &km);
+    for p in &problems {
+        eprintln!("logi: bindings: {p}");
+    }
+    Some(b).filter(|b| !b.list.is_empty())
+}
+
+/// Whether there are bindings for the service to run, without reporting
+/// parse problems a second time.
+fn bindings_configured() -> bool {
+    let Ok(text) = std::fs::read_to_string(actions::config_path()) else {
+        return false;
+    };
+    let km = keymap();
+    !actions::Bindings::parse(&text, &km).0.list.is_empty()
+}
+
 /// The background service.
 ///
 /// Deliberately tolerant: with no rule file, or no device attached, it idles
@@ -904,45 +981,58 @@ fn cmd_serve() -> Result<(), CliError> {
                 continue;
             }
         };
-        match rules {
+        // Rules are not the only thing the service is for: button bindings
+        // run in it too, and the panel tells the user that with the service
+        // up they work with the window closed. Idling on "no rules" alone made
+        // that untrue for anyone who bound buttons and never wrote a rule.
+        let cfg = match rules {
             None => {
-                if !announced_idle {
-                    eprintln!(
-                        "logi: no rules at {}; idling. Run `logi watch` once to write an example.",
-                        path.display()
-                    );
-                    announced_idle = true;
+                if bindings_configured() {
+                    Some(appwatch::Config::default())
+                } else {
+                    if !announced_idle {
+                        eprintln!(
+                            "logi: no rules at {} and no bindings; idling. Run `logi watch` \
+                             once to write an example.",
+                            path.display()
+                        );
+                        announced_idle = true;
+                    }
+                    // Nothing to do, so wait rather than spin or exit.
+                    nap(60);
+                    None
                 }
-                // Nothing to do, so wait rather than spin or exit.
-                nap(60);
             }
             Some(text) => {
                 let (cfg, problems) = appwatch::parse_rules(&text);
                 for p in &problems {
                     eprintln!("logi: {}: {p}", path.display());
                 }
-                if cfg.rules.is_empty() && cfg.fallback.is_none() {
+                if cfg.rules.is_empty() && cfg.fallback.is_none() && !bindings_configured() {
                     if !announced_idle {
                         eprintln!("logi: {} has no rules yet; idling", path.display());
                         announced_idle = true;
                     }
                     nap(30);
-                    continue;
-                }
-                announced_idle = false;
-                match serve_once(cfg) {
-                    // A missing or unplugged device is normal, not fatal.
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if announced_problem.as_deref() != Some(msg.as_str()) {
-                            eprintln!("logi: {msg}; retrying every 10s until it clears");
-                            announced_problem = Some(msg);
-                        }
-                        nap(10);
-                    }
-                    Ok(()) => announced_problem = None,
+                    None
+                } else {
+                    Some(cfg)
                 }
             }
+        };
+        let Some(cfg) = cfg else { continue };
+        announced_idle = false;
+        match serve_once(cfg) {
+            // A missing or unplugged device is normal, not fatal.
+            Err(e) => {
+                let msg = e.to_string();
+                if announced_problem.as_deref() != Some(msg.as_str()) {
+                    eprintln!("logi: {msg}; retrying every 10s until it clears");
+                    announced_problem = Some(msg);
+                }
+                nap(10);
+            }
+            Ok(()) => announced_problem = None,
         }
     }
     eprintln!("logi: service stopping");
@@ -982,17 +1072,7 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
 
     // Button bindings are optional: no file, no bindings, or a device without
     // the feature all just mean the watcher runs alone.
-    let km = keymap();
-    let bindings = std::fs::read_to_string(actions::config_path())
-        .ok()
-        .map(|t| {
-            let (b, problems) = actions::Bindings::parse(&t, &km);
-            for p in &problems {
-                eprintln!("logi: bindings: {p}");
-            }
-            b
-        })
-        .filter(|b| !b.list.is_empty());
+    let bindings = service_bindings();
 
     let mut spy_state = None;
     if let Some(b) = &bindings {
@@ -1016,6 +1096,8 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
     let mut watcher = appwatch::Watcher::new(cfg);
     let mut last_scan = std::time::Instant::now() - poll;
     let mut prev_mask: u16 = 0;
+    let mut last_switch_err: Option<String> = None;
+    let mut last_check = std::time::Instant::now();
 
     let outcome = (|| -> Result<(), hidpp::Error> {
         // `leaving()`, not just INTERRUPTED: the unit's ExecReload is a SIGHUP,
@@ -1054,13 +1136,39 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
                     if let Some(msg) = appwatch::describe(&decision) {
                         eprintln!("logi: applying {msg}");
                     }
-                    profiles.set_current(dev, *profile)?;
-                    if let (Some(d), Some(v)) = (dpi_feat.as_ref(), want) {
-                        if let Err(e) = d.set(dev, *v, 0) {
-                            eprintln!("logi: setting {v} dpi: {e}");
+                    match profiles.set_current(dev, *profile) {
+                        Ok(()) => {
+                            last_switch_err = None;
+                            if let (Some(d), Some(v)) = (dpi_feat.as_ref(), want) {
+                                if let Err(e) = d.set(dev, *v, 0) {
+                                    eprintln!("logi: setting {v} dpi: {e}");
+                                }
+                            }
+                        }
+                        // Only the endpoint failing ends the run. Any other
+                        // failure used to return from here too, and the
+                        // teardown and reconnect that follow rewrite the
+                        // non-volatile button table twice; a rule naming a
+                        // profile the device lacks would have done that every
+                        // few seconds for as long as the service ran.
+                        Err(e) if endpoint_gone(&e) => return Err(e),
+                        Err(e) => {
+                            let msg = format!("switching to profile {profile}: {e}");
+                            if last_switch_err.as_deref() != Some(msg.as_str()) {
+                                eprintln!("logi: {msg}");
+                                last_switch_err = Some(msg);
+                            }
+                            if switch_retryable(&e) {
+                                watcher.invalidate();
+                            }
                         }
                     }
                 }
+            }
+
+            if spy_state.is_none() && last_check.elapsed() >= ENDPOINT_CHECK_EVERY {
+                last_check = std::time::Instant::now();
+                check_endpoint(&profiles, dev)?;
             }
         }
         Ok(())
@@ -1210,6 +1318,7 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
     install_interrupt_handler();
     let poll = cfg.poll;
     let mut watcher = appwatch::Watcher::new(cfg);
+    let mut last_check = std::time::Instant::now();
     // `leaving()`, not just INTERRUPTED: the handler above replaces SIGHUP's
     // default of killing us, so ignoring a hangup here would leave this
     // command running after the terminal that started it had gone.
@@ -1232,14 +1341,30 @@ fn cmd_watch(args: &[String]) -> Result<(), CliError> {
                                 .into(),
                         ));
                     }
-                    // Let the next match try again rather than believing it stuck.
-                    watcher.invalidate();
-                }
-                if let (Some(d), Some(v)) = (dpi.as_ref(), want) {
+                    // Let the next match try again rather than believing it
+                    // stuck, unless it cannot work: a profile the device does
+                    // not have is refused the same way every time.
+                    if switch_retryable(&e) {
+                        watcher.invalidate();
+                    }
+                } else if let (Some(d), Some(v)) = (dpi.as_ref(), want) {
                     if let Err(e) = d.set(dev, *v, 0) {
                         eprintln!("logi: setting {v} dpi: {e}");
                     }
                 }
+            }
+        }
+        if !dry && last_check.elapsed() >= ENDPOINT_CHECK_EVERY {
+            last_check = std::time::Instant::now();
+            if let Err(e) = check_endpoint(&profiles, dev) {
+                eprintln!("logi: {e}");
+                return Err(CliError::Failed(
+                    "the endpoint is gone, and this command holds one open\n\
+                     handle, so nothing it does from here can work. Re-plug the\n\
+                     mouse and run `logi watch` again, or use `logi serve`, which\n\
+                     reconnects on its own."
+                        .into(),
+                ));
             }
         }
         nap_for(poll);
@@ -1365,6 +1490,20 @@ mod tests {
         assert!(!super::endpoint_gone(&Error::Device { code: 8, feature: 1, function: 2 }));
         assert!(!super::endpoint_gone(&Error::Protocol("short reply".into())));
         assert!(!super::endpoint_gone(&Error::NoSuchFeature(0x8110)));
+    }
+
+    #[test]
+    fn a_refused_switch_is_not_retried_but_a_lost_one_is() {
+        use crate::hidpp::Error;
+        // Protocol is set_current's own range check: it answers the same way
+        // every time, and retrying it in the service means tearing down and
+        // rewriting the non-volatile button table on every attempt.
+        assert!(!super::switch_retryable(&Error::Protocol("profile 9 out of range".into())));
+        assert!(!super::switch_retryable(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        ))));
+        assert!(super::switch_retryable(&Error::Timeout { feature: 1, function: 2 }));
+        assert!(super::switch_retryable(&Error::Device { code: 8, feature: 1, function: 2 }));
     }
 
     #[test]

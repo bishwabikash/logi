@@ -339,6 +339,33 @@ pub fn spawn() -> Handle {
     Handle { tx, snapshot, next_id: Arc::new(AtomicU64::new(1)), host_held }
 }
 
+/// Which node an effect thread is holding open, as the filesystem names it.
+type NodeId = (u64, u64);
+
+fn node_id(path: &str) -> Option<NodeId> {
+    use std::os::unix::fs::MetadataExt;
+    // A stat, not an open: nothing here touches the device itself.
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// True when the node an effect thread opened is no longer the node at that
+/// path: unplugged, or unplugged and plugged back in.
+///
+/// `effects::Running` has no way to ask whether its thread is still alive, and
+/// that thread exits on its own when a frame write fails — which is what an
+/// unplug does. The worker would go on believing in a running effect that is
+/// not, and with `effect` still set the loop top never reconnects. A replug
+/// recreates the node, so the identity is compared and not just its presence;
+/// a bare `exists()` misses a replug that lands between two polls. `None`
+/// means the identity could not be taken when the effect started, in which
+/// case nothing is claimed.
+fn effect_node_gone(started_on: Option<NodeId>, path: &str) -> bool {
+    match started_on {
+        Some(id) => node_id(path) != Some(id),
+        None => false,
+    }
+}
+
 /// Take host mode only if we are not already in it. Each switch costs a
 /// 150ms settle, which is very noticeable when it happens on every click.
 fn ensure_host(l: &mut Live) -> crate::hidpp::Result<()> {
@@ -607,6 +634,9 @@ fn worker(
 ) {
     let mut live: Option<Live> = None;
     let mut effect: Option<effects::Running> = None;
+    // Identity of the device node the running effect opened; see
+    // `effect_node_gone`.
+    let mut effect_node: Option<NodeId> = None;
     let mut pending: std::collections::VecDeque<(CmdId, Cmd)> =
         std::collections::VecDeque::new();
     // The worker's own copy. Mutated freely here and published in one clone,
@@ -639,7 +669,26 @@ fn worker(
             Some(c) => c,
             None => match rx.recv_timeout(Duration::from_millis(400)) {
                 Ok(c) => c,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // An effect thread that died on its own (the mouse was
+                    // unplugged mid-effect) leaves `effect` set and `live`
+                    // empty, a state the reconnect guard above cannot leave.
+                    // Retire it here so the next pass reconnects and the
+                    // snapshot stops claiming an effect that is not running.
+                    if effect.is_some() && effect_node_gone(effect_node, &snap.path) {
+                        if let Some(r) = effect.take() {
+                            r.stop();
+                        }
+                        effect_node = None;
+                        snap.effect_running = None;
+                        snap.connected = false;
+                        snap.error = Some(
+                            "the effect ended because the mouse was disconnected".to_string(),
+                        );
+                        publish(&shared, &snap);
+                    }
+                    continue;
+                }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             },
         };
@@ -653,6 +702,7 @@ fn worker(
         if let Some(r) = effect.take() {
             r.stop();
         }
+        effect_node = None;
         if was_running {
             snap.effect_running = None;
         }
@@ -698,7 +748,11 @@ fn worker(
         let name_for_backup = l.name.clone();
         let wrote_flash = cmd.rereads_profiles();
         let result: crate::hidpp::Result<Option<String>> = match cmd {
-            Cmd::Refresh => Ok(None),
+            // read_state swallows every read error, so on its own a Refresh
+            // of an unplugged mouse "succeeded", kept the dead handle, and
+            // left the snapshot saying connected. One real call first lets
+            // a vanished device surface as the Io error that drops the handle.
+            Cmd::Refresh => l.dev.protocol_version().map(|_| None),
             Cmd::SetDpi(v) => feat!(l, dpi, "adjustable DPI").and_then(|(d, dev)| {
                 d.set(dev, v, 0).map(|got| {
                     Some(if got == v {
@@ -736,7 +790,10 @@ fn worker(
                 .map(|_| Some("lighting off".into())),
             Cmd::PersistLighting { leds: recs } => {
                 feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
-                    let idx = p.current(dev).unwrap_or(0);
+                    // Not `unwrap_or(0)`: a read that timed out would store
+                    // this lighting into profile 0's flash while a different
+                    // profile is the one the mouse is running.
+                    let idx = p.current(dev)?;
                     let blob = p.read_sector(dev, idx as u16 + 1, None)?;
                     let mut prof =
                         Profile::parse(&blob).map_err(crate::hidpp::Error::Protocol)?;
@@ -796,6 +853,7 @@ fn worker(
                 match effects::start(name.clone(), color, period_ms) {
                     Ok(r) => {
                         effect = Some(r);
+                        effect_node = node_id(&snap.path);
                         // The effect thread now owns the device.
                         live = None;
                         snap.effect_running = Some(name);
@@ -1005,6 +1063,26 @@ mod tests {
         // The half-written temporary must not be left behind as litter that
         // looks like a backup.
         assert!(!dir.join("no-such-directory").exists());
+    }
+
+    #[test]
+    fn an_effect_whose_node_disappeared_is_noticed() {
+        let dir = temp_dir("effect-node");
+        let node = dir.join("hidraw0");
+        std::fs::write(&node, "").unwrap();
+        let path = node.to_str().unwrap();
+        let id = node_id(path);
+        assert!(id.is_some());
+        assert!(!effect_node_gone(id, path), "a node that is still there is not gone");
+        std::fs::remove_file(&node).unwrap();
+        assert!(effect_node_gone(id, path), "an unplug has to retire the effect");
+    }
+
+    #[test]
+    fn an_effect_with_no_recorded_node_is_never_called_dead() {
+        // If the identity could not be taken at the start, claiming the effect
+        // died would tear down one that is running.
+        assert!(!effect_node_gone(None, "/nonexistent/hidraw9"));
     }
 
     #[test]

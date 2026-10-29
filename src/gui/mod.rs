@@ -4,7 +4,7 @@
 use crate::device::{self, Cmd, Snapshot};
 use crate::dpi::Capability;
 use crate::led;
-use crate::profile_blob::{Button, Led, SPECIALS};
+use crate::profile_blob::{Button, Led, BTN_HID, HID_MOUSE, SPECIALS};
 use eframe::egui;
 
 pub mod bindings_editor;
@@ -53,6 +53,15 @@ pub struct App {
     /// made for one profile must not stay armed over another: Apply writes
     /// flash.
     btn_profile: Option<u8>,
+    /// The newest flash write sent from here that the worker has not yet
+    /// answered, and when it was sent.
+    ///
+    /// The panels decide what to offer from the snapshot, and the snapshot only
+    /// catches up once the worker has written and read back. A second write
+    /// armed in that window is judged against sectors that are already out of
+    /// date: two button changes that each leave a left click behind can,
+    /// together, leave none. So writes wait for the previous one's answer.
+    flash_inflight: Option<(device::CmdId, std::time::Instant)>,
 
     themed: bool,
     profile_editor: profile_editor::ProfileEditor,
@@ -95,6 +104,7 @@ impl App {
             backup_path: default_backup_path(),
             btn_action: std::collections::HashMap::new(),
             btn_profile: None,
+            flash_inflight: None,
             themed: false,
             profile_editor: profile_editor::ProfileEditor::new(),
             rules: rules_editor::RulesEditor::new(),
@@ -105,6 +115,15 @@ impl App {
             tray_tried: false,
             tray_rx: None,
             dpi_touched: false,
+        }
+    }
+
+    /// Send a command, and remember it if it writes flash. See `flash_inflight`.
+    fn send_tracked(&mut self, cmd: Cmd) {
+        let flash = writes_flash(&cmd);
+        let id = self.dev.send(cmd);
+        if flash {
+            self.flash_inflight = Some((id, std::time::Instant::now()));
         }
     }
 
@@ -127,6 +146,61 @@ impl App {
                 .unwrap_or_default()
         }
     }
+}
+
+/// True if this binding presses the left mouse button.
+fn presses_left(b: &Button) -> bool {
+    b.0[0] == BTN_HID && b.0[1] == HID_MOUSE && u16::from_be_bytes([b.0[2], b.0[3]]) & 1 != 0
+}
+
+/// Whether replacing `buttons[index]` with `new` would take away the only
+/// left click the first `count` buttons have.
+///
+/// A mouse that cannot click survives unplugging and looks exactly like broken
+/// hardware, and this grid writes flash one button at a time with no staging
+/// step like the profile editor's. A profile that already has no left click is
+/// not made worse by a change, so it stays editable: that is the way back.
+fn strands_left_click(buttons: &[Button], count: usize, index: usize, new: Button) -> bool {
+    let had = buttons.iter().take(count).any(presses_left);
+    let has = buttons
+        .iter()
+        .take(count)
+        .enumerate()
+        .any(|(i, b)| presses_left(if i == index { &new } else { b }));
+    had && !has
+}
+
+/// How long a flash write is waited on before the panels stop holding for it.
+///
+/// A write that is read back takes seconds, not minutes. The bound is for a
+/// worker that never answers: the buttons must not stay grey for good.
+const FLASH_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Commands that write an onboard profile sector.
+fn writes_flash(c: &Cmd) -> bool {
+    matches!(
+        c,
+        Cmd::PersistLighting { .. } | Cmd::WriteProfile { .. } | Cmd::SetButton { .. }
+    )
+}
+
+/// Whether the command sent as `id` is still unanswered.
+///
+/// The worker runs commands in the order they were sent and records an
+/// outcome for each, so an outcome with a higher id means this one's has been
+/// recorded too, even if the ring has since pushed it out.
+fn still_waiting(id: device::CmdId, newest_outcome: device::CmdId, waited: std::time::Duration) -> bool {
+    newest_outcome < id && waited < FLASH_WAIT
+}
+
+/// Whether a tab has nothing to show without a mouse attached.
+///
+/// The service and the app rules are not the device's: the rules are a config
+/// file and the service is a systemd unit. With no mouse found, the service is
+/// often the very thing to look at (it may be failing, or be what the user
+/// needs to restart), so the whole window must not collapse to "no device".
+fn tab_needs_device(t: Tab) -> bool {
+    !matches!(t, Tab::Apps | Tab::Service)
 }
 
 /// Every label the per-button menu offers.
@@ -166,6 +240,57 @@ fn storable_mode(m: u8) -> bool {
     matches!(m, led::OFF | led::FIXED | led::BREATHING | led::CYCLE)
 }
 
+/// The profile record for a lighting mode, or `None` when no record encodes it.
+///
+/// One place decides both "can this be stored" and "what is stored", so the
+/// button cannot be enabled for a mode the record then misstates.
+fn lighting_record(mode: u8, color: [u8; 3], period_ms: u16, waveform: u8, intensity: u8) -> Option<Led> {
+    match mode {
+        led::OFF => Some(Led::off()),
+        led::FIXED => Some(Led::fixed(color)),
+        led::BREATHING => Some(Led::breathing(color, period_ms, waveform, intensity)),
+        led::CYCLE => Some(Led::cycle(period_ms, intensity)),
+        _ => None,
+    }
+}
+
+/// Which of the profile's two LED records a save would replace.
+///
+/// Record slot and zone position line up, the same pairing the profile editor
+/// uses. "All zones" replaces only as many slots as the device has zones: on a
+/// device that reports one, the second record is not this panel's to touch.
+/// A selection with no slot behind it (a third zone, or none at all) replaces
+/// nothing.
+fn lighting_slots(all_zones: bool, zone_sel: usize, zone_count: usize) -> Vec<usize> {
+    if all_zones {
+        (0..zone_count.min(2)).collect()
+    } else if zone_sel < zone_count && zone_sel < 2 {
+        vec![zone_sel]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The two records to write, or `None` when writing them would have to guess.
+///
+/// The command carries both slots, so any slot not being replaced has to come
+/// from what the mouse already stores. If that is not known the answer is
+/// `None`, never a copy of the new record: that copy is the silent loss of the
+/// other zone's lighting.
+fn merged_leds(slots: &[usize], rec: Led, stored: Option<[Led; 2]>) -> Option<[Led; 2]> {
+    if slots.is_empty() {
+        return None;
+    }
+    if (0..2).all(|s| slots.contains(&s)) {
+        return Some([rec, rec]);
+    }
+    let mut keep = stored?;
+    for &s in slots {
+        *keep.get_mut(s)? = rec;
+    }
+    Some(keep)
+}
+
 /// Why storing lighting into the onboard profile is not on offer, or `None`
 /// when it is.
 ///
@@ -196,6 +321,24 @@ fn store_blocked_reason(storable: bool, format: u8, slot_known: bool) -> Option<
     None
 }
 
+/// What a tray service item should do right now, or nothing.
+fn tray_service_action(
+    toggle: bool,
+    known: bool,
+    state: crate::service::State,
+    busy: bool,
+) -> Option<crate::service::Action> {
+    use crate::service::{can_control, Action, State};
+    if !known || busy || !can_control(state) {
+        return None;
+    }
+    Some(match (toggle, state) {
+        (false, _) => Action::Restart,
+        (true, State::Active) => Action::Stop,
+        (true, _) => Action::Start,
+    })
+}
+
 fn default_backup_path() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     format!("{home}/logi-backup.json")
@@ -209,6 +352,34 @@ impl eframe::App for App {
     /// last pushed and ignores its own profile. Restoring on exit means
     /// closing the app always returns the mouse to driving itself.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // An effect streams frames from a thread of its own, and the process
+        // ending would cut that thread off wherever it was. Asking the worker
+        // to stop it first is what lets it hand the mouse back and be done
+        // before the restore below, rather than racing it. Bounded: the app
+        // is closing, and a worker that never answers must not hold the
+        // window open.
+        if self.dev.snapshot().effect_running.is_some() {
+            self.dev.send(Cmd::StopEffect);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while self.dev.snapshot().effect_running.is_some()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        // A flash write the worker is partway through must not be cut off by
+        // the process ending: the sector is erased and rewritten in steps, and
+        // an interrupted one is a profile the mouse cannot read back. The
+        // restore below also talks to the device, so it waits for the write
+        // too. Bounded for the same reason as above.
+        if let Some((id, _)) = self.flash_inflight {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
+            while self.dev.snapshot().newest_outcome_id() < id
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
         self.dev.restore_onboard_blocking();
     }
 
@@ -226,6 +397,11 @@ impl eframe::App for App {
         // Before the tray, not after: the tray renders this snapshot, and
         // reading it second had every icon update describing the frame before.
         self.snap = self.dev.snapshot();
+        if let Some((id, since)) = self.flash_inflight {
+            if !still_waiting(id, self.snap.newest_outcome_id(), since.elapsed()) {
+                self.flash_inflight = None;
+            }
+        }
         self.sync_tray(ctx);
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
@@ -237,16 +413,15 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::BG).inner_margin(egui::Margin::symmetric(22, 18)))
             .show(ctx, |ui| {
-                if !self.snap.connected {
-                    self.draw_disconnected(ui);
-                    return;
-                }
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     // Cap the reading width, but never beyond what the panel
                     // actually has: forcing 640 here clipped every card.
                     let w = ui.available_width().min(660.0);
                     ui.set_max_width(w);
                     match self.tab {
+                        t if !self.snap.connected && tab_needs_device(t) => {
+                            self.draw_disconnected(ui)
+                        }
                         Tab::Sensor => self.draw_sensor(ui),
                         Tab::Lighting => self.draw_lighting(ui),
                         Tab::Profiles => self.draw_profiles(ui),
@@ -345,15 +520,21 @@ impl App {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
-                Event::ToggleService => {
-                    let a = if self.service.state() == crate::service::State::Active {
-                        crate::service::Action::Stop
-                    } else {
-                        crate::service::Action::Start
-                    };
-                    self.service.request(a);
+                Event::ToggleService | Event::RestartService => {
+                    // The same gate the Service tab puts on its buttons. The
+                    // menu has no greyed state of its own, so without it a
+                    // click before the first poll acted on a default, one
+                    // during an action queued a second systemctl, and one
+                    // with no unit or no systemd could only produce an error.
+                    if let Some(a) = tray_service_action(
+                        matches!(ev, Event::ToggleService),
+                        self.service.known(),
+                        self.service.state(),
+                        self.service.busy().is_some(),
+                    ) {
+                        self.service.request(a);
+                    }
                 }
-                Event::RestartService => self.service.request(crate::service::Action::Restart),
                 Event::SetProfile(p) => {
                     self.dev.send(Cmd::SetProfile(p));
                 }
@@ -417,7 +598,7 @@ impl App {
                         .color(if on { theme::TEXT } else { theme::DIM });
                     let resp = ui.add_sized(
                         egui::vec2(ui.available_width(), 32.0),
-                        egui::SelectableLabel::new(on, txt),
+                        egui::Button::selectable(on, txt),
                     );
                     if resp.clicked() {
                         self.tab = t;
@@ -427,6 +608,12 @@ impl App {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     if ui.button("Refresh").clicked() {
                         self.dev.send(Cmd::Refresh);
+                    }
+                    // Memory mode is the onboard-profiles feature. With no
+                    // mouse, or one that reports none, the toggle could only
+                    // send a command the worker refuses.
+                    if !(self.snap.connected && self.snap.has_profiles) {
+                        return;
                     }
                     ui.add_space(14.0);
 
@@ -749,10 +936,16 @@ impl App {
             // flash, so three things have to hold before the button is live.
             //
             // The record has to be able to say what was picked. `Led` encodes
-            // off, fixed, breathing and cycle; a zone that reports wave or
-            // starlight would otherwise fall through to the fixed arm below
-            // and store a plain colour nobody chose.
-            let storable = storable_mode(self.mode);
+            // off, fixed, breathing and cycle; for a zone that reports wave
+            // or starlight `lighting_record` has no answer, so nothing is
+            // stored rather than a plain colour nobody chose.
+            let rec = lighting_record(
+                self.mode,
+                self.rgb(),
+                self.period_ms,
+                led::WAVEFORMS[self.waveform].1,
+                self.intensity,
+            );
             // The other zone's record has to be known, because the command
             // carries both slots. Writing this record into both when the
             // mouse's own lighting has not been read is the silent loss of
@@ -763,13 +956,26 @@ impl App {
                 .profiles
                 .get(self.snap.active_profile as usize)
                 .map(|p| p.leds);
-            let slot_known =
-                self.all_zones || stored.map(|k| self.zone_sel < k.len()).unwrap_or(false);
+            let slots = lighting_slots(self.all_zones, self.zone_sel, zones.len());
+            let to_store = rec.and_then(|r| merged_leds(&slots, r, stored));
             // And the sector has to be one this app can decode at all: the
             // worker parses it with the format-2 codec before writing it back.
-            let blocked =
-                store_blocked_reason(storable, self.snap.profile_format, slot_known);
-            let can_store = blocked.is_none();
+            let blocked = if slots.is_empty() {
+                Some(
+                    "The selected zone has no record in the profile, so there is nothing \
+                     to write for it.",
+                )
+            } else {
+                store_blocked_reason(
+                    rec.is_some(),
+                    self.snap.profile_format,
+                    to_store.is_some(),
+                )
+            };
+            // One flash write at a time: `stored` above is the snapshot, and
+            // a write still in flight has not reached it yet.
+            let writing = self.flash_inflight.is_some();
+            let can_store = blocked.is_none() && !writing;
 
             ui.add_space(14.0);
             if !live_ok(self.mode) {
@@ -785,7 +991,10 @@ impl App {
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(live_ok(self.mode), egui::Button::new("Apply now"))
+                    .add_enabled(
+                        live_ok(self.mode) && storable_mode(self.mode),
+                        egui::Button::new("Apply now"),
+                    )
                     .clicked()
                 {
                     let c = self.rgb();
@@ -793,6 +1002,7 @@ impl App {
                     for z in self.zones() {
                         self.dev.send(match self.mode {
                             led::OFF => Cmd::LedOff { zone: z },
+                            led::FIXED => Cmd::LedFixed { zone: z, color: c },
                             led::BREATHING => Cmd::LedBreathing {
                                 zone: z, color: c, period: self.period_ms,
                                 waveform: wf, intensity: self.intensity,
@@ -800,7 +1010,9 @@ impl App {
                             led::CYCLE => Cmd::LedCycle {
                                 zone: z, period: self.period_ms, intensity: self.intensity,
                             },
-                            _ => Cmd::LedFixed { zone: z, color: c },
+                            // Nothing else is sent: the button is only
+                            // enabled for the four modes above.
+                            _ => continue,
                         });
                     }
                 }
@@ -808,28 +1020,13 @@ impl App {
                     .add_enabled(can_store, egui::Button::new("Save to mouse"))
                     .clicked()
                 {
-                    let c = self.rgb();
-                    let wf = led::WAVEFORMS[self.waveform].1;
-                    let rec = match self.mode {
-                        led::OFF => Led::off(),
-                        led::BREATHING => Led::breathing(c, self.period_ms, wf, self.intensity),
-                        led::CYCLE => Led::cycle(self.period_ms, self.intensity),
-                        _ => Led::fixed(c),
-                    };
-                    // This writes flash. With one zone selected, keep the
-                    // other exactly as the mouse already stores it: pushing
-                    // this record into both slots silently discarded stored
-                    // lighting the user never touched. Record slot and zone
-                    // position line up, which is the same pairing the profile
-                    // editor uses.
-                    let leds = match (self.all_zones, stored) {
-                        (false, Some(mut keep)) if self.zone_sel < keep.len() => {
-                            keep[self.zone_sel] = rec;
-                            keep
-                        }
-                        _ => [rec, rec],
-                    };
-                    self.dev.send(Cmd::PersistLighting { leds });
+                    // This writes flash. With one zone selected the other is
+                    // kept exactly as the mouse already stores it (see
+                    // `merged_leds`); `can_store` is only true when that
+                    // answer exists.
+                    if let Some(leds) = to_store {
+                        self.send_tracked(Cmd::PersistLighting { leds });
+                    }
                 }
             });
             ui.add_space(8.0);
@@ -841,6 +1038,9 @@ impl App {
             if let Some(why) = blocked {
                 ui.add_space(6.0);
                 theme::hint(ui, why);
+            } else if writing {
+                ui.add_space(6.0);
+                theme::hint(ui, "Waiting for the mouse to confirm the last write.");
             }
         });
 
@@ -958,7 +1158,7 @@ impl App {
             let snap = self.snap.clone();
             let sel = self.profile_sel as u8;
             for cmd in self.profile_editor.ui(ui, &snap, sel) {
-                self.dev.send(cmd);
+                self.send_tracked(cmd);
             }
         }
 
@@ -1027,8 +1227,14 @@ impl App {
 
         let choices = button_choices();
 
-        let n_buttons = self.snap.button_count;
+        // The sector's table has 32 slots whatever a device claims, and
+        // `set_button` refuses anything past them.
+        let n_buttons = self.snap.button_count.min(crate::profile_blob::N_BUTTON_SLOTS as u8);
         let mut pending: Option<(u8, Button)> = None;
+        let mut stranded = false;
+        // The strand check below reads the snapshot's table, which does not
+        // include a write that has been sent and not yet answered.
+        let writing = self.flash_inflight.is_some();
 
         theme::section(ui, &format!("Buttons, profile {idx}"), |ui| {
             egui::Grid::new("btns")
@@ -1058,14 +1264,38 @@ impl App {
                             });
 
                         let changed = sel != cur_desc;
-                        if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
-                            if let Some(b) = action_to_button(&sel) {
+                        let chosen = if changed { action_to_button(&sel) } else { None };
+                        let strands = chosen.is_some_and(|b| {
+                            strands_left_click(&p.buttons, n_buttons as usize, i as usize, b)
+                        });
+                        stranded |= strands;
+                        if ui
+                            .add_enabled(
+                                changed && !strands && !writing,
+                                egui::Button::new("Apply"),
+                            )
+                            .clicked()
+                        {
+                            if let Some(b) = chosen {
                                 pending = Some((i, b));
                             }
                         }
                         ui.end_row();
                     }
                 });
+            if stranded {
+                ui.add_space(8.0);
+                theme::hint(
+                    ui,
+                    "That change would leave this profile with no left click, and a mouse \
+                     with none cannot click, even after unplugging. Bind left click to \
+                     another button first.",
+                );
+            }
+            if writing {
+                ui.add_space(8.0);
+                theme::hint(ui, "Waiting for the mouse to confirm the last write.");
+            }
             ui.add_space(10.0);
             theme::hint(
                 ui,
@@ -1075,7 +1305,7 @@ impl App {
         });
 
         if let Some((button, binding)) = pending {
-            self.dev.send(Cmd::SetButton { index: idx, button, binding });
+            self.send_tracked(Cmd::SetButton { index: idx, button, binding });
             self.btn_action.remove(&button);
         }
     }
@@ -1301,6 +1531,127 @@ mod tests {
         assert!(store_blocked_reason(true, 2, false).is_some());
         // All three hold.
         assert_eq!(store_blocked_reason(true, 2, true), None);
+    }
+
+    #[test]
+    fn a_record_exists_only_for_the_modes_a_profile_can_hold() {
+        for m in [led::OFF, led::FIXED, led::BREATHING, led::CYCLE] {
+            let r = lighting_record(m, [1, 2, 3], 4000, 0, 100).expect("storable");
+            assert_eq!(r.mode(), m, "the record says what the panel shows");
+        }
+        for m in [led::WAVE, led::STARLIGHT, led::RIPPLE, led::CUSTOM] {
+            assert_eq!(lighting_record(m, [1, 2, 3], 4000, 0, 100), None);
+        }
+    }
+
+    #[test]
+    fn saving_one_zone_never_copies_it_over_the_other() {
+        let a = Led::fixed([1, 1, 1]);
+        let b = Led::fixed([2, 2, 2]);
+        let new = Led::fixed([9, 9, 9]);
+        // Selecting the second zone keeps the first as stored.
+        let slots = lighting_slots(false, 1, 2);
+        assert_eq!(merged_leds(&slots, new, Some([a, b])), Some([a, new]));
+        let slots = lighting_slots(false, 0, 2);
+        assert_eq!(merged_leds(&slots, new, Some([a, b])), Some([new, b]));
+        // The stored records are unknown: no write, not a copy into both.
+        assert_eq!(merged_leds(&slots, new, None), None);
+        // Both zones selected replaces both, and needs nothing stored.
+        let slots = lighting_slots(true, 0, 2);
+        assert_eq!(merged_leds(&slots, new, None), Some([new, new]));
+    }
+
+    #[test]
+    fn a_zone_with_no_record_slot_writes_nothing() {
+        // A third zone has no record behind it, and neither does a stale
+        // selection on a device that reports none.
+        assert!(lighting_slots(false, 2, 3).is_empty());
+        assert!(lighting_slots(false, 0, 0).is_empty());
+        assert!(lighting_slots(true, 0, 0).is_empty());
+        let new = Led::off();
+        assert_eq!(merged_leds(&[], new, Some([new, new])), None);
+    }
+
+    #[test]
+    fn all_zones_on_a_one_zone_device_leaves_the_other_record_alone() {
+        let a = Led::fixed([1, 1, 1]);
+        let b = Led::fixed([2, 2, 2]);
+        let new = Led::fixed([9, 9, 9]);
+        let slots = lighting_slots(true, 0, 1);
+        assert_eq!(slots, vec![0]);
+        assert_eq!(merged_leds(&slots, new, Some([a, b])), Some([new, b]));
+        assert_eq!(merged_leds(&slots, new, None), None);
+    }
+
+    #[test]
+    fn the_service_and_the_rules_do_not_wait_for_a_mouse() {
+        assert!(!tab_needs_device(Tab::Service));
+        assert!(!tab_needs_device(Tab::Apps));
+        for t in [Tab::Sensor, Tab::Lighting, Tab::Profiles, Tab::Buttons, Tab::About] {
+            assert!(tab_needs_device(t));
+        }
+    }
+
+    #[test]
+    fn a_tray_service_click_acts_only_when_the_panel_would_let_it() {
+        use crate::service::{Action, State};
+        // Nothing has looked at systemd yet: the state is a default.
+        assert_eq!(tray_service_action(true, false, State::Inactive, false), None);
+        // Something is already in flight.
+        assert_eq!(tray_service_action(true, true, State::Active, true), None);
+        // Nothing to control.
+        assert_eq!(tray_service_action(true, true, State::NotInstalled, false), None);
+        assert_eq!(tray_service_action(false, true, State::NoSystemd, false), None);
+        // And when it can: toggle flips, restart restarts.
+        assert_eq!(tray_service_action(true, true, State::Active, false), Some(Action::Stop));
+        assert_eq!(tray_service_action(true, true, State::Failed, false), Some(Action::Start));
+        assert_eq!(tray_service_action(false, true, State::Active, false), Some(Action::Restart));
+    }
+
+    #[test]
+    fn the_grid_will_not_remove_the_only_left_click() {
+        let left = Button::mouse(1);
+        let right = Button::mouse(2);
+        let table = [left, right, Button::disabled()];
+        // Disabling or rebinding the only left click strands the mouse.
+        assert!(strands_left_click(&table, 3, 0, Button::disabled()));
+        assert!(strands_left_click(&table, 3, 0, right));
+        // Anything else is fine, including keeping left click where it is.
+        assert!(!strands_left_click(&table, 3, 1, Button::disabled()));
+        assert!(!strands_left_click(&table, 3, 0, Button::mouse(1)));
+        // Moving it to another button first is the way to change the original.
+        let moved = [left, left, Button::disabled()];
+        assert!(!strands_left_click(&moved, 3, 0, Button::disabled()));
+        // A profile already without one can always be edited back.
+        let broken = [right, Button::disabled()];
+        assert!(!strands_left_click(&broken, 2, 0, Button::disabled()));
+        assert!(!strands_left_click(&broken, 2, 1, left));
+        // A left click beyond the buttons this device has does not count.
+        let hidden = [right, right, left];
+        assert!(!strands_left_click(&hidden, 2, 0, Button::disabled()));
+    }
+
+    #[test]
+    fn a_flash_write_holds_the_next_until_it_is_answered() {
+        use std::time::Duration;
+        let soon = Duration::from_secs(1);
+        // Sent as 7, nothing newer recorded: still in flight.
+        assert!(still_waiting(7, 0, soon));
+        assert!(still_waiting(7, 6, soon));
+        // Its own outcome, or a later one if the ring moved on.
+        assert!(!still_waiting(7, 7, soon));
+        assert!(!still_waiting(7, 12, soon));
+        // A worker that never answers must not grey the buttons for good.
+        assert!(!still_waiting(7, 0, FLASH_WAIT));
+    }
+
+    #[test]
+    fn only_sector_writes_are_held_for() {
+        assert!(writes_flash(&Cmd::SetButton { index: 0, button: 1, binding: Button::disabled() }));
+        assert!(writes_flash(&Cmd::PersistLighting { leds: [Led::off(), Led::off()] }));
+        assert!(!writes_flash(&Cmd::Refresh));
+        assert!(!writes_flash(&Cmd::SetDpi(800)));
+        assert!(!writes_flash(&Cmd::Backup(String::new())));
     }
 
     #[test]

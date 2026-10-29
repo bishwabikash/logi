@@ -194,8 +194,8 @@ impl ButtonSpy {
             return Ok(());
         }
         if let Err(e) = self.set_remapping(dev, &want) {
-            let _ = self.restore(dev);
-            return Err(e);
+            let put_back = self.restore(dev);
+            return Err(silence_failure(e, put_back));
         }
         Ok(())
     }
@@ -212,6 +212,30 @@ impl ButtonSpy {
     /// was zeroed by something else.
     pub fn restore_identity(&self, dev: &mut Device) -> Result<()> {
         self.set_remapping(dev, &IDENTITY[..self.count as usize])
+    }
+}
+
+/// What `silence` reports when its write failed and it then tried to put the
+/// saved table back.
+///
+/// If the put-back worked, the original error is the whole story. If it did
+/// not, the write may have landed and nothing undid it, so the caller has to be
+/// told the mouse might have dead buttons and what fixes that: the panel's
+/// ApplyBindings has no teardown of its own, so this message is the only
+/// warning its user gets.
+///
+/// `Error::Io` passes through untouched even then. The device worker reads that
+/// variant as "the mouse vanished" and drops its handle to reconnect; hiding it
+/// inside a Protocol error would leave it holding a dead descriptor.
+fn silence_failure(e: Error, put_back: Result<()>) -> Error {
+    match (put_back, e) {
+        (Ok(()), e) => e,
+        (Err(_), e @ Error::Io(_)) => e,
+        (Err(e2), e) => Error::Protocol(format!(
+            "{e}. Putting the previous button mapping back also failed ({e2}), so \
+             some buttons may be dead. Use the restore button, or run \
+             `logi bind reset`, to put the factory mapping back."
+        )),
     }
 }
 
@@ -529,6 +553,33 @@ mod tests {
 
         // restore_identity needs only the count, so it is still writable.
         check_table(&IDENTITY[..blind.count as usize], blind.count).unwrap();
+    }
+
+    #[test]
+    fn a_failed_silence_that_could_not_be_undone_says_so() {
+        let timeout = || Error::Timeout { feature: 0x0d, function: SET_REMAPPING };
+
+        // Put back fine: the original error is all there is to say.
+        let e = silence_failure(timeout(), Ok(()));
+        assert!(matches!(e, Error::Timeout { .. }), "{e:?}");
+
+        // Put back failed too: the write may have landed, so name the way out.
+        let e = silence_failure(timeout(), Err(timeout()));
+        let msg = format!("{e}");
+        assert!(matches!(e, Error::Protocol(_)), "{e:?}");
+        assert!(msg.contains("no reply"), "keeps the cause: {msg}");
+        assert!(msg.contains("dead"), "{msg}");
+        assert!(msg.contains("logi bind reset"), "{msg}");
+
+        // An unplug stays an Io error, which is what makes the worker
+        // reconnect.
+        let gone = Error::Io(io_err());
+        let e = silence_failure(gone, Err(timeout()));
+        assert!(matches!(e, Error::Io(_)), "{e:?}");
+    }
+
+    fn io_err() -> std::io::Error {
+        std::io::Error::from(std::io::ErrorKind::BrokenPipe)
     }
 
     #[test]

@@ -545,7 +545,59 @@ impl Scanner {
     }
 }
 
+/// Where a write to `path` has to land so that a symlink at `path` survives.
+///
+/// A link that resolves is followed all the way. A dangling one (a dotfiles
+/// checkout that is not mounted, or a file moved away) is followed by hand,
+/// and only as far as a directory that already exists: creating the missing
+/// directories of someone else's tree to satisfy a link they have not
+/// finished setting up would be worse than saying so.
+fn resolve_target(path: &Path) -> std::io::Result<PathBuf> {
+    if let Ok(p) = std::fs::canonicalize(path) {
+        return Ok(p);
+    }
+    let mut cur = path.to_path_buf();
+    let mut followed = false;
+    for _ in 0..40 {
+        match std::fs::read_link(&cur) {
+            Ok(t) => {
+                followed = true;
+                cur = if t.is_absolute() {
+                    t
+                } else {
+                    cur.parent().map(|p| p.join(&t)).unwrap_or(t)
+                };
+                if let Ok(c) = std::fs::canonicalize(&cur) {
+                    return Ok(c);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if followed {
+        let parent_exists = cur.parent().map(|p| p.is_dir()).unwrap_or(false);
+        if !parent_exists {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{} is a symlink to {}, whose directory does not exist",
+                    path.display(),
+                    cur.display()
+                ),
+            ));
+        }
+    }
+    Ok(cur)
+}
+
 fn write_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    // A config kept in a dotfiles repository is usually a symlink. Renaming
+    // over the link would replace it with a regular file and leave the real
+    // one, the one the user actually maintains, silently out of date. Write
+    // through to the file it points at instead. A path that is not a link and
+    // does not exist yet is written as given.
+    let resolved = resolve_target(path)?;
+    let path = resolved.as_path();
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -621,10 +673,14 @@ pub struct RulesEditor {
     /// Saving is blocked while this is set: an empty editor over a config we
     /// never managed to read would write the user's rules away.
     unreadable: Option<String>,
-    /// Set when a Save found the file different from the copy in
-    /// `disk_text`. The next Save goes through; this is the one chance to
-    /// press Reload instead.
-    confirm_overwrite: bool,
+    /// The exact file text a Save found that differed from `disk_text`, and
+    /// told the user about. A second Save goes through only if the file still
+    /// reads as that, so a file edited again after the warning, or one the
+    /// warning was ignored on for an hour, is warned about afresh instead of
+    /// being replaced on the strength of a confirmation for a different file.
+    /// The outer `Option` is "nothing acknowledged"; the inner one is the
+    /// file's text, `None` for no file.
+    acknowledged: Option<Option<String>>,
     requested: Option<Instant>,
 }
 
@@ -659,7 +715,7 @@ impl RulesEditor {
             scanner: None,
             no_scanner: false,
             unreadable: None,
-            confirm_overwrite: false,
+            acknowledged: None,
             requested: None,
         }
     }
@@ -755,7 +811,7 @@ impl RulesEditor {
             }
         }
         self.disk_text = text;
-        self.confirm_overwrite = false;
+        self.acknowledged = None;
     }
 
     pub fn dirty(&self) -> bool {
@@ -775,10 +831,10 @@ impl RulesEditor {
             self.status = Status::Failed(why);
             return;
         }
-        if !self.confirm_overwrite {
+        {
             match self.read_file() {
-                Ok(text) if text != self.disk_text => {
-                    self.confirm_overwrite = true;
+                Ok(text) if text != self.disk_text && self.acknowledged.as_ref() != Some(&text) => {
+                    self.acknowledged = Some(text);
                     self.status = Status::Note(format!(
                         "{} changed on disk since logi read it. Press Save again to \
                          replace it with what is on screen, or Reload from file to take \
@@ -804,8 +860,21 @@ impl RulesEditor {
                 Ok(()) => {
                     self.model = model.clone();
                     self.disk = model;
+                    // A kept line's diagnostic names its line in the file as
+                    // it was read. The save moved it to the end, so the old
+                    // number would send the user to the wrong line of the file
+                    // they were told they could edit by hand.
+                    let (written, _) = Model::from_text(&text);
+                    let same_lines = written.kept.len() == self.model.kept.len()
+                        && written.kept.iter().zip(&self.model.kept).all(|(a, b)| {
+                            a.raw.trim_end() == b.raw.trim_end()
+                        });
+                    if same_lines {
+                        self.model.kept = written.kept.clone();
+                        self.disk.kept = written.kept;
+                    }
                     self.disk_text = Some(text);
-                    self.confirm_overwrite = false;
+                    self.acknowledged = None;
                     // `round_trip` has already confirmed that the only
                     // problems the written file still has are the kept lines,
                     // so every note from the load is about a line that has
@@ -1298,6 +1367,10 @@ impl RulesEditor {
             match &self.status {
                 Status::Quiet => {}
                 Status::Note(m) => theme::hint(ui, m),
+                // "Saved" is about the file as it was a moment ago; once the
+                // panel is dirty again it would be reporting on a state that
+                // no longer matches what is on screen.
+                Status::Saved(_) if self.dirty() => {}
                 Status::Saved(m) => {
                     ui.add(
                         egui::Label::new(
@@ -1829,6 +1902,114 @@ poll_ms = 500
         assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "the rename must not widen the file's mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_through_a_symlink_updates_the_file_it_points_at() {
+        let dir = temp_dir("symlink");
+        let real = dir.join("dotfiles-rules.conf");
+        let link = dir.join("rules.conf");
+        std::fs::write(&real, "csgo = 1\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut ed = RulesEditor::with_path(link.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the link was replaced by a regular file"
+        );
+        assert!(std::fs::read_to_string(&real).unwrap().contains("blender = 2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_through_a_dangling_symlink_fills_in_its_target() {
+        let dir = temp_dir("dangling");
+        let real = dir.join("dotfiles-rules.conf");
+        let link = dir.join("rules.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut ed = RulesEditor::with_path(link.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "the dangling link was replaced by a regular file"
+        );
+        assert!(std::fs::read_to_string(&real).unwrap().contains("blender = 2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_link_into_a_missing_directory_is_reported_and_left_alone() {
+        let dir = temp_dir("dangling-dir");
+        let link = dir.join("rules.conf");
+        let real = dir.join("not-mounted/rules.conf");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut ed = RulesEditor::with_path(link.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Failed(_)), "{:?}", ed.status);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!dir.join("not-mounted").exists(), "someone else's tree was created");
+        assert!(ed.dirty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_line_is_renumbered_once_the_save_has_moved_it() {
+        let dir = temp_dir("renumber");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "this line is nonsense\ncsgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        assert!(ed.model.kept[0].problem.starts_with("line 1:"), "{:?}", ed.model.kept);
+        ed.model.add("blender", 2);
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let at = text.lines().position(|l| l == "this line is nonsense").unwrap() + 1;
+        assert!(
+            ed.model.kept[0].problem.starts_with(&format!("line {at}:")),
+            "{:?} vs line {at}",
+            ed.model.kept
+        );
+        assert!(!ed.dirty(), "renumbering is not an edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_confirmation_does_not_cover_a_file_that_changed_again() {
+        let dir = temp_dir("stale-twice");
+        let path = dir.join("rules.conf");
+        std::fs::write(&path, "csgo = 1\n").unwrap();
+
+        let mut ed = RulesEditor::with_path(path.clone());
+        ed.load();
+        ed.model.add("blender", 2);
+        std::fs::write(&path, "factorio = 3\n").unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Note(_)), "{:?}", ed.status);
+
+        // The warning was shown for `factorio`; the file is now something else.
+        std::fs::write(&path, "quake = 2\n").unwrap();
+        ed.save();
+        assert!(matches!(ed.status, Status::Note(_)), "{:?}", ed.status);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "quake = 2\n");
+
+        // Confirming what is there now goes through.
+        ed.save();
+        assert!(matches!(ed.status, Status::Saved(_)), "{:?}", ed.status);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

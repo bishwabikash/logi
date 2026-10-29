@@ -203,6 +203,34 @@ impl Led {
     }
 }
 
+fn decode_name(field: &[u8]) -> String {
+    let units: Vec<u16> = field
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// UTF-16LE, NUL padded to the field. Truncation is by whole characters: a
+/// cut through a surrogate pair would store half a character.
+fn encode_name(name: &str) -> [u8; NAME_LEN] {
+    let mut out = [0u8; NAME_LEN];
+    let mut at = 0;
+    for ch in name.chars() {
+        let mut units = [0u16; 2];
+        let units = ch.encode_utf16(&mut units);
+        if at + units.len() * 2 > NAME_LEN {
+            break;
+        }
+        for u in units.iter() {
+            out[at..at + 2].copy_from_slice(&u.to_le_bytes());
+            at += 2;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct Profile {
     pub report_rate_ms: u8,
@@ -237,12 +265,7 @@ impl Profile {
                 Button([blob[o], blob[o + 1], blob[o + 2], blob[o + 3]])
             })
             .collect();
-        let name_u16: Vec<u16> = blob[OFF_NAME..OFF_NAME + NAME_LEN]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&c| c != 0)
-            .collect();
-        let name = String::from_utf16_lossy(&name_u16);
+        let name = decode_name(&blob[OFF_NAME..OFF_NAME + NAME_LEN]);
         let mut rec = [Led::off(); 4];
         for (i, r) in rec.iter_mut().enumerate() {
             let o = OFF_LEDS + i * LED_RECORD;
@@ -289,10 +312,18 @@ impl Profile {
             let o = OFF_BUTTONS + i * 4;
             buf[o..o + 4].copy_from_slice(&b.0);
         }
-        let mut nm: Vec<u8> = self.name.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-        nm.truncate(NAME_LEN);
-        nm.resize(NAME_LEN, 0);
-        buf[OFF_NAME..OFF_NAME + NAME_LEN].copy_from_slice(&nm);
+        // The name field is only rewritten when the name changed. Decoding is
+        // lossy (a lone surrogate becomes U+FFFD) and stops at the first NUL,
+        // so re-encoding an untouched name would alter bytes nobody asked to
+        // touch, and make an unedited profile look different from the sector
+        // it was read from.
+        let name_changed = match &self.original {
+            Some(o) => decode_name(&o[OFF_NAME..OFF_NAME + NAME_LEN]) != self.name,
+            None => true,
+        };
+        if name_changed {
+            buf[OFF_NAME..OFF_NAME + NAME_LEN].copy_from_slice(&encode_name(&self.name));
+        }
         for (i, l) in self.leds.iter().chain(self.alt_leds.iter()).enumerate() {
             let o = OFF_LEDS + i * LED_RECORD;
             buf[o..o + LED_RECORD].copy_from_slice(&l.0);
@@ -431,6 +462,40 @@ mod tests {
         g[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_be_bytes());
         let p = Profile::parse(&g).unwrap();
         assert_eq!(p.serialize()[0x1f], 0x5A);
+    }
+
+    #[test]
+    fn an_unedited_name_field_is_left_exactly_as_read() {
+        // Bytes after the first NUL and a lone surrogate both fail to survive
+        // decode-then-encode; neither is the codec's to change.
+        let mut g = golden();
+        g[OFF_NAME..OFF_NAME + 8].copy_from_slice(&[b'A', 0, b'B', 0, 0, 0, 0x34, 0x12]);
+        g[OFF_NAME + 8..OFF_NAME + 10].copy_from_slice(&[0x00, 0xD8]);
+        let crc = crc_ccitt(&g[..OFF_CRC]);
+        g[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_be_bytes());
+        let p = Profile::parse(&g).unwrap();
+        assert_eq!(p.name, "AB");
+        assert_eq!(p.serialize(), g);
+    }
+
+    #[test]
+    fn an_edited_name_is_written_and_padded() {
+        let mut p = Profile::parse(&golden()).unwrap();
+        p.name = "Hi".into();
+        let out = p.serialize();
+        assert_eq!(&out[OFF_NAME..OFF_NAME + 6], &[b'H', 0, b'i', 0, 0, 0]);
+        assert!(out[OFF_NAME + 4..OFF_NAME + NAME_LEN].iter().all(|b| *b == 0));
+        assert_eq!(Profile::parse(&out).unwrap().name, "Hi");
+    }
+
+    #[test]
+    fn a_long_name_is_cut_on_a_character_boundary() {
+        let mut p = Profile::parse(&golden()).unwrap();
+        // 23 one-unit characters, then a two-unit one that would straddle the
+        // end of the 24-unit field.
+        p.name = format!("{}{}", "a".repeat(23), "\u{1F600}");
+        let out = p.serialize();
+        assert_eq!(Profile::parse(&out).unwrap().name, "a".repeat(23));
     }
 
     #[test]

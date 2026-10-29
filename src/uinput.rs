@@ -50,6 +50,10 @@ const UI_SET_EVBIT: libc::c_ulong = iow(100, 4);
 const UI_SET_KEYBIT: libc::c_ulong = iow(101, 4);
 const UI_SET_RELBIT: libc::c_ulong = iow(102, 4);
 
+/// Gap between typed characters. Short enough that a hundred characters cost a
+/// fifth of a second, long enough for the reader to drain between them.
+const TYPING_GAP: Duration = Duration::from_millis(2);
+
 const UINPUT_MAX_NAME_SIZE: usize = 80;
 const BUS_VIRTUAL: u16 = 0x06;
 
@@ -216,6 +220,12 @@ impl VirtualDevice {
     ///
     /// Characters with no key on a US layout are skipped rather than failing
     /// the whole string: a macro that is mostly typeable should still type.
+    ///
+    /// A pause follows every character. The input core hands each event to the
+    /// compositor's evdev client through a small ring buffer, and a string
+    /// written in one tight burst can outrun the reader: the buffer overflows,
+    /// the client resyncs, and characters go missing from the middle of the
+    /// text.
     pub fn type_text(&mut self, text: &str) -> io::Result<()> {
         for (code, shift) in text_keys(text) {
             if shift {
@@ -223,6 +233,7 @@ impl VirtualDevice {
             } else {
                 self.tap(code)?;
             }
+            thread::sleep(TYPING_GAP);
         }
         Ok(())
     }

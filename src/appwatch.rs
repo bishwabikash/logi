@@ -80,18 +80,28 @@ pub fn scan_processes() -> Vec<Proc> {
         if !n.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let comm = fs::read_to_string(format!("/proc/{n}/comm"))
-            .map(|s| s.trim().to_string())
+        // Bytes, not `read_to_string`: a process is free to put anything in
+        // its name or arguments, and a single byte that is not UTF-8 made the
+        // strict read fail and the process vanish from the scan, or lose its
+        // command line, so a rule naming it never matched.
+        let comm = fs::read(format!("/proc/{n}/comm"))
+            .map(|b| proc_text(&b))
             .unwrap_or_default();
         if comm.is_empty() {
             continue;
         }
-        let cmdline = fs::read_to_string(format!("/proc/{n}/cmdline"))
-            .map(|s| s.replace('\0', " ").trim().to_string())
+        let cmdline = fs::read(format!("/proc/{n}/cmdline"))
+            .map(|b| proc_text(&b))
             .unwrap_or_default();
         out.push(Proc { comm, cmdline });
     }
     out
+}
+
+/// A /proc text file as one trimmed string: arguments are NUL-separated, and
+/// bytes that are not UTF-8 are replaced rather than failing the whole read.
+fn proc_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).replace('\0', " ").trim().to_string()
 }
 
 /// First matching rule wins, so order is precedence.
@@ -548,6 +558,15 @@ mod tests {
             ps.iter().any(|p| p.comm == me),
             "the scan did not find this process ({me:?})"
         );
+    }
+
+    #[test]
+    fn proc_text_survives_bytes_that_are_not_utf8() {
+        assert_eq!(proc_text(b"game\0--map\0one\0"), "game --map one");
+        assert_eq!(proc_text(b"game\n"), "game");
+        let t = proc_text(b"wine\0C:\\caf\xe9\\game.exe\0");
+        assert!(t.starts_with("wine C:\\caf"), "{t:?}");
+        assert!(t.ends_with("\\game.exe"), "{t:?}");
     }
 
     #[test]

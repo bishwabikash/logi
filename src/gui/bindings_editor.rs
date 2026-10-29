@@ -22,7 +22,7 @@
 
 use super::theme;
 use crate::actions::{self, Action, BindMode, Binding, Bindings, FnKeymap, Keymap, MAX_BUTTON};
-use crate::device::{Cmd, CmdKind, Snapshot};
+use crate::device::{Cmd, CmdId, CmdKind, Snapshot};
 use crate::uinput;
 use eframe::egui;
 
@@ -235,8 +235,16 @@ fn driver_key_name(egui_name: &str) -> String {
         }
     }
     match n.as_str() {
-        "openbracket" => "leftbrace".into(),
-        "closebracket" => "rightbrace".into(),
+        // egui's `Key::name` calls the arrows "Left" and "Right", and uinput
+        // reads a bare "left" or "right" as the mouse button. Passed through,
+        // capturing the arrow key bound a click: `key left` parses to
+        // BTN_LEFT, so every press of the button would left-click.
+        "left" => "arrowleft".into(),
+        "right" => "arrowright".into(),
+        "up" => "arrowup".into(),
+        "down" => "arrowdown".into(),
+        "openbracket" | "opencurlybracket" => "leftbrace".into(),
+        "closebracket" | "closecurlybracket" => "rightbrace".into(),
         "pipe" => "backslash".into(),
         "questionmark" => "slash".into(),
         "colon" => "semicolon".into(),
@@ -278,7 +286,13 @@ fn chord_text(key_name: &str, m: egui::Modifiers) -> String {
     if m.alt {
         s.push_str("alt+");
     }
-    s.push_str(&driver_key_name(key_name));
+    // uinput's "plus" is the keypad's. Shift+= is what produces a '+' on the
+    // main block, and egui reports that as Plus with Shift held.
+    if key_name == "Plus" && m.shift {
+        s.push_str("equal");
+    } else {
+        s.push_str(&driver_key_name(key_name));
+    }
     s
 }
 
@@ -294,6 +308,11 @@ pub struct BindingsEditor {
     status: Option<(String, bool)>,
     /// Button whose next key press is being captured.
     capturing: Option<u8>,
+    /// The frame this panel last ran in. Capture is armed on a click and
+    /// lives in this struct, but only a frame that draws this panel can take
+    /// the key; a gap means the user left the tab, and coming back to a
+    /// capture still armed would eat the first key they typed there.
+    last_ui_frame: u64,
     /// Button waiting for a second click to confirm Replace.
     confirm: Option<u8>,
     /// Why the last Replace was refused outright.
@@ -304,6 +323,21 @@ pub struct BindingsEditor {
     /// warning, so a backup that failed must not be able to clear it.
     backed_up: bool,
     requests: Vec<Request>,
+    /// A Save's `ApplyBindings` is on its way: the newest outcome id the
+    /// snapshot held when it was queued, so only an answer to it counts. The
+    /// status line must not claim a button was given back before the device
+    /// has said so — a failed write leaves the remapping table as it was.
+    awaiting_apply: Option<CmdId>,
+    /// How many `ApplyBindings` are queued and not yet answered. Two Saves
+    /// can be in flight at once, and the first one's answer is also "newer
+    /// than the id seen before the second was sent", so matching on the id
+    /// alone settles the status on the wrong command and never hears the
+    /// second one fail.
+    pending_applies: usize,
+    /// The newest Save was not sent to the device (none connected, or it
+    /// cannot report presses), so an earlier apply that answers later is not
+    /// news about the file as it now stands.
+    tail_unapplied: bool,
     loaded: bool,
 }
 
@@ -321,11 +355,15 @@ impl BindingsEditor {
             problems: Vec::new(),
             status: None,
             capturing: None,
+            last_ui_frame: 0,
             confirm: None,
             refused: None,
             backup_path: default_backup_path(),
             backed_up: false,
             requests: Vec::new(),
+            awaiting_apply: None,
+            pending_applies: 0,
+            tail_unapplied: false,
             loaded: false,
         }
     }
@@ -478,8 +516,19 @@ impl BindingsEditor {
     /// produces go with it, or the character is inserted into whichever
     /// TextEdit had focus.
     fn poll_capture(&mut self, ui: &egui::Ui) {
+        let frame = ui.ctx().cumulative_frame_nr();
+        let away = frame > self.last_ui_frame.saturating_add(1);
+        self.last_ui_frame = frame;
+        if away {
+            self.capturing = None;
+        }
         let Some(button) = self.capturing else { return };
         let got = ui.input_mut(|i| {
+            // Ctrl+C, Ctrl+X and Ctrl+V never arrive as a `Key` event at all:
+            // egui-winit turns them into Copy / Cut / Paste and returns before
+            // pushing the key. The modifiers they were pressed with are the
+            // ones egui currently holds.
+            let held = i.modifiers;
             let mut first = None;
             i.events.retain(|e| match e {
                 egui::Event::Key {
@@ -490,6 +539,20 @@ impl BindingsEditor {
                     ..
                 } => {
                     first.get_or_insert((key.name(), *modifiers));
+                    false
+                }
+                egui::Event::Copy => {
+                    first.get_or_insert(("C", held));
+                    false
+                }
+                egui::Event::Cut => {
+                    first.get_or_insert(("X", held));
+                    false
+                }
+                // Not left in the queue either: a focused TextEdit would
+                // paste the clipboard into itself on the same press.
+                egui::Event::Paste(_) => {
+                    first.get_or_insert(("V", held));
                     false
                 }
                 // Releases and repeats go too: half a press left behind is
@@ -511,8 +574,9 @@ impl BindingsEditor {
         }
     }
 
-    /// Ask for Replace on one button, with the two refusals that matter.
-    fn want_replace(&mut self, button: u8, count: u8) {
+    /// Whether putting `button` on Replace would leave no button clicking. If
+    /// so, records the refusal for the user and says so.
+    fn refuse_if_last(&mut self, button: u8, count: u8) -> bool {
         let mut probe = self.rows.clone();
         if let Some(r) = probe.iter_mut().find(|r| r.button == button) {
             r.mode = BindMode::Replace;
@@ -522,12 +586,34 @@ impl BindingsEditor {
                 "Button {button} is the last one still clicking. Replace on every \
                  button would leave the mouse with no physical click at all."
             ));
-            return;
+            return true;
         }
         self.refused = None;
+        false
+    }
+
+    /// Ask for Replace on one button, with the two refusals that matter.
+    fn want_replace(&mut self, button: u8, count: u8) {
+        if self.refuse_if_last(button, count) {
+            return;
+        }
         if button == 1 {
             // Left click. Needs a second, deliberate click.
             self.confirm = Some(button);
+            return;
+        }
+        self.set_replace(button);
+    }
+
+    /// The second click on the left-click confirmation.
+    ///
+    /// The all-Replace refusal is checked again here, not trusted from when
+    /// the card was opened. The card stays up while other rows are edited, so
+    /// Replace on every other button in the meantime would otherwise let this
+    /// click walk straight past the guard.
+    fn confirm_replace(&mut self, button: u8, count: u8) {
+        self.confirm = None;
+        if self.refuse_if_last(button, count) {
             return;
         }
         self.set_replace(button);
@@ -555,6 +641,7 @@ impl BindingsEditor {
             self.load();
         }
         self.poll_capture(ui);
+        self.settle_apply(snap);
 
         // An unknown device gets the full set of rows, so the file can be
         // written before the mouse is plugged in.
@@ -563,6 +650,12 @@ impl BindingsEditor {
         } else {
             snap.button_count.min(MAX_BUTTON)
         };
+        // A capture armed on a row that is no longer drawn (a different mouse
+        // with fewer buttons) has no "Press a key" cue and would still take
+        // the next key typed anywhere in this panel.
+        if self.capturing.is_some_and(|b| b > count) {
+            self.capturing = None;
+        }
         let keys = keymap();
         let (bindings, errs) = self.to_bindings(&keys);
         let silence = bindings.to_silence();
@@ -648,7 +741,8 @@ impl BindingsEditor {
                     &format!(
                         "The file also binds button {} — this mouse has {count}, so \
                          there is no row for that above. It stays in the file as it is; \
-                         a Replace among these stops the whole set being applied.",
+                         a Replace among these cannot be applied to this mouse, so Save \
+                         leaves it out of what it sends.",
                         hidden.join(", ")
                     ),
                 );
@@ -686,6 +780,12 @@ impl BindingsEditor {
                         ui.selectable_value(&mut row.kind, *k, k.label());
                     }
                 });
+            // Capture belongs to a Key row. Switched to another kind with it
+            // still armed, the cue is gone but the next key press would turn
+            // the row back into a Key binding behind the user's back.
+            if row.kind != Kind::Key && self.capturing == Some(button) {
+                self.capturing = None;
+            }
 
             ui.add_space(4.0);
             // The mode lives on the same line as the action: the pair is the
@@ -740,7 +840,9 @@ impl BindingsEditor {
                             theme::hint(
                                 ui,
                                 "Waiting for a key press. Escape cancels. Super is not \
-                                 visible to this window, so type super+l for that one.",
+                                 visible to this window, so type super+l for that one; \
+                                 ctrl+v with an empty clipboard sends this window \
+                                 nothing at all, so type that one too.",
                             );
                         }
                     }
@@ -821,7 +923,7 @@ impl BindingsEditor {
                                 self.confirm = None;
                             }
                             if ui.button("Replace it anyway").clicked() {
-                                self.set_replace(button);
+                                self.confirm_replace(button, count);
                             }
                         });
                     });
@@ -944,9 +1046,12 @@ impl BindingsEditor {
     /// lot. Swallowing it here left a button the user had just moved off
     /// Replace silenced in the mouse — across unplugging — with only the
     /// factory table to get it back, and told them so in the status line.
-    fn queue_apply(&mut self, apply: bool, silence: Vec<u8>) -> String {
+    fn queue_apply(&mut self, apply: bool, silence: Vec<u8>, after: CmdId) -> String {
         let path = actions::config_path();
+        self.tail_unapplied = !apply;
         if !apply {
+            // An apply already in flight keeps being tracked: if it fails, the
+            // mouse's table is in an unknown state and that is still news.
             return format!(
                 "saved to {}; not applied, because no connected mouse can report \
                  button presses",
@@ -955,18 +1060,68 @@ impl BindingsEditor {
         }
         let n = silence.len();
         self.requests.push(Request::ApplyBindings { silence });
+        // The baseline of the oldest unanswered apply stays: answers arrive in
+        // send order, and a newer baseline would skip past the first one.
+        if self.pending_applies == 0 || self.awaiting_apply.is_none() {
+            self.awaiting_apply = Some(after);
+            self.pending_applies = 0;
+        }
+        self.pending_applies += 1;
         if n == 0 {
             format!(
-                "saved to {}; nothing is set to Replace, so every physical button \
-                 clicks again",
+                "saved to {}; asking the mouse to let every physical button click again",
                 path.display()
             )
         } else {
             format!(
-                "saved to {}; {n} button(s) silenced, every other one left clicking",
+                "saved to {}; asking the mouse to silence {n} button(s) and leave \
+                 every other one clicking",
                 path.display()
             )
         }
+    }
+
+    /// Replace the "asking the mouse" status with what the device answered.
+    ///
+    /// The file is already written by then, so a failure here means the file
+    /// and the mouse's remapping table disagree, and the user needs to hear
+    /// that rather than keep reading a success. Save is not offered again for
+    /// the same edit (nothing is dirty), so the way out is named.
+    fn settle_apply(&mut self, snap: &Snapshot) {
+        let Some(after) = self.awaiting_apply else { return };
+        let Some(o) = snap.outcome_after(after, CmdKind::ApplyBindings) else { return };
+        self.pending_applies = self.pending_applies.saturating_sub(1);
+        if self.pending_applies > 0 {
+            // Not the last Save's answer. The last one writes the whole set
+            // again, so it is the one that says where the table ended up.
+            self.awaiting_apply = Some(o.id);
+            return;
+        }
+        self.awaiting_apply = None;
+        if o.ok && self.tail_unapplied {
+            // The newest Save never reached the device; the status already
+            // says so, and this answer is about an older set.
+            return;
+        }
+        self.status = Some(if o.ok {
+            (
+                format!(
+                    "saved; the mouse answered: {}",
+                    o.message.as_deref().unwrap_or("done")
+                ),
+                true,
+            )
+        } else {
+            (
+                format!(
+                    "saved to the file, but the mouse did not take it: {}. Its remapping \
+                     table may still hold the old silenced set; Restore physical buttons \
+                     puts every button back.",
+                    o.message.as_deref().unwrap_or("no reason given")
+                ),
+                false,
+            )
+        });
     }
 
     fn draw_save(&mut self, ui: &mut egui::Ui, snap: &Snapshot, errs: &[String], count: u8) {
@@ -989,7 +1144,14 @@ impl BindingsEditor {
                             // what the hint at the bottom of the section
                             // promises, so the two must not drift apart.
                             let apply = snap.connected && snap.has_button_spy;
-                            let msg = self.queue_apply(apply, silence);
+                            // Only buttons this mouse has. buttonspy refuses
+                            // the whole set if one is past its count, which
+                            // would also refuse the un-silencing of the others
+                            // the user moved off Replace in the same edit.
+                            let silence: Vec<u8> =
+                                silence.into_iter().filter(|b| *b <= count).collect();
+                            let after = snap.newest_outcome_id();
+                            let msg = self.queue_apply(apply, silence, after);
                             self.status = Some((msg, true));
                         }
                         Err(e) => self.status = Some((e, false)),
@@ -1268,6 +1430,40 @@ mod tests {
         );
     }
 
+    /// The confirmation card outlives the click that opened it. Replacing
+    /// every other button while it is up must not let "Replace it anyway"
+    /// finish the job the refusal exists to stop.
+    #[test]
+    fn confirming_left_click_rechecks_the_all_replaced_refusal() {
+        let mut e = editor("");
+        for b in 2..=4 {
+            e.set_replace(b);
+        }
+        e.want_replace(1, 5);
+        assert_eq!(e.confirm, Some(1));
+        // Meanwhile the last other button is replaced: 1 is now the only one
+        // still clicking.
+        e.want_replace(5, 5);
+        assert!(e.refused.is_none());
+        e.confirm_replace(1, 5);
+        assert!(e.refused.is_some(), "the confirm click bypassed the guard");
+        assert_eq!(e.confirm, None);
+        assert!(!all_replaced(&e.rows, 5));
+        assert_eq!(
+            e.rows.iter().find(|r| r.button == 1).unwrap().mode,
+            BindMode::Augment
+        );
+
+        // And with room to spare it goes through.
+        e.set_augment(5);
+        e.want_replace(1, 5);
+        e.confirm_replace(1, 5);
+        assert_eq!(
+            e.rows.iter().find(|r| r.button == 1).unwrap().mode,
+            BindMode::Replace
+        );
+    }
+
     #[test]
     fn an_unknown_key_name_surfaces_a_useful_message() {
         let mut e = editor("");
@@ -1328,6 +1524,39 @@ mod tests {
             Action::parse(&format!("key {chord}"), &keys)
                 .unwrap_or_else(|e| panic!("{name} -> {chord}: {e}"));
         }
+    }
+
+    /// Every key egui can report has to come out of capture as the keyboard
+    /// key it was, or as an error the row shows — never as another key, and
+    /// above all never as a mouse button. `Key::name` is egui's own text, not
+    /// the driver's, and the two disagree: its arrows are "Left" and "Right",
+    /// which uinput reads as BTN_LEFT and BTN_RIGHT.
+    #[test]
+    fn no_captured_key_becomes_a_mouse_button_or_the_wrong_key() {
+        let keys = keymap();
+        let code_of = |name: &str, m: egui::Modifiers| -> Result<u16, String> {
+            match Action::parse(&format!("key {}", chord_text(name, m)), &keys)? {
+                Action::Key { code, .. } => Ok(code),
+                o => panic!("{name}: {o:?}"),
+            }
+        };
+        let none = egui::Modifiers::NONE;
+        for &k in egui::Key::ALL {
+            if let Ok(code) = code_of(k.name(), none) {
+                assert!(code < 0x100, "{:?} was captured as a mouse button ({code})", k);
+            }
+        }
+        assert_eq!(code_of("Left", none), Ok(105));
+        assert_eq!(code_of("Right", none), Ok(106));
+        assert_eq!(code_of("Up", none), Ok(103));
+        assert_eq!(code_of("Down", none), Ok(108));
+        assert_eq!(code_of("OpenCurlyBracket", none), Ok(26));
+        assert_eq!(code_of("CloseCurlyBracket", none), Ok(27));
+        // Shift+= is the main block's plus; a bare Plus is the keypad's.
+        let shift = egui::Modifiers { shift: true, ..Default::default() };
+        assert_eq!(code_of("Plus", shift), Ok(13));
+        assert_eq!(code_of("Plus", none), Ok(78));
+        assert_eq!(chord_text("Left", shift), "shift+arrowleft");
     }
 
     /// The frame's write-back must not be able to undo a mode click.
@@ -1420,27 +1649,145 @@ mod tests {
     fn saving_sends_the_whole_silenced_set_including_the_empty_one() {
         let mut e = editor("");
 
-        let msg = e.queue_apply(true, Vec::new());
+        let msg = e.queue_apply(true, Vec::new(), 0);
         assert_eq!(
             e.take_requests(),
             vec![Request::ApplyBindings { silence: Vec::new() }],
             "an empty set must still be applied: it is what gives a click back"
         );
-        assert!(msg.contains("clicks again"), "{msg}");
+        assert!(msg.contains("click again"), "{msg}");
 
         // A non-empty one carries exactly the Replace rows, nothing more.
-        let msg = e.queue_apply(true, vec![3, 4]);
+        let msg = e.queue_apply(true, vec![3, 4], 0);
         assert_eq!(
             e.take_requests(),
             vec![Request::ApplyBindings { silence: vec![3, 4] }]
         );
-        assert!(msg.contains("2 button(s) silenced"), "{msg}");
+        assert!(msg.contains("silence 2 button(s)"), "{msg}");
 
         // And nothing at all is asked of a mouse that cannot report presses:
         // silencing a button there is silencing it with nothing listening.
-        let msg = e.queue_apply(false, vec![3]);
+        let msg = e.queue_apply(false, vec![3], 0);
         assert!(e.take_requests().is_empty(), "nothing may be applied");
         assert!(msg.contains("not applied"), "{msg}");
+    }
+
+    /// The status line may not say a button was given back until the device
+    /// says so, and a failed apply has to turn it into a warning.
+    #[test]
+    fn the_status_follows_what_the_device_answered() {
+        use crate::device::Outcome;
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        snap.record(Outcome::ok(1, CmdKind::ApplyBindings, Some("old".into())));
+        let after = snap.newest_outcome_id();
+        e.queue_apply(true, vec![3], after);
+        assert_eq!(e.awaiting_apply, Some(after));
+
+        // Before any answer, and with an older answer on the books: unchanged.
+        e.settle_apply(&snap);
+        assert_eq!(e.awaiting_apply, Some(after));
+        // Someone else's command is not ours.
+        snap.record(Outcome::failed(2, CmdKind::SetDpi, "nope"));
+        e.settle_apply(&snap);
+        assert_eq!(e.awaiting_apply, Some(after));
+
+        snap.record(Outcome::failed(3, CmdKind::ApplyBindings, "device unplugged"));
+        e.settle_apply(&snap);
+        assert_eq!(e.awaiting_apply, None);
+        let (msg, good) = e.status.clone().unwrap();
+        assert!(!good, "{msg}");
+        assert!(msg.contains("device unplugged") && msg.contains("Restore"), "{msg}");
+
+        // And a success is reported as the device's own words.
+        e.queue_apply(true, Vec::new(), snap.newest_outcome_id());
+        snap.record(Outcome::ok(
+            4,
+            CmdKind::ApplyBindings,
+            Some("all physical buttons restored".into()),
+        ));
+        e.settle_apply(&snap);
+        let (msg, good) = e.status.clone().unwrap();
+        assert!(good && msg.contains("all physical buttons restored"), "{msg}");
+    }
+
+    /// Two Saves can be in flight together. The first one's answer is also
+    /// newer than the id seen before the second was sent, so the status has to
+    /// wait for the last answer: a failure of the newest Save must not be
+    /// shadowed by the older one's success.
+    #[test]
+    fn two_saves_in_flight_settle_on_the_last_answer() {
+        use crate::device::Outcome;
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        let base = snap.newest_outcome_id();
+        e.queue_apply(true, vec![3], base);
+        // The second Save is clicked before the first is answered.
+        e.queue_apply(true, Vec::new(), snap.newest_outcome_id());
+        assert_eq!(e.pending_applies, 2);
+
+        snap.record(Outcome::ok(1, CmdKind::ApplyBindings, Some("first".into())));
+        e.settle_apply(&snap);
+        assert_eq!(e.pending_applies, 1);
+        assert!(e.awaiting_apply.is_some(), "still waiting on the second");
+        let still_asking = e.status.clone();
+        assert!(still_asking.is_none(), "the first answer must not settle the status");
+
+        snap.record(Outcome::failed(2, CmdKind::ApplyBindings, "device unplugged"));
+        e.settle_apply(&snap);
+        assert_eq!(e.awaiting_apply, None);
+        let (msg, good) = e.status.clone().unwrap();
+        assert!(!good && msg.contains("device unplugged"), "{msg}");
+    }
+
+    /// A Save with no mouse to send it to is not undone by an older apply
+    /// answering afterwards.
+    #[test]
+    fn an_older_apply_does_not_overwrite_a_save_that_was_never_sent() {
+        use crate::device::Outcome;
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        e.queue_apply(true, vec![3], 0);
+        let msg = e.queue_apply(false, vec![3], 0);
+        e.status = Some((msg, true));
+        snap.record(Outcome::ok(1, CmdKind::ApplyBindings, Some("done".into())));
+        e.settle_apply(&snap);
+        let (msg, _) = e.status.clone().unwrap();
+        assert!(msg.contains("not applied"), "{msg}");
+
+        // A failure of that older apply is still news: the table is unknown.
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        e.queue_apply(true, vec![3], 0);
+        e.queue_apply(false, vec![3], 0);
+        snap.record(Outcome::failed(1, CmdKind::ApplyBindings, "timed out"));
+        e.settle_apply(&snap);
+        assert!(!e.status.clone().unwrap().1);
+    }
+
+    /// Capture armed, then the user leaves the tab: coming back must not find
+    /// it still armed and eat the first key typed there.
+    #[test]
+    fn capture_does_not_survive_leaving_the_tab() {
+        let ctx = egui::Context::default();
+        let mut e = editor("");
+        let mut frame = |e: &mut BindingsEditor, draws_panel: bool| {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    if draws_panel {
+                        e.poll_capture(ui);
+                    }
+                });
+            });
+        };
+        frame(&mut e, true);
+        e.capturing = Some(4);
+        frame(&mut e, true);
+        assert_eq!(e.capturing, Some(4), "consecutive frames keep it armed");
+        frame(&mut e, false);
+        frame(&mut e, false);
+        frame(&mut e, true);
+        assert_eq!(e.capturing, None, "a gap in frames means the tab was left");
     }
 
     /// A captured key belongs to the capture and to nothing else.
@@ -1488,6 +1835,45 @@ mod tests {
             0,
             "the press was left for the focused widget to act on as well"
         );
+    }
+
+    /// Ctrl+C is the very chord the key field's hint shows, and egui-winit
+    /// never delivers it as a key press: it becomes `Event::Copy`. Capture
+    /// used to wait for a `Key` that could not come, stay armed, and leave the
+    /// Copy / Paste for a focused TextEdit to act on.
+    #[test]
+    fn clipboard_chords_are_captured_not_lost() {
+        use std::cell::RefCell;
+        for (event, want) in [
+            (egui::Event::Copy, "ctrl+c"),
+            (egui::Event::Cut, "ctrl+x"),
+            (egui::Event::Paste("clip".into()), "ctrl+shift+v"),
+        ] {
+            let ed = RefCell::new(editor(""));
+            let left = RefCell::new(usize::MAX);
+            let shift = want.contains("shift");
+            egui::__run_test_ui(|ui| {
+                let mut e = ed.borrow_mut();
+                e.capturing = Some(4);
+                ui.input_mut(|i| {
+                    i.modifiers = egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        shift,
+                        ..Default::default()
+                    };
+                    i.events.push(event.clone());
+                });
+                e.poll_capture(ui);
+                *left.borrow_mut() = ui.input(|i| i.events.len());
+            });
+            let e = ed.borrow();
+            assert_eq!(e.capturing, None, "{want}: capture stayed armed");
+            let row = e.rows.iter().find(|r| r.button == 4).unwrap();
+            assert_eq!(row.key, want);
+            assert_eq!(row.kind, Kind::Key);
+            assert_eq!(*left.borrow(), 0, "{want}: left for a focused widget");
+        }
     }
 
     /// Escape cancels, and is swallowed with everything else: a cancel that

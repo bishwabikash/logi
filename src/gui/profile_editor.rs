@@ -366,6 +366,47 @@ impl Draft {
         self.buttons.iter().take(self.editable).any(is_left_click)
     }
 
+    /// Carry unsaved edits across a change in what the mouse holds.
+    ///
+    /// Three-way: a field the user has not touched (it still equals `old`, the
+    /// reading the edits were staged against) takes the value from `new`; a
+    /// field the user changed stays theirs. Without this a draft staged before
+    /// another panel wrote this profile — the Lighting tab's Save to mouse,
+    /// the per-button writes — carried the *old* bytes for everything the user
+    /// never touched, and Save to mouse wrote them straight back over that
+    /// write, silently undoing it in flash.
+    fn rebase(&mut self, old: &Draft, new: &Draft) {
+        fn keep<T: PartialEq + Clone>(mine: &mut T, old: &T, new: &T) {
+            if *mine == *old {
+                *mine = new.clone();
+            }
+        }
+        keep(&mut self.name, &old.name, &new.name);
+        keep(&mut self.rate_ms, &old.rate_ms, &new.rate_ms);
+        for i in 0..N_DPI {
+            keep(&mut self.dpi[i], &old.dpi[i], &new.dpi[i]);
+        }
+        keep(&mut self.default_dpi, &old.default_dpi, &new.default_dpi);
+        keep(&mut self.shift_dpi, &old.shift_dpi, &new.shift_dpi);
+        for z in 0..2 {
+            // An edit that lands on exactly what the mouse now holds has
+            // nothing left to write either.
+            if self.leds[z] == old.leds[z] || self.leds[z].to_led() == new.leds[z].to_led() {
+                self.leds[z] = new.leds[z].clone();
+            }
+        }
+        // Never edited by the user, only mirrored from `leds` at build time.
+        self.alt_raw = new.alt_raw;
+        if self.buttons.len() != new.buttons.len() || old.buttons.len() != new.buttons.len() {
+            self.buttons = new.buttons.clone();
+        } else {
+            for i in 0..self.buttons.len() {
+                keep(&mut self.buttons[i], &old.buttons[i], &new.buttons[i]);
+            }
+        }
+        self.editable = new.editable;
+    }
+
     fn set_bind(&mut self, i: usize, b: Bind) {
         if let Some(button) = b.to_button() {
             if let Some(slot) = self.buttons.get_mut(i) {
@@ -633,10 +674,20 @@ impl ProfileEditor {
             // Those later edits stay, re-based against what the device now
             // holds, so "unsaved" keeps meaning unsaved against the mouse
             // rather than against the reading from before the write.
+            //
+            // Three-way against what was sent, not just a new base: every
+            // field still equal to `sent` is one the user has not touched since
+            // Save, and takes the device's own reading. Replacing the base
+            // alone left the edited lighting record (old raw bytes, edited
+            // flag) and the mirrored second-mode records differing from the
+            // reading for good, so the profile showed unsaved changes with
+            // nothing to save.
             if let (Some(p), Some(s)) =
                 (snap.profiles.get(index as usize), self.staged.get_mut(&index))
             {
-                s.base = Draft::from_profile(p, s.draft.editable);
+                let now = Draft::from_profile(p, s.draft.editable);
+                s.draft.rebase(&sent, &now);
+                s.base = now;
             }
         }
     }
@@ -1152,7 +1203,8 @@ impl ProfileEditor {
                 } else {
                     "Take a backup before the first write of this session. It dumps every \
                      sector, the profile directory included, so a bad profile can be put \
-                     back."
+                     back. A file already at the path below is replaced, so point it \
+                     somewhere new to keep an older backup."
                 },
             );
             ui.add_space(6.0);
@@ -1286,9 +1338,16 @@ impl ProfileEditor {
 /// the user's nose after a failed write.
 fn stage_for(prev: Option<Staged>, base: &Draft) -> Staged {
     match prev {
+        Some(s) if s.base == *base => s,
         // Nothing staged and the device has moved on: adopt the reading.
-        Some(s) if !s.dirty() && s.base != *base => Staged::new(base.clone()),
-        Some(s) => s,
+        Some(s) if !s.dirty() => Staged::new(base.clone()),
+        // Edits staged and the device has moved on: keep the edits, but only
+        // the ones the user made. See `Draft::rebase`.
+        Some(mut s) => {
+            s.draft.rebase(&s.base, base);
+            s.base = base.clone();
+            s
+        }
         None => Staged::new(base.clone()),
     }
 }
@@ -1667,6 +1726,56 @@ mod tests {
         assert_eq!(stage_for(Some(clean), &moved).draft.rate_ms, 8);
     }
 
+    #[test]
+    fn staged_edits_carry_over_a_change_another_writer_made() {
+        // Edits staged against the reading as it was.
+        let old = draft();
+        let mut st = Staged::new(old.clone());
+        st.draft.name = "Mine".into();
+        st.draft.buttons[6] = Button::mouse(2);
+
+        // Meanwhile another panel wrote this profile: new lighting, a new rate
+        // and a rebound button the user never touched here.
+        let mut p = profile();
+        p.report_rate_ms = 4;
+        p.leds[0] = Led::fixed([1, 2, 3]);
+        p.alt_leds[0] = Led::fixed([1, 2, 3]);
+        p.buttons[8] = Button::mouse(3);
+        let now = Draft::from_profile(&p, 11);
+
+        let kept = stage_for(Some(st), &now);
+        assert_eq!(kept.base, now);
+        // The user's own edits survive...
+        assert_eq!(kept.draft.name, "Mine");
+        assert_eq!(kept.draft.buttons[6], Button::mouse(2));
+        assert!(kept.dirty());
+        // ...and nothing they did not touch is put back to the old reading.
+        assert_eq!(kept.draft.rate_ms, 4);
+        assert_eq!(kept.draft.leds[0], now.leds[0]);
+        assert_eq!(kept.draft.buttons[8], Button::mouse(3));
+        let built = kept.draft.build(&p);
+        assert_eq!(built.leds[0], Led::fixed([1, 2, 3]));
+        assert_eq!(built.alt_leds[0], Led::fixed([1, 2, 3]));
+        assert_eq!(built.report_rate_ms, 4);
+        assert_eq!(built.buttons[8], Button::mouse(3));
+    }
+
+    #[test]
+    fn edits_the_mouse_now_holds_are_no_longer_unsaved() {
+        // A write that went through without its outcome being seen: after a
+        // refresh the reading matches the draft, so nothing is left to save.
+        let old = draft();
+        let mut st = Staged::new(old.clone());
+        st.draft.rate_ms = 4;
+        st.draft.leds[1].mode = led::BREATHING;
+        st.draft.leds[1].mark();
+        let p = st.draft.build(&profile());
+        let now = Draft::from_profile(&Profile::parse(&p.serialize()).unwrap(), 11);
+        let kept = stage_for(Some(st), &now);
+        assert!(!kept.dirty(), "the mouse already holds these edits");
+        assert_eq!(kept.draft, now);
+    }
+
     /// The editor mid-save: edits staged for `index`, the write handed over,
     /// and `after` standing for whatever was already on the books.
     fn mid_save(index: u8, after: CmdId) -> ProfileEditor {
@@ -1896,6 +2005,46 @@ mod tests {
         // reading from before the write.
         assert_eq!(ed.staged[&2].base.name, "Gaming");
         assert_eq!(ed.staged[&2].base.rate_ms, 4);
+    }
+
+    #[test]
+    fn a_write_going_through_leaves_no_phantom_difference_behind() {
+        // Lighting edited and saved, then a name typed while the write was in
+        // flight. The lighting is on the mouse now, byte for byte, so the only
+        // thing still unsaved is the name. Re-basing by overwriting the
+        // reading alone left the staged lighting (marked edited, holding the
+        // old raw record) and the mirrored second-mode records differing from
+        // the new reading for good: "unsaved changes" with nothing to save,
+        // and a flash write offered that would change nothing.
+        let mut ed = ProfileEditor::new();
+        let mut st = Staged::new(draft());
+        st.draft.leds[0].mode = led::BREATHING;
+        st.draft.leds[0].color = [0xff, 0x00, 0x80];
+        st.draft.leds[0].mark();
+        st.draft.rate_ms = 4;
+        let sent_draft = st.draft.clone();
+        let on_device = Profile::parse(&sent_draft.build(&profile()).serialize()).unwrap();
+        st.draft.name = "typed later".into();
+        ed.staged.insert(2, st);
+        ed.writes.insert(
+            2,
+            Write { after: 5, sent: Instant::now(), sent_draft, state: WriteState::Waiting },
+        );
+        let mut snap = with_outcomes(vec![Outcome::ok(6, CmdKind::WriteProfile(2), None)]);
+        snap.profiles = vec![profile(), profile(), on_device];
+
+        ed.resolve_writes(&snap);
+
+        let s = &ed.staged[&2];
+        assert_eq!(s.draft.name, "typed later");
+        let mut rest = s.draft.clone();
+        rest.name = s.base.name.clone();
+        assert_eq!(rest, s.base, "only the name was typed after Save");
+        // Putting the name back leaves nothing to save.
+        let mut back = Staged { draft: rest, base: s.base.clone() };
+        assert!(!back.dirty());
+        back.draft.name = "typed later".into();
+        assert!(back.dirty());
     }
 
     /// A device shaped like a real one, with `step` as its reported DPI step.

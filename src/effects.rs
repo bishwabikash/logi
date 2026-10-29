@@ -9,6 +9,8 @@
 //! including on error, because otherwise its lighting would stay dependent on
 //! a process that is no longer running.
 
+use crate::capabilities::Capabilities;
+use crate::features;
 use crate::led::{self, Leds};
 use crate::profiles::{OnboardProfiles, MODE_HOST, MODE_ONBOARD};
 use crate::{discover, hidpp};
@@ -108,6 +110,19 @@ pub fn frame(name: &str, t: f32, color: [u8; 3], period_s: f32, zones: usize) ->
         .collect()
 }
 
+/// Refuse a feature the firmware flags hidden, engineering or manufacturing.
+/// One the device never reported is left to the lookup that follows, which
+/// names it.
+fn require_drivable(caps: &Capabilities, id: u16) -> hidpp::Result<()> {
+    if caps.supports(id) && !caps.usable(id) {
+        return Err(hidpp::Error::Protocol(format!(
+            "this device flags feature 0x{id:04x} as hidden or engineering, which \
+             this app does not drive"
+        )));
+    }
+    Ok(())
+}
+
 /// The device, held in host mode for as long as an effect is running.
 ///
 /// Opening it, taking host mode and handing the mouse back all live here so
@@ -126,6 +141,11 @@ struct Session {
 impl Session {
     fn open() -> hidpp::Result<Self> {
         let found = discover::open_device()?;
+        // An effect drives 0x8070 and flips 0x8100's mode, so both are held to
+        // the same rule every other control is: a feature the firmware flags
+        // hidden, engineering or manufacturing is listed and never driven.
+        require_drivable(&found.caps, features::COLOR_LED_EFFECTS)?;
+        require_drivable(&found.caps, features::ONBOARD_PROFILES)?;
         let mut dev = found.device;
         let leds = Leds::new(&mut dev)?;
         if leds.zone_count == 0 {
@@ -162,12 +182,28 @@ impl Session {
     }
 
     /// Hand the mouse back. Idempotent, so Drop after an explicit call is free.
+    ///
+    /// A mouse left in host mode keeps whatever colour was last pushed and
+    /// ignores its stored profile until something switches it back, so one
+    /// timed-out reply is not allowed to be the end of it. A setter that timed
+    /// out may well have landed, so the mode is read back before trying again.
     fn release(&mut self) {
         if self.released {
             return;
         }
         self.released = true;
-        let _ = self.profiles.set_mode(&mut self.dev, self.restore);
+        for _ in 0..2 {
+            match self.profiles.set_mode(&mut self.dev, self.restore) {
+                Ok(()) => return,
+                // The endpoint is gone; another try is against nothing.
+                Err(hidpp::Error::Io(_)) => return,
+                Err(_) => {
+                    if matches!(self.profiles.mode(&mut self.dev), Ok(m) if m == self.restore) {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn run(
@@ -304,6 +340,33 @@ mod tests {
     fn zero_period_does_not_divide_by_zero() {
         let f = frame("breathe", 1.0, [255; 3], 0.0, 1);
         assert_eq!(f.len(), 1);
+    }
+
+    fn caps(entries: &[(u16, u8)]) -> Capabilities {
+        Capabilities {
+            features: entries.iter().enumerate().map(|(i, (id, t))| (i as u8, *id, *t)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_flagged_lighting_or_mode_feature_is_not_driven() {
+        for id in [features::COLOR_LED_EFFECTS, features::ONBOARD_PROFILES] {
+            for flag in [0x10u8, 0x20, 0x40] {
+                assert!(
+                    require_drivable(&caps(&[(id, flag)]), id).is_err(),
+                    "0x{id:04x} flagged 0x{flag:02x} was driven"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unflagged_or_unreported_feature_is_left_to_the_lookup() {
+        let id = features::COLOR_LED_EFFECTS;
+        assert!(require_drivable(&caps(&[(id, 0x00)]), id).is_ok());
+        assert!(require_drivable(&caps(&[(id, 0x80)]), id).is_ok());
+        assert!(require_drivable(&caps(&[]), id).is_ok());
     }
 
     #[test]

@@ -72,6 +72,9 @@ const MOD_ALIASES: &[(&str, &str)] = &[
     ("win", "leftmeta"),
 ];
 
+/// Codes from here up are BTN_*; below it they are keys.
+const BTN_FIRST: u16 = 0x100;
+
 /// Linux BTN_* codes, which are not keys and so are not the keymap's business.
 pub const MOUSE_BUTTONS: &[(&str, u16)] = &[
     ("left", 0x110),
@@ -189,6 +192,17 @@ impl Action {
                         let names: Vec<&str> = MOUSE_BUTTONS.iter().map(|(n, _)| *n).collect();
                         format!("unknown mouse button {bare:?}; want one of {}", names.join(" "))
                     })?;
+                // A raw number has to be a BTN_ code. Every key in the keymap is
+                // also a valid number, so `mouse 4` -- the fourth button, to
+                // anyone writing it -- would otherwise parse as KEY_3 and type
+                // a "3" on every press.
+                if code < BTN_FIRST {
+                    return Err(format!(
+                        "mouse button {bare:?} is not a button: use a name \
+                         (left right middle side extra forward back task) or a \
+                         BTN_ code from {BTN_FIRST} up"
+                    ));
+                }
                 // The names above are resolved without the keymap, so the code
                 // is checked against it: a binding the host cannot press would
                 // leave a Replace-bound button silenced and doing nothing,
@@ -585,6 +599,17 @@ mod tests {
         for bad in ["key 999", "key ctrl+999", "mouse 300", "mouse side"] {
             assert!(Action::parse(bad, &FakeKeys).is_err(), "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn a_small_mouse_number_is_not_quietly_a_key() {
+        // 30 is a code the fake keymap can press (KEY_A), so without the range
+        // check this parsed as "mouse button 30" and typed an `a`.
+        for bad in ["mouse 30", "mouse 4", "mouse 0"] {
+            let e = Action::parse(bad, &FakeKeys).unwrap_err();
+            assert!(e.contains("not a button"), "{bad:?}: {e}");
+        }
+        assert!(Action::parse("mouse 274", &FakeKeys).is_ok());
     }
 
     #[test]

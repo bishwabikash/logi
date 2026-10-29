@@ -88,6 +88,15 @@ pub fn zone_location_name(loc: u16) -> &'static str {
 // ext_caps bits
 pub const EXT_CAP_HAS_ZONE_EFFECT: u16 = 0x01;
 
+/// getZoneEffectInfo reports the effect id as a u16, but every mode this
+/// codec knows fits a byte. An id that does not must keep its slot in the
+/// zone's list (setZoneEffect addresses effects by position) without being
+/// mistaken for a known mode, so it becomes 0xFF, which no mode uses. A bare
+/// `as u8` would turn 0x0103 into CYCLE.
+fn mode_from_effect_id(id: u16) -> u8 {
+    u8::try_from(id).unwrap_or(0xFF)
+}
+
 /// Parse `ff0066`, `#ff0066`, or a colour name.
 pub fn parse_color(s: &str) -> Result<[u8; 3]> {
     let named = match s.trim().to_ascii_lowercase().as_str() {
@@ -111,6 +120,11 @@ pub fn parse_color(s: &str) -> Result<[u8; 3]> {
         return Err(Error::Protocol(format!(
             "bad colour {s:?}: want rrggbb hex or a colour name"
         )));
+    }
+    // from_str_radix takes a leading '+', so "+ff000" would otherwise parse
+    // as a valid, different colour.
+    if !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::Protocol(format!("bad colour {s:?}: not hex")));
     }
     let v = u32::from_str_radix(&t, 16)
         .map_err(|_| Error::Protocol(format!("bad colour {s:?}: not hex")))?;
@@ -189,7 +203,7 @@ impl Leds {
                     "short getZoneEffectInfo reply for zone {z} effect {e}"
                 )));
             }
-            zone.modes.push(u16::from_be_bytes([q[2], q[3]]) as u8);
+            zone.modes.push(mode_from_effect_id(u16::from_be_bytes([q[2], q[3]])));
         }
         Ok(zone)
     }
@@ -322,5 +336,34 @@ impl Leds {
                 z.modes.iter().copied().filter(|m| *m == FIXED || *m == BREATHING).collect()
             })
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_color_takes_hex_names_and_a_hash() {
+        assert_eq!(parse_color("ff0066").unwrap(), [0xff, 0x00, 0x66]);
+        assert_eq!(parse_color("#FF0066").unwrap(), [0xff, 0x00, 0x66]);
+        assert_eq!(parse_color(" Red ").unwrap(), [0xff, 0, 0]);
+    }
+
+    #[test]
+    fn parse_color_refuses_a_signed_number() {
+        // "+ff000" is six bytes and from_str_radix reads it as 0x0ff000.
+        assert!(parse_color("+ff000").is_err());
+        assert!(parse_color("-ff000").is_err());
+        assert!(parse_color("ggg000").is_err());
+    }
+
+    #[test]
+    fn a_wide_effect_id_is_not_mistaken_for_a_known_mode() {
+        assert_eq!(mode_from_effect_id(0x0003), CYCLE);
+        assert_eq!(mode_from_effect_id(0x000A), BREATHING);
+        // 0x0103 truncated to 0x03 would read as CYCLE.
+        assert_eq!(mode_from_effect_id(0x0103), 0xFF);
+        assert_eq!(mode_name(mode_from_effect_id(0x0103)), "?");
     }
 }

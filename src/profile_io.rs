@@ -147,7 +147,17 @@ pub fn write_sector(
     dev.call_short(idx, MEMORY_WRITE_END, &[]).map_err(partial)?;
 
     std::thread::sleep(SETTLE);
-    let back = profiles.read_sector(dev, sector, None)?;
+    let back = profiles.read_sector(dev, sector, None).map_err(|e| match e {
+        // A vanished device stays an Io error: that is how the worker knows
+        // to drop the handle.
+        Error::Io(_) => e,
+        // The write itself was acknowledged, so a bare "no reply" would read
+        // as "nothing happened" and invite a blind retry.
+        e => Error::Protocol(format!(
+            "sector {sector} was written but could not be read back to verify it ({e}). \
+             Read it again before trusting it."
+        )),
+    })?;
     if back.len() != payload.len() {
         return Err(Error::Protocol(format!(
             "sector {sector} read back {} bytes, expected {}",

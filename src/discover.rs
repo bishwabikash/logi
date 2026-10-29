@@ -199,8 +199,19 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
     }
 }
 
+/// The id in `$G502_DEVICE`, if one is set and not blank.
+fn device_from_env(var: Option<String>) -> Option<String> {
+    var.filter(|s| !s.trim().is_empty())
+}
+
+/// Open the device the user named in `$G502_DEVICE`, or the only one.
+///
+/// The CLI commands honour that variable, and so must everything that opens a
+/// device without being told which: with two Logitech devices attached, an
+/// effect or the GUI worker that ignored it would put the *other* device into
+/// host mode and light that one instead.
 pub fn open_device() -> Result<Found> {
-    open_device_matching(None)
+    open_device_matching(device_from_env(std::env::var("G502_DEVICE").ok()).as_deref())
 }
 
 #[cfg(test)]
@@ -219,6 +230,14 @@ mod tests {
                 "{w:?} did not reduce to the product id, so it would match no device"
             );
         }
+    }
+
+    #[test]
+    fn a_blank_device_variable_means_no_choice() {
+        assert_eq!(device_from_env(None), None);
+        assert_eq!(device_from_env(Some(String::new())), None);
+        assert_eq!(device_from_env(Some("  \t".into())), None);
+        assert_eq!(device_from_env(Some("046d:c08b".into())).as_deref(), Some("046d:c08b"));
     }
 
     #[test]
