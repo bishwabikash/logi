@@ -122,8 +122,13 @@ the worker; the worker also re-reads the cheap state every 1.5 s regardless,
 and publishes only when something a panel shows has moved. The same re-read
 notices an unplugged mouse.
 
-Checked on a G502 HERO with `logi state --follow` while a second process
-changed DPI and profile: every change appeared within about a second and a
-half. **Not confirmed:** whether the mouse announces presses of its own DPI and
-profile buttons. The About tab shows a counter for that; if it stays at zero
-while those buttons are pressed, the re-read is doing the work.
+Checked on a G502 HERO two ways. With `logi state --follow` running while a
+second process changed DPI and profile, every change appeared within about a
+second and a half. And with the DPI buttons pressed by hand, the mouse
+announced each press (75 announcements, 74 state changes tracked in 50 s, about
+0.35 s apart while pressing, final state consistent). The stage index and the
+sensor DPI occasionally disagreed for one read, 2 of 74, and the next read
+agreed. **Not yet watched:** the profile button.
+
+A window opened before the build that added this keeps running the old code, so
+it will not follow anything until it is closed and reopened.

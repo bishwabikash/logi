@@ -20,9 +20,9 @@ Run `logi` for the window, or `logi --help` for the command line.
 ## What it does
 
 * **DPI.** The G502 HERO's sensor is continuous, 100 to 25600 in steps of 50,
-  not a handful of fixed stages. The window follows changes made outside it,
-  including the DPI and profile buttons on the mouse, and shows which stage is
-  active.
+  not a handful of fixed stages. The window follows changes made outside it:
+  presses of the DPI button show up within a fraction of a second, and it shows
+  which stage is active.
 * **Report rate**, written to the active onboard profile.
 * **Lighting.** Off, fixed colour and breathing, set live or stored into a
   profile so it survives without any software. A few host-driven effects
@@ -73,6 +73,7 @@ taken first.
 | Button rebinding in flash | yes |
 | Per-application profile switching | yes |
 | The window following DPI and profile changes made by another process | yes |
+| The window following presses of the mouse's own DPI buttons | yes (the mouse announces each press; about 75 tracked in 50 s) |
 | The tray icon registering with GNOME | yes |
 
 | **Implemented and unit-tested, never run against hardware** | |
@@ -81,7 +82,7 @@ taken first.
 | The service acting on bindings | **no** |
 | Saving a profile to flash from the editor panel | **no** (the same write path was verified from the CLI) |
 | The tray menu's actions | **no** |
-| A press of the mouse's own DPI or profile button showing up in the window | **not watched directly.** Expected, because the window re-reads the device about every second and a half; whether the mouse also announces the press is unknown |
+| A press of the mouse's own *profile* button showing up in the window | **not watched.** Expected through the periodic re-read; whether the mouse also announces it is unknown. Only the DPI buttons were pressed |
 | Any mouse other than the G502 HERO | **no** |
 
 The suite has about 420 unit tests, none of which need hardware. They check the

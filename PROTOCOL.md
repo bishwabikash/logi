@@ -173,37 +173,31 @@ repeated runs. **[probed]**
 
 0x8100 sends two unsolicited reports. The event id is the high nibble of byte
 3, and the software id in the low nibble is zero, which is what separates an
-event from the reply to somebody's request. **[Solaar; not yet confirmed on a
-G502 HERO]**
+event from the reply to somebody's request.
 
-| event | byte 3 | payload |
-|---|---|---|
-| 0, current profile changed | `0x00` | u16 big-endian profile sector |
-| 1, current DPI stage changed | `0x10` | the stage *index*, not a DPI |
+| event | byte 3 | payload | status |
+|---|---|---|---|
+| 1, current DPI stage changed | `0x10` | the stage *index*, 0-based, not a DPI | **[probed]** |
+| 0, current profile changed | `0x00` | u16 big-endian profile sector | [Solaar]; not observed here |
 
-The DPI event carries an index, so the value has to be read afterwards. The
-mouse sends nothing for a change the host makes itself: changing the DPI or
-the profile over HID++ produced no announcement. **[probed]** Whether pressing
-the mouse's own DPI and profile buttons does is the open question. The app
-does not depend on it: it also re-reads the device about every second and a
-half, and shows a counter of announcements received (About tab, or
-`logi state --follow`) so a given mouse can be checked.
+**DPI stage, confirmed on a G502 HERO** (firmware U1 v27.03, onboard mode):
+75 announcements for about 75 presses of the DPI buttons over 50 seconds,
+including presses 0.1 s apart. Each carries the stage the mouse moved to. The
+profile event was not observed because the profile button was not pressed.
 
-## Not covered
+**Two registers, not one.** The stage index (0x8100) and the sensor DPI (0x2201)
+did not always change together. In 2 of 74 reads taken straight after an
+announcement the stage had moved and the DPI had not yet, and the next read
+200 ms later agreed. Do not assume the two update atomically: read again if an
+announcement arrived while you were reading.
 
-**Surface tuning, lift-off distance, angle snapping.** These are not
-standalone HID++ features on this device: the feature table has no entry for
-them. Logitech's own software is thought to drive them through the
-`engineering`-flagged features listed above (`TDE_ACCESS` 0x1eb0,
-`SPI_DIRECT_ACCESS` 0x1e22), which would mean writing sensor registers
-directly. That is a guess, not something this project observed. There is no
-open implementation, and a wrong write to registers like these is not
-recoverable from userspace, so this project does not touch them.
+**Only physical presses announce.** Changing the DPI or the profile over HID++
+produced no announcement. **[probed]**
 
-The G HUB installer does not contain the component that would answer the
-question: it downloads it at install time, and obtaining it was not pursued.
-Anyone who does go after it should treat these features as able to brick the
-device.
+The event carries an index, so the value is read afterwards. The app does not
+depend on any of this: it also re-reads the device about every second and a
+half, and counts announcements received (About tab, or `logi state --follow`)
+so a given mouse can be checked.
 
 ## 0x8110 MOUSE_BUTTON_SPY
 
