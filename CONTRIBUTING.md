@@ -46,8 +46,11 @@ Read this before running anything that writes. Each rule here comes from
 something that went wrong on the development mouse.
 
 * **Onboard profiles are flash with finite endurance.** Never write on a
-  keystroke, a slider drag or a loop. Stage edits and commit on an explicit
-  action. Always verify by reading back.
+  keystroke, a slider drag or a loop. The window sends a change only after it
+  has stopped changing (`src/gui/autosend.rs`), one write at a time, never
+  retries a failure on its own, and waits for the once-per-launch backup.
+  Anything new that writes flash goes through the same gates. Always verify by
+  reading back.
 * **Take a backup first:** `logi backup before.json`, and `logi restore` puts it
   back.
 * **The button remapping table survives unplugging.** Writing zeros to it leaves

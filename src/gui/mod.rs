@@ -40,6 +40,20 @@ pub struct App {
     period_ms: u16,
     waveform: usize,
     intensity: u8,
+    /// The lighting settings as last seen, so an edit can be told from the
+    /// panel merely being drawn. None until the panel has been looked at, so
+    /// opening it sends nothing.
+    light_key: Option<LightKey>,
+    /// What the panel was aimed at when `light_key` was taken. Changing the
+    /// zone is not an edit of the lighting, and the mode it forces on a zone
+    /// that lacks the old one must not be sent as if the user had picked it.
+    light_aim: (bool, usize),
+    light_live: autosend::Settle,
+    light_flash: autosend::Settle,
+    /// The settings and aim last handed over to be stored. Not sent twice.
+    light_tried: Option<(LightKey, (bool, usize))>,
+    /// Newest outcome id when the last store was sent, to find its answer.
+    light_after: Option<CmdId>,
 
     // Effects
     effect: usize,
@@ -57,6 +71,11 @@ pub struct App {
     /// made for one profile must not stay armed over another: Apply writes
     /// flash.
     btn_profile: Option<u8>,
+    /// The choice last handed to the worker for each button. A choice is sent
+    /// once, on its own; if it did not take, it is not sent again until the
+    /// user picks again or presses Try again, so a refusal cannot become a loop
+    /// of flash writes.
+    btn_tried: std::collections::HashMap<u8, String>,
     /// The newest flash write (or profile switch) sent from here that the
     /// worker has not yet answered, and when it was sent.
     ///
@@ -106,6 +125,12 @@ impl App {
             period_ms: 4000,
             waveform: 0,
             intensity: 100,
+            light_key: None,
+            light_aim: (true, 0),
+            light_live: autosend::Settle::new(),
+            light_flash: autosend::Settle::new(),
+            light_tried: None,
+            light_after: None,
             effect: 0,
             effect_period_ms: 4000,
             profile_sel: 0,
@@ -113,6 +138,7 @@ impl App {
             backup_sent: Vec::new(),
             btn_action: std::collections::HashMap::new(),
             btn_profile: None,
+            btn_tried: std::collections::HashMap::new(),
             flash_inflight: None,
             backup: BackupState::NotStarted,
             backup_override: false,
@@ -219,6 +245,27 @@ impl App {
         target
     }
 
+    /// Set the chosen lighting on the zones selected, live.
+    fn send_live_lighting(&mut self) {
+        let c = self.rgb();
+        let wf = led::WAVEFORMS[self.waveform].1;
+        for z in self.zones() {
+            self.dev.send(match self.mode {
+                led::OFF => Cmd::LedOff { zone: z },
+                led::FIXED => Cmd::LedFixed { zone: z, color: c },
+                led::BREATHING => Cmd::LedBreathing {
+                    zone: z, color: c, period: self.period_ms,
+                    waveform: wf, intensity: self.intensity,
+                },
+                led::CYCLE => Cmd::LedCycle {
+                    zone: z, period: self.period_ms, intensity: self.intensity,
+                },
+                // Only the four modes above can be set live.
+                _ => continue,
+            });
+        }
+    }
+
     fn rgb(&self) -> [u8; 3] {
         [
             (self.color[0] * 255.0).round() as u8,
@@ -239,6 +286,9 @@ impl App {
         }
     }
 }
+
+/// Everything the lighting panel edits, minus which zone it is aimed at.
+type LightKey = (u8, [u8; 3], u16, usize, u8);
 
 /// Where the safety backup stands. See `autosend::Safety`.
 #[derive(Debug, Clone, PartialEq)]
@@ -583,6 +633,14 @@ impl eframe::App for App {
         // an interrupted one is a profile the mouse cannot read back. The
         // restore below also talks to the device, so it waits for the write
         // too. Bounded for the same reason as above.
+        // Edits still inside their quiet period have no later to be sent in.
+        {
+            let snap = self.dev.snapshot();
+            let safety = self.safety();
+            for c in self.profile_editor.flush(&snap, &safety) {
+                self.send_tracked(c);
+            }
+        }
         if let Some((id, _)) = self.flash_inflight {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(6);
             while self.dev.snapshot().newest_outcome_id() < id
@@ -613,6 +671,7 @@ impl eframe::App for App {
             // A choice armed against a mouse that has gone is not one for
             // whatever comes back: Apply writes flash.
             self.btn_action.clear();
+            self.btn_tried.clear();
             self.btn_profile = None;
             // A drag in progress when the mouse went is never finished: the
             // slider is not drawn while there is no device, so it never sees
@@ -623,6 +682,24 @@ impl eframe::App for App {
         if let Some((id, since)) = self.flash_inflight {
             if !still_waiting(id, self.snap.newest_outcome_id(), since.elapsed()) {
                 self.flash_inflight = None;
+            }
+        }
+        // Edits that have stopped changing go to the mouse, whichever tab made
+        // them.
+        {
+            let safety = self.safety();
+            let busy = self.flash_inflight.is_some();
+            let (cmds, wake) = self.profile_editor.tick(
+                &self.snap,
+                &safety,
+                busy,
+                std::time::Instant::now(),
+            );
+            for c in cmds {
+                self.dispatch(c);
+            }
+            if let Some(w) = wake {
+                ctx.request_repaint_after(w);
             }
         }
         self.sync_tray(ctx);
@@ -1096,6 +1173,25 @@ impl App {
         });
         }
 
+        // The stages are a range the mouse reported, edited in the active
+        // profile and sent on their own. A list sensor has fixed values to pick
+        // from instead, handled above.
+        if self.snap.has_dpi
+            && self.snap.has_profiles
+            && self.snap.profile_format == 2
+            && matches!(self.snap.dpi_cap, Some(Capability::Range { .. }))
+        {
+            let snap = self.snap.clone();
+            let idx = snap.active_profile;
+            let writing = self.flash_inflight.is_some();
+            let cmds = ui
+                .add_enabled_ui(!writing, |ui| self.profile_editor.stages_ui(ui, &snap, idx))
+                .inner;
+            for c in cmds {
+                self.dispatch(c);
+            }
+        }
+
         if !self.snap.has_rate {
             theme::section(ui, "Report rate", |ui| {
                 theme::unsupported(ui, "an adjustable report rate")
@@ -1300,52 +1396,91 @@ impl App {
                 );
                 ui.add_space(8.0);
             }
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        live_ok(self.mode) && storable_mode(self.mode),
-                        egui::Button::new("Apply now"),
-                    )
-                    .clicked()
-                {
-                    let c = self.rgb();
-                    let wf = led::WAVEFORMS[self.waveform].1;
-                    for z in self.zones() {
-                        self.dev.send(match self.mode {
-                            led::OFF => Cmd::LedOff { zone: z },
-                            led::FIXED => Cmd::LedFixed { zone: z, color: c },
-                            led::BREATHING => Cmd::LedBreathing {
-                                zone: z, color: c, period: self.period_ms,
-                                waveform: wf, intensity: self.intensity,
-                            },
-                            led::CYCLE => Cmd::LedCycle {
-                                zone: z, period: self.period_ms, intensity: self.intensity,
-                            },
-                            // Nothing else is sent: the button is only
-                            // enabled for the four modes above.
-                            _ => continue,
-                        });
-                    }
+            // Sent by itself. A change to the settings (not to the zone) starts
+            // two waits: a short one for the live colour, which costs the mouse
+            // nothing, and a long one for the flash copy.
+            let now = std::time::Instant::now();
+            let key: LightKey =
+                (self.mode, self.rgb(), self.period_ms, self.waveform, self.intensity);
+            let aim = (self.all_zones, self.zone_sel);
+            if self.light_key.is_none() || self.light_aim != aim {
+                self.light_key = Some(key);
+                self.light_aim = aim;
+                self.light_live.clear();
+                self.light_flash.clear();
+            } else if self.light_key != Some(key) {
+                self.light_key = Some(key);
+                self.light_live.touch(now);
+                self.light_flash.touch(now);
+            }
+            if self.light_live.due(now, autosend::LIVE_QUIET) {
+                self.light_live.clear();
+                if live_ok(self.mode) && storable_mode(self.mode) {
+                    self.send_live_lighting();
                 }
-                if ui
-                    .add_enabled(can_store, egui::Button::new("Save to mouse"))
-                    .clicked()
+            }
+            if self.light_flash.pending() {
+                if blocked.is_some() {
+                    // Not for now, and not to be sent later behind the user's
+                    // back once something else unblocks it.
+                    self.light_flash.clear();
+                } else if self.light_flash.due(now, autosend::FLASH_QUIET)
+                    && can_store
+                    && self.safety().allows_flash()
+                    && self.light_tried != Some((key, aim))
                 {
-                    // This writes flash. With one zone selected the other is
-                    // kept exactly as the mouse already stores it (see
-                    // `merged_leds`); `can_store` is only true when that
-                    // answer exists.
+                    self.light_flash.clear();
                     if let Some(leds) = to_store {
+                        self.light_tried = Some((key, aim));
+                        self.light_after = Some(self.snap.newest_outcome_id());
                         self.send_tracked(Cmd::PersistLighting { leds });
                     }
                 }
-            });
+            }
+            // The repaint that sends it: nothing else wakes an idle window.
+            let wait = [
+                self.light_live.wait_left(now, autosend::LIVE_QUIET),
+                self.light_flash.wait_left(now, autosend::FLASH_QUIET),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|d| !d.is_zero())
+            .min();
+            if let Some(w) = wait {
+                ui.ctx().request_repaint_after(w);
+            }
+            let answer = self
+                .light_after
+                .and_then(|a| self.snap.outcome_after(a, device::CmdKind::PersistLighting))
+                .cloned();
             ui.add_space(8.0);
             theme::hint(
                 ui,
-                "Apply now needs host mode and is lost on unplug. Save to mouse writes \
-                 onboard flash, so it persists with nothing running, and into Windows.",
+                "A change is applied to the mouse's lights a moment after you stop, and \
+                 then stored in its active profile, so it persists with nothing running \
+                 and into Windows. The live part needs host mode and is lost on unplug. \
+                 The stored part is written to flash once, not as you drag.",
             );
+            match (&answer, self.light_flash.pending()) {
+                (Some(o), _) if !o.ok => {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Storing failed: {}",
+                            o.message.clone().unwrap_or_else(|| "the mouse refused it".into())
+                        ))
+                        .color(theme::BAD)
+                        .size(13.0)
+                        .strong(),
+                    );
+                    theme::hint(ui, "It will not be retried on its own. Change the lighting to try again.");
+                }
+                (_, true) => {
+                    ui.add_space(6.0);
+                    theme::hint(ui, "Sending in a moment.");
+                }
+                _ => {}
+            }
             if let Some(why) = blocked {
                 ui.add_space(6.0);
                 theme::hint(ui, why);
@@ -1561,6 +1696,7 @@ impl App {
         // flash.
         if self.btn_profile != Some(idx) {
             self.btn_action.clear();
+            self.btn_tried.clear();
             self.btn_profile = Some(idx);
         }
 
@@ -1574,6 +1710,14 @@ impl App {
         // The strand check below reads the snapshot's table, which does not
         // include a write that has been sent and not yet answered.
         let writing = self.flash_inflight.is_some();
+        let safety = self.safety();
+        // A choice that now matches the mouse has gone through.
+        let held: Vec<u8> = self.btn_tried.keys().copied().collect();
+        for b in held {
+            if !self.btn_action.contains_key(&b) {
+                self.btn_tried.remove(&b);
+            }
+        }
 
         theme::section(ui, &format!("Buttons, profile {idx}"), |ui| {
             egui::Grid::new("btns")
@@ -1594,6 +1738,8 @@ impl App {
                                     let mut s = sel.clone();
                                     if ui.selectable_value(&mut s, c.clone(), c).clicked() {
                                         self.btn_action.insert(i, c.clone());
+                                        // A new choice is a new request.
+                                        self.btn_tried.remove(&i);
                                     }
                                 }
                             });
@@ -1604,16 +1750,28 @@ impl App {
                             strands_left_click(&p.buttons, n_buttons as usize, i as usize, b)
                         });
                         stranded |= strands;
-                        if ui
-                            .add_enabled(
-                                changed && !strands && !writing,
-                                egui::Button::new("Apply"),
-                            )
-                            .clicked()
-                        {
-                            if let Some(b) = chosen {
-                                pending = Some((i, b));
+                        let tried = self.btn_tried.get(&i).is_some_and(|t| *t == sel);
+                        if changed && !strands && chosen.is_some() {
+                            if tried {
+                                // Sent and not taken (or not yet read back).
+                                if writing {
+                                    ui.label(egui::RichText::new("sending").color(theme::DIM).size(12.5));
+                                } else if ui.button("Try again").clicked() {
+                                    pending = chosen.map(|b| (i, b));
+                                }
+                            } else if !safety.allows_flash() {
+                                ui.label(
+                                    egui::RichText::new("waiting for the backup")
+                                        .color(theme::DIM)
+                                        .size(12.5),
+                                );
+                            } else if writing {
+                                ui.label(egui::RichText::new("next").color(theme::DIM).size(12.5));
+                            } else {
+                                pending = chosen.map(|b| (i, b));
                             }
+                        } else {
+                            ui.label("");
                         }
                         ui.end_row();
                     }
@@ -1634,15 +1792,20 @@ impl App {
             ui.add_space(10.0);
             theme::hint(
                 ui,
-                "Changing a binding writes onboard flash, so it persists with nothing \
-                 running. Take a backup from the Profiles tab first.",
+                "A binding you choose is written to the mouse straight away, so it persists \
+                 with nothing running. A backup is taken first, once each time the app \
+                 starts. Only one change is written at a time, and a refused one is not \
+                 retried on its own.",
             );
         });
 
         if let Some((button, binding)) = pending {
             // The choice stays: once the write reads back it matches the
             // device and `chosen_label` drops it, and if the write fails it
-            // is still there to retry. Apply is held until then.
+            // is still there, with Try again.
+            if let Some(label) = self.btn_action.get(&button).cloned() {
+                self.btn_tried.insert(button, label);
+            }
             self.send_tracked(Cmd::SetButton { index: idx, button, binding });
         }
     }

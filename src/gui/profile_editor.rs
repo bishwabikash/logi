@@ -1,10 +1,10 @@
 //! Editing one onboard profile from the GUI.
 //!
-//! Every control here edits a staged copy held in memory. Nothing reaches the
-//! mouse until the user presses Save to mouse, because writing a profile is a
-//! flash write with finite endurance: a write per keystroke would both wear
-//! the sector out and leave half-built profiles on the device while the user
-//! is still typing.
+//! Every control here edits a staged copy held in memory. It reaches the mouse
+//! by itself, but only once it has stopped changing (`tick`), because writing a
+//! profile is a flash write with finite endurance: a write per keystroke would
+//! both wear the sector out and leave half-built profiles on the device while
+//! the user is still typing.
 //!
 //! Two other rules are load-bearing rather than stylistic:
 //!
@@ -12,13 +12,14 @@
 //!     device, so `Profile::serialize` can pass through the bytes this codec
 //!     does not model. Building one from nothing would zero them.
 //!   * A profile with no left click leaves a mouse that cannot be clicked,
-//!     which has happened on this project. Save refuses such a profile.
+//!     which has happened on this project. Such a profile is never sent.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 
+use super::autosend::{Safety, Settle, FLASH_QUIET};
 use super::theme;
 use crate::device::{Cmd, CmdId, CmdKind, Snapshot};
 use crate::dpi::Capability;
@@ -353,7 +354,7 @@ impl Draft {
             p.leds[i] = l.to_led();
             // The second-mode record gets the same value, so holding the
             // sniper button does not change the lighting. Same thing the
-            // Lighting tab's Save to mouse does.
+            // Lighting tab's store does.
             p.alt_leds[i] = if l.edited { l.to_led() } else { self.alt_raw[i] };
         }
         p.buttons = self.buttons.clone();
@@ -398,9 +399,9 @@ impl Draft {
     /// Three-way: a field the user has not touched (it still equals `old`, the
     /// reading the edits were staged against) takes the value from `new`; a
     /// field the user changed stays theirs. Without this a draft staged before
-    /// another panel wrote this profile — the Lighting tab's Save to mouse,
+    /// another panel wrote this profile — the Lighting tab's store,
     /// the per-button writes — carried the *old* bytes for everything the user
-    /// never touched, and Save to mouse wrote them straight back over that
+    /// never touched, and the send wrote them straight back over that
     /// write, silently undoing it in flash.
     fn rebase(&mut self, old: &Draft, new: &Draft) {
         fn keep<T: PartialEq + Clone>(mine: &mut T, old: &T, new: &T) {
@@ -558,6 +559,132 @@ pub struct ProfileEditor {
     /// mouse had in fact taken would sit staged as unsaved for the rest of
     /// the session.
     writes: HashMap<u8, Write>,
+    /// Per profile, what the automatic send is waiting on.
+    auto: HashMap<u8, Auto>,
+    /// What `tick` last saw of the backup, so the panels can say why an edit
+    /// has not gone yet.
+    safety: Safety,
+    /// The stage slot the Sensor tab's slider is editing.
+    stage_sel: usize,
+    /// A stage being typed into: its slot and the text so far.
+    stage_edit: Option<(usize, String)>,
+}
+
+/// Where one profile's edits stand on their way to the mouse.
+#[derive(Debug, Default, Clone)]
+struct Auto {
+    /// The draft as of the last look, to notice that it changed.
+    seen: Option<Draft>,
+    settle: Settle,
+    /// The last draft handed to the worker. Never sent twice: a write that
+    /// failed is not retried on its own, since a loop of failing flash writes
+    /// is exactly what must not happen. An edit, or Try again, sends it anew.
+    tried: Option<Draft>,
+}
+
+/// Why a profile is not sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    NoLeftClick,
+    BadChecksum,
+    NoStages,
+}
+
+/// Whether `draft` may be written over `original`, and if not why.
+///
+/// With no editable buttons the editor never touches the remapping table (it
+/// is written back as read), so there is nothing to refuse. The flash path
+/// refuses a sector whose stored checksum is wrong, so that it does not bless a
+/// corruption with a fresh one.
+fn blocked(draft: &Draft, original: &Profile) -> Option<Blocked> {
+    if !original.crc_ok() {
+        Some(Blocked::BadChecksum)
+    } else if draft.editable > 0 && !draft.has_left_click() {
+        Some(Blocked::NoLeftClick)
+    } else if draft.enabled_stages().is_empty() {
+        Some(Blocked::NoStages)
+    } else {
+        None
+    }
+}
+
+/// What to tell the user about an edit that is on its way to the mouse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Line {
+    InSync,
+    Soon,
+    WaitingForBackup,
+    BackupFailed(String),
+    Blocked(Blocked),
+    Writing,
+    Failed(String),
+    Unanswered,
+}
+
+fn send_line(
+    dirty: bool,
+    state: Option<&WriteState>,
+    blocked: Option<Blocked>,
+    safety: &Safety,
+) -> Line {
+    match state {
+        Some(WriteState::Waiting) => return Line::Writing,
+        Some(WriteState::Failed(m)) => return Line::Failed(m.clone()),
+        Some(WriteState::Unanswered) => return Line::Unanswered,
+        None => {}
+    }
+    if !dirty {
+        return Line::InSync;
+    }
+    if let Some(b) = blocked {
+        return Line::Blocked(b);
+    }
+    match safety {
+        Safety::Pending => Line::WaitingForBackup,
+        Safety::Failed(w) => Line::BackupFailed(w.clone()),
+        Safety::Ready => Line::Soon,
+    }
+}
+
+/// The slot a new stage goes in: just after the last one in use, so the
+/// mouse's button reaches it last, and failing that the first free one.
+fn free_slot(dpi: &[u16; N_DPI]) -> Option<usize> {
+    let after = dpi.iter().rposition(|d| *d != 0).map_or(0, |i| i + 1);
+    if after < N_DPI {
+        Some(after)
+    } else {
+        dpi.iter().position(|d| *d == 0)
+    }
+}
+
+/// A value for a new stage: the current DPI if no stage has it, else the first
+/// common value that is free.
+fn new_stage_value(existing: &[u16], live: u16, cap: Option<&Capability>) -> u16 {
+    let live = if live == 0 { 1600 } else { live };
+    for c in [live, 800, 1600, 3200, 6400, 400, 12800] {
+        let v = snap_stage(cap, c);
+        if v != 0 && !existing.contains(&v) {
+            return v;
+        }
+    }
+    snap_stage(cap, live)
+}
+
+/// (min, max, step) the sensor accepts. A list sensor has no step, so 50 is
+/// only a slider granularity there.
+fn range_of(cap: Option<&Capability>) -> (u16, u16, u16) {
+    match cap {
+        Some(Capability::Range { min, max, step }) => (*min, *max, (*step).max(1)),
+        // Extrema, not the first and last entry: the list is built in the
+        // order the device reported it, and a descending one would hand the
+        // slider an inverted range.
+        Some(Capability::List(v)) => (
+            v.iter().copied().min().unwrap_or(100),
+            v.iter().copied().max().unwrap_or(25600),
+            50,
+        ),
+        None => (100, 25600, 50),
+    }
 }
 
 impl Default for ProfileEditor {
@@ -575,6 +702,10 @@ impl ProfileEditor {
             backup_sent: Vec::new(),
             copy_from: 0,
             writes: HashMap::new(),
+            auto: HashMap::new(),
+            safety: Safety::Ready,
+            stage_sel: 0,
+            stage_edit: None,
         }
     }
 
@@ -593,6 +724,132 @@ impl ProfileEditor {
 
     pub fn discard(&mut self) {
         self.staged.clear();
+        self.auto.clear();
+    }
+
+    /// Hand a draft to the worker and start tracking its answer.
+    fn start_write(
+        &mut self,
+        index: u8,
+        draft: &Draft,
+        original: &Profile,
+        snap: &Snapshot,
+        cmds: &mut Vec<Cmd>,
+    ) {
+        cmds.push(Cmd::WriteProfile { index, profile: Box::new(draft.build(original)) });
+        // Read before the command is sent (the host's dispatch loop sends it
+        // after this returns), so every outcome on the books now is older than
+        // this write's own.
+        self.writes.insert(
+            index,
+            Write {
+                after: snap.newest_outcome_id(),
+                sent: Instant::now(),
+                sent_draft: draft.clone(),
+                state: WriteState::Waiting,
+            },
+        );
+        // The draft is deliberately left as it is. It is what was sent, and
+        // until the outcome says the device took it, adopting it as the truth
+        // would be a guess.
+        let a = self.auto.entry(index).or_default();
+        a.tried = Some(draft.clone());
+        a.settle.clear();
+    }
+
+    /// Send edits that have stopped changing. Called every frame, whichever tab
+    /// is showing, so an edit made on the Sensor tab goes out as surely as one
+    /// made here.
+    ///
+    /// `busy` is another flash write in flight, which this must not overlap: the
+    /// panels judge what to write from a snapshot that does not include it yet.
+    /// Returns the commands and how long until the next one is due, to schedule
+    /// the repaint that will send it: nothing else wakes an idle window.
+    pub fn tick(
+        &mut self,
+        snap: &Snapshot,
+        safety: &Safety,
+        busy: bool,
+        now: Instant,
+    ) -> (Vec<Cmd>, Option<Duration>) {
+        let mut cmds = Vec::new();
+        let mut wake: Option<Duration> = None;
+        self.safety = safety.clone();
+        if !snap.connected || !snap.has_profiles || snap.profile_format != 2 {
+            return (cmds, wake);
+        }
+        self.resolve_writes(snap);
+
+        let mut indices: Vec<u8> = self.staged.keys().copied().collect();
+        indices.sort_unstable();
+        for index in indices {
+            let Some(original) = snap.profiles.get(index as usize) else { continue };
+            let n_buttons = (snap.button_count as usize).min(original.buttons.len());
+            let base = Draft::from_profile(original, n_buttons);
+            // Brought up to date with what the mouse holds, the same way the
+            // panel does, so a write built here never carries stale bytes for
+            // fields nobody touched.
+            let st = stage_for(self.staged.remove(&index), &base);
+            if !st.dirty() {
+                self.auto.remove(&index);
+                self.drop_settled_write(index);
+                continue;
+            }
+            let hold = blocked(&st.draft, original);
+            let waiting =
+                self.writes.get(&index).is_some_and(|w| w.state == WriteState::Waiting);
+
+            let a = self.auto.entry(index).or_default();
+            if a.seen.as_ref() != Some(&st.draft) {
+                a.seen = Some(st.draft.clone());
+                a.settle.touch(now);
+            }
+            if a.tried.as_ref() == Some(&st.draft) {
+                // Already sent, and either in flight or answered badly.
+                a.settle.clear();
+            }
+            let due = a.settle.due(now, FLASH_QUIET);
+            if let Some(left) = a.settle.wait_left(now, FLASH_QUIET) {
+                if !left.is_zero() {
+                    wake = Some(wake.map_or(left, |w| w.min(left)));
+                }
+            }
+            let go = due && hold.is_none() && !waiting && !busy && safety.allows_flash();
+            let draft = go.then(|| st.draft.clone());
+            self.staged.insert(index, st);
+            if let Some(d) = draft {
+                self.start_write(index, &d, original, snap, &mut cmds);
+            }
+        }
+        (cmds, wake)
+    }
+
+    /// Everything unsent that could be sent, right now, for the window closing.
+    /// The quiet period is skipped because there will be no later.
+    pub fn flush(&mut self, snap: &Snapshot, safety: &Safety) -> Vec<Cmd> {
+        let mut cmds = Vec::new();
+        if !snap.connected || !snap.has_profiles || snap.profile_format != 2 || !safety.allows_flash()
+        {
+            return cmds;
+        }
+        let mut indices: Vec<u8> = self.staged.keys().copied().collect();
+        indices.sort_unstable();
+        for index in indices {
+            let Some(original) = snap.profiles.get(index as usize) else { continue };
+            let Some(st) = self.staged.get(&index) else { continue };
+            let waiting =
+                self.writes.get(&index).is_some_and(|w| w.state == WriteState::Waiting);
+            let tried = self.auto.get(&index).and_then(|a| a.tried.as_ref()) == Some(&st.draft);
+            if !st.dirty() || waiting || tried || blocked(&st.draft, original).is_some() {
+                continue;
+            }
+            let d = st.draft.clone();
+            self.start_write(index, &d, original, snap, &mut cmds);
+            // One at a time: the worker takes them in order, but each is built
+            // from the same snapshot.
+            break;
+        }
+        cmds
     }
 
     /// Draw the editor for one profile. Returns the commands to dispatch.
@@ -766,7 +1023,7 @@ impl ProfileEditor {
                 Some(WriteState::Waiting) => theme::pill(ui, "writing to flash", theme::WARN),
                 Some(WriteState::Failed(_)) => theme::pill(ui, "write failed", theme::BAD),
                 Some(WriteState::Unanswered) => theme::pill(ui, "write unconfirmed", theme::BAD),
-                None if st.dirty() => theme::pill(ui, "unsaved changes", theme::WARN),
+                None if st.dirty() => theme::pill(ui, "not sent yet", theme::WARN),
                 None => {}
             }
         });
@@ -835,18 +1092,7 @@ impl ProfileEditor {
     fn draw_dpi(&self, ui: &mut egui::Ui, d: &mut Draft, snap: &Snapshot) {
         let cap = snap.dpi_cap.clone();
         theme::section(ui, "DPI stages", |ui| {
-            let (min, max, step) = match &cap {
-                Some(Capability::Range { min, max, step }) => (*min, *max, *step),
-                // Extrema, not the first and last entry: the list is built in
-                // the order the device reported it, and a descending one
-                // would hand the slider an inverted range.
-                Some(Capability::List(v)) => (
-                    v.iter().copied().min().unwrap_or(100),
-                    v.iter().copied().max().unwrap_or(25600),
-                    50,
-                ),
-                None => (100, 25600, 50),
-            };
+            let (min, max, step) = range_of(cap.as_ref());
             egui::Grid::new("profile-dpi-stages")
                 .num_columns(3)
                 .spacing(egui::vec2(12.0, 8.0))
@@ -1222,32 +1468,17 @@ impl ProfileEditor {
     ) -> bool {
         let dirty = st.dirty();
         let waiting = state == Some(&WriteState::Waiting);
-        // With no editable buttons the editor never touches the remapping
-        // table — it is written back exactly as read — so there is nothing to
-        // refuse, and refusing left the save button dead with no way out.
-        let no_click = st.draft.editable > 0 && !st.draft.has_left_click();
-        // The flash path refuses a sector whose stored checksum does not match
-        // its contents, so that it does not bless a corruption with a fresh
-        // one. A write that stopped part-way leaves exactly that, which makes
-        // "Save again to retry" a button that can only fail the same way.
-        // Said here, before the click, with the way out.
-        let crc_bad = !original.crc_ok();
-        let blocked = no_click || crc_bad || st.draft.enabled_stages().is_empty();
+        let hold = blocked(&st.draft, original);
         let mut reverted = false;
 
-        theme::section(ui, "Save", |ui| {
+        theme::section(ui, "Sending to the mouse", |ui| {
             theme::hint(
                 ui,
-                if self.backup_asked {
-                    "A backup was asked for this session. Taking another never replaces \
-                     the first: when the file named below already exists, the new one is \
-                     written beside it with a number on the end."
-                } else {
-                    "Take a backup before the first write of this session. It dumps every \
-                     sector, the profile directory included, so a bad profile can be put \
-                     back. A file already at the path below is never replaced: the new \
-                     backup is written beside it with a number on the end."
-                },
+                "Changes are sent by themselves once you stop editing. A backup of every \
+                 sector is taken first, once each time the app starts and only if the \
+                 mouse has changed since the last one, into ~/.local/share/logi/backups. \
+                 To take another now, name a file below. A file already there is never \
+                 replaced: the new one is written beside it with a number on the end.",
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -1255,9 +1486,7 @@ impl ProfileEditor {
                 ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
                 // Kept available after the first click: the write happens on
                 // the device thread, so a failure to write the file shows up
-                // in the status bar afterwards, and hiding the control left no
-                // way to retry the one thing that makes a bad write
-                // recoverable.
+                // in the status bar afterwards.
                 if ui
                     .add_enabled(
                         !self.backup_path.trim().is_empty(),
@@ -1266,15 +1495,11 @@ impl ProfileEditor {
                     .clicked()
                 {
                     // Never onto a file that is already there: the backup
-                    // taken before a write is the way back from it, and a
-                    // second one taken after a bad write would replace the
-                    // good one with the bad state. The field shows where it
-                    // actually went.
+                    // taken before a write is the way back from it.
                     //
-                    // Trimmed first: the enable check above already ignores
-                    // surrounding blanks, but the path itself kept them, so a
-                    // pasted path with a trailing space made a file whose
-                    // name ends in one, which no later look for it finds.
+                    // Trimmed first: a pasted path with a trailing space made
+                    // a file whose name ends in one, which no later look for
+                    // it finds.
                     let typed = self.backup_path.trim().to_string();
                     let target = free_backup_path(&typed, |p| {
                         self.backup_sent.iter().any(|s| s == p)
@@ -1288,38 +1513,16 @@ impl ProfileEditor {
             });
             ui.add_space(12.0);
 
+            let line = send_line(dirty, state, hold, &self.safety);
+            let retry = matches!(line, Line::Failed(_) | Line::Unanswered) && hold.is_none();
             ui.horizontal(|ui| {
-                // Not while one is in flight: a second click would be a second
-                // flash write for the same edits.
-                if ui
-                    .add_enabled(dirty && !blocked && !waiting, egui::Button::new("Save to mouse"))
-                    .clicked()
-                {
-                    cmds.push(Cmd::WriteProfile {
-                        index,
-                        profile: Box::new(st.draft.build(original)),
-                    });
-                    // Read before the command is sent — the host's dispatch
-                    // loop sends it after `ui` returns — so every outcome on
-                    // the books now is older than this write's own.
-                    self.writes.insert(
-                        index,
-                        Write {
-                            after: snap.newest_outcome_id(),
-                            sent: Instant::now(),
-                            sent_draft: st.draft.clone(),
-                            state: WriteState::Waiting,
-                        },
-                    );
-                    // The draft is deliberately left as it is. It is what was
-                    // sent, and until the outcome says the device took it,
-                    // adopting it as the truth would be a guess — the guess
-                    // that used to discard a failed write's edits.
+                if retry && ui.button("Try again").clicked() {
+                    let d = st.draft.clone();
+                    self.start_write(index, &d, original, snap, cmds);
                 }
-                // Not while one is in flight either. Reverting would throw
-                // away the very edits that were sent, and then the failure
-                // text below — "your edits are still here" — would be a lie
-                // with nothing left on screen to retry from.
+                // Not while one is in flight. Reverting would throw away the
+                // very edits that were sent, and then the failure text below,
+                // "your edits are still here", would be a lie.
                 if ui.add_enabled(dirty && !waiting, egui::Button::new("Revert")).clicked() {
                     reverted = true; // dropping the staged entry is the revert
                     self.drop_settled_write(index);
@@ -1327,7 +1530,7 @@ impl ProfileEditor {
             });
 
             ui.add_space(8.0);
-            if crc_bad {
+            if hold == Some(Blocked::BadChecksum) {
                 ui.label(
                     egui::RichText::new("This profile's stored checksum does not match its contents.")
                         .color(theme::BAD)
@@ -1337,87 +1540,249 @@ impl ProfileEditor {
                 ui.add_space(4.0);
                 theme::hint(
                     ui,
-                    "Saving is refused: it would put a fresh checksum on a damaged sector. \
+                    "Nothing is sent: it would put a fresh checksum on a damaged sector. \
                      An interrupted write leaves this. Put a backup back with \
                      `logi restore <file>` in a terminal, then press Refresh in the sidebar.",
                 );
                 ui.add_space(8.0);
             }
-            match state {
-                Some(WriteState::Waiting) => {
-                    theme::hint(
-                        ui,
-                        "Written; waiting for the mouse to confirm. The worker re-reads every \
-                         sector after a write, which takes about a second. Your edits stay \
-                         here until it answers.",
-                    );
-                    ui.add_space(8.0);
-                }
-                Some(WriteState::Failed(msg)) => {
-                    ui.label(
-                        egui::RichText::new(format!("The write failed: {msg}"))
-                            .color(theme::BAD)
-                            .size(13.0)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                    theme::hint(
-                        ui,
-                        if crc_bad {
-                            "Your edits are still here, so nothing has been lost, but the \
-                             write left the sector damaged: Save is off until a backup is put \
-                             back, as explained above. Revert drops these edits."
-                        } else {
-                            "Your edits are still here, so nothing has been lost. Save again to \
-                             retry, or Revert to go back to what the mouse holds. Press Refresh \
-                             in the sidebar first if you want to see what that is now: a write \
-                             that reports an error may still have changed the sector."
-                        },
-                    );
-                    ui.add_space(8.0);
-                }
-                Some(WriteState::Unanswered) => {
-                    ui.label(
-                        egui::RichText::new("No answer came back for this write.")
-                            .color(theme::BAD)
-                            .size(13.0)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                    theme::hint(
-                        ui,
-                        if crc_bad {
-                            "That says nothing about whether the mouse took it, so your edits \
-                             are kept, but the sector now reads as damaged: Save is off until a \
-                             backup is put back, as explained above. Revert drops these edits."
-                        } else {
-                            "That says nothing about whether the mouse took it, so your edits \
-                             are kept. Press Refresh in the sidebar to see what the mouse holds \
-                             now, then save again or revert."
-                        },
-                    );
-                    ui.add_space(8.0);
-                }
-                None => {}
-            }
-            if !dirty {
-                theme::hint(ui, "This profile matches what is on the mouse.");
-            } else if blocked {
-                theme::hint(
-                    ui,
-                    "Fix the problem flagged above before saving. Nothing has been written.",
-                );
-            } else if state.is_none() {
-                theme::hint(
-                    ui,
-                    &format!(
-                        "One flash write to profile {index}. Flash has finite endurance, so \
-                         edits are collected here and written once, not as you type."
-                    ),
-                );
-            }
+            send_line_ui(ui, &line, index);
         });
         reverted
+    }
+}
+
+impl ProfileEditor {
+    /// The DPI stages of profile `index`, for the Sensor tab: a chip per stage,
+    /// one slider for the chosen chip, and a value that can be typed.
+    ///
+    /// It edits the same staged draft as the Profiles tab, so the two always
+    /// agree, and the edit goes out through `tick` like any other. Returns
+    /// commands to dispatch (a live DPI, a retry).
+    pub fn stages_ui(&mut self, ui: &mut egui::Ui, snap: &Snapshot, index: u8) -> Vec<Cmd> {
+        let mut cmds: Vec<Cmd> = Vec::new();
+        if !snap.has_profiles || snap.profile_format != 2 {
+            return cmds;
+        }
+        let Some(original) = snap.profiles.get(index as usize) else { return cmds };
+        let n_buttons = (snap.button_count as usize).min(original.buttons.len());
+        let base = Draft::from_profile(original, n_buttons);
+        self.resolve_writes(snap);
+        let state = self.writes.get(&index).map(|w| w.state.clone());
+        let mut st = stage_for(self.staged.remove(&index), &base);
+        let cap = snap.dpi_cap.clone();
+        let (min, max, step) = range_of(cap.as_ref());
+        // Which slot the mouse is on, if it says and the DPI agrees.
+        let active_slot = snap.dpi_stage().and(snap.dpi_index).map(|i| i as usize);
+
+        theme::section(ui, "DPI stages", |ui| {
+            let d = &mut st.draft;
+            let on = d.enabled_stages();
+            if on.is_empty() {
+                ui.label(
+                    egui::RichText::new("Every stage is disabled.").color(theme::BAD).size(12.5),
+                );
+                ui.add_space(4.0);
+            }
+            if !on.contains(&self.stage_sel) {
+                self.stage_sel = on.first().copied().unwrap_or(0);
+            }
+            let mut changed_slot: Option<usize> = None;
+
+            // The chips. Click to choose; double-click to type a value.
+            ui.horizontal_wrapped(|ui| {
+                for &i in &on {
+                    if self.stage_edit.as_ref().is_some_and(|(e, _)| *e == i) {
+                        let Some((_, text)) = self.stage_edit.as_mut() else { continue };
+                        let r = ui.add(
+                            egui::TextEdit::singleline(text)
+                                .desired_width(64.0)
+                                .hint_text("DPI"),
+                        );
+                        if !r.has_focus() && !r.lost_focus() {
+                            r.request_focus();
+                        }
+                        let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                        if esc {
+                            self.stage_edit = None;
+                        } else if enter || (r.lost_focus() && !esc) {
+                            let typed = text.trim().parse::<u32>().ok();
+                            self.stage_edit = None;
+                            if let Some(v) = typed {
+                                let v = snap_stage(cap.as_ref(), v.clamp(min as u32, max as u32) as u16);
+                                if d.dpi[i] != v {
+                                    d.dpi[i] = v;
+                                    changed_slot = Some(i);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let mark = if active_slot == Some(i) { " \u{2022}" } else { "" };
+                    let r = ui.selectable_label(self.stage_sel == i, format!("{}{mark}", d.dpi[i]));
+                    if r.clicked() {
+                        self.stage_sel = i;
+                    }
+                    if r.double_clicked() {
+                        self.stage_sel = i;
+                        self.stage_edit = Some((i, d.dpi[i].to_string()));
+                    }
+                }
+                if d.dpi.iter().filter(|v| **v != 0).count() < N_DPI
+                    && ui.button("+").on_hover_text("Add a stage").clicked()
+                {
+                    if let Some(slot) = free_slot(&d.dpi) {
+                        let existing: Vec<u16> = d.dpi.iter().copied().filter(|v| *v != 0).collect();
+                        d.dpi[slot] = new_stage_value(&existing, snap.dpi, cap.as_ref());
+                        self.stage_sel = slot;
+                        changed_slot = Some(slot);
+                    }
+                }
+            });
+
+            // The slider for the chosen one. A local copy, written back only on
+            // a change: egui's slider otherwise rounds an existing value to the
+            // step while painting and would rewrite the draft by being drawn.
+            if on.contains(&self.stage_sel) {
+                let i = self.stage_sel;
+                ui.add_space(10.0);
+                let mut v = d.dpi[i];
+                let w = ui.available_width();
+                ui.spacing_mut().slider_width = (w - 140.0).max(160.0);
+                let resp = ui.add(
+                    egui::Slider::new(&mut v, min..=max)
+                        .clamping(egui::SliderClamping::Edits)
+                        .step_by(step as f64)
+                        .suffix(" DPI"),
+                );
+                if resp.changed() {
+                    let v = snap_stage(cap.as_ref(), v);
+                    if d.dpi[i] != v {
+                        d.dpi[i] = v;
+                    }
+                }
+                // Live only once the drag lets go, as the main slider does: a
+                // command per frame would queue behind the worker for no gain.
+                if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+                    changed_slot = Some(i);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Use now").on_hover_text("Switch the mouse to this DPI").clicked() {
+                        cmds.push(Cmd::SetDpi(d.dpi[i]));
+                    }
+                    let can_drop = on.len() > 1;
+                    if ui
+                        .add_enabled(can_drop, egui::Button::new("Remove stage"))
+                        .on_disabled_hover_text("A profile needs at least one stage")
+                        .clicked()
+                    {
+                        d.dpi[i] = 0;
+                        d.fix_indices();
+                    }
+                });
+            }
+            // The mouse follows an edit to the stage it is on, so a drag is felt
+            // as it happens. Not flash: this is the live DPI, and it costs the
+            // mouse nothing.
+            if let Some(i) = changed_slot {
+                if active_slot == Some(i) && d.dpi[i] != 0 && d.dpi[i] != snap.dpi {
+                    cmds.push(Cmd::SetDpi(d.dpi[i]));
+                }
+            }
+
+            ui.add_space(8.0);
+            let hold = blocked(d, original);
+            let line = send_line(st.dirty(), state.as_ref(), hold, &self.safety);
+            let retry = matches!(line, Line::Failed(_) | Line::Unanswered) && hold.is_none();
+            send_line_ui(ui, &line, index);
+            if retry && ui.button("Try again").clicked() {
+                let dd = st.draft.clone();
+                self.start_write(index, &dd, original, snap, &mut cmds);
+            }
+            ui.add_space(4.0);
+            theme::hint(
+                ui,
+                &format!(
+                    "Read from the mouse: it accepts {min} to {max} DPI in steps of {step}. \
+                     Click a stage and drag, or double-click it to type a value; the dot is \
+                     the stage the mouse is on. Stages are the ones its DPI button cycles \
+                     through, in this order."
+                ),
+            );
+        });
+
+        if st.dirty() {
+            self.staged.insert(index, st);
+        } else {
+            self.drop_settled_write(index);
+        }
+        cmds
+    }
+}
+
+/// The one-line account of where an edit stands. Shared by this panel and the
+/// Sensor tab's stage editor, so both say the same thing.
+fn send_line_ui(ui: &mut egui::Ui, line: &Line, index: u8) {
+    let bad = |ui: &mut egui::Ui, t: &str| {
+        ui.label(egui::RichText::new(t).color(theme::BAD).size(13.0).strong());
+        ui.add_space(4.0);
+    };
+    match line {
+        Line::InSync => theme::hint(ui, "This profile matches what is on the mouse."),
+        Line::Soon => theme::hint(
+            ui,
+            &format!(
+                "Sending to profile {index} in a moment. Flash has finite endurance, so a \
+                 change goes out once you stop, not as you type."
+            ),
+        ),
+        Line::WaitingForBackup => theme::hint(
+            ui,
+            "Waiting for the safety backup to finish. Nothing is written before it.",
+        ),
+        Line::BackupFailed(why) => theme::hint(
+            ui,
+            &format!(
+                "Not sent: the safety backup could not be taken ({why}). The status bar \
+                 has the way to send anyway."
+            ),
+        ),
+        Line::Blocked(Blocked::NoLeftClick) => {
+            bad(ui, "Not sent: no button is bound to the left click.");
+            theme::hint(ui, "The mouse would not be able to click. Bind one under Buttons.");
+        }
+        Line::Blocked(Blocked::NoStages) => {
+            bad(ui, "Not sent: every stage is disabled.");
+            theme::hint(ui, "The profile needs at least one DPI stage.");
+        }
+        Line::Blocked(Blocked::BadChecksum) => {}
+        Line::Writing => theme::hint(
+            ui,
+            "Written; waiting for the mouse to confirm. The worker re-reads every sector \
+             after a write, which takes about a second. Your edits stay here until it \
+             answers.",
+        ),
+        Line::Failed(msg) => {
+            bad(ui, &format!("The write failed: {msg}"));
+            theme::hint(
+                ui,
+                "Your edits are still here, so nothing is lost. It will not be retried on \
+                 its own. Try again, or Revert to go back to what the mouse holds. A write \
+                 that reports an error may still have changed the sector: press Refresh in \
+                 the sidebar to see.",
+            );
+        }
+        Line::Unanswered => {
+            bad(ui, "No answer came back for this write.");
+            theme::hint(
+                ui,
+                "That says nothing about whether the mouse took it, so your edits are kept. \
+                 Press Refresh in the sidebar to see what the mouse holds, then Try again or \
+                 Revert.",
+            );
+        }
     }
 }
 
@@ -2370,5 +2735,183 @@ mod tests {
         let mut ed = mid_save(2, 5);
         ed.drop_settled_write(2);
         assert_eq!(state_of(&ed, 2), Some(WriteState::Waiting));
+    }
+
+    // ---- automatic sending ----
+
+    /// An editor holding one edit to profile 0 made at `t`, and the snapshot
+    /// it was made against.
+    fn edited_at(t: Instant) -> (ProfileEditor, Snapshot) {
+        let snap = paint_snapshot(50);
+        let mut ed = ProfileEditor::new();
+        let base = Draft::from_profile(&snap.profiles[0], 11);
+        let mut st = Staged::new(base);
+        st.draft.dpi[0] = 2400;
+        ed.staged.insert(0, st);
+        // The first look at the edit is what starts its quiet period.
+        let (cmds, _) = ed.tick(&snap, &Safety::Ready, false, t);
+        assert!(cmds.is_empty());
+        (ed, snap)
+    }
+
+    fn sent(c: &[Cmd]) -> usize {
+        c.iter().filter(|c| matches!(c, Cmd::WriteProfile { .. })).count()
+    }
+
+    #[test]
+    fn an_edit_is_sent_once_it_has_been_left_alone() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        let (c, wake) = ed.tick(&snap, &Safety::Ready, false, t + Duration::from_millis(1500));
+        assert_eq!(sent(&c), 0, "still inside the quiet period");
+        assert_eq!(wake, Some(Duration::from_millis(500)));
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + FLASH_QUIET);
+        assert_eq!(sent(&c), 1);
+        // Waiting on the answer: not sent a second time.
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + FLASH_QUIET * 3);
+        assert_eq!(sent(&c), 0);
+    }
+
+    #[test]
+    fn a_further_edit_pushes_the_send_back() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        ed.staged.get_mut(&0).unwrap().draft.dpi[0] = 2450;
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + Duration::from_millis(1900));
+        assert_eq!(sent(&c), 0);
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + Duration::from_millis(2500));
+        assert_eq!(sent(&c), 0, "the second edit restarted the wait");
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + Duration::from_millis(3900));
+        assert_eq!(sent(&c), 1);
+    }
+
+    #[test]
+    fn nothing_is_sent_before_the_backup_is_good() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        let late = t + Duration::from_secs(60);
+        for safety in [Safety::Pending, Safety::Failed("disk full".into())] {
+            let (c, _) = ed.tick(&snap, &safety, false, late);
+            assert_eq!(sent(&c), 0, "{safety:?}");
+        }
+        // And the moment it is, the edit that waited goes.
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, late);
+        assert_eq!(sent(&c), 1);
+    }
+
+    #[test]
+    fn it_waits_for_another_flash_write_to_finish() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        let late = t + Duration::from_secs(10);
+        let (c, _) = ed.tick(&snap, &Safety::Ready, true, late);
+        assert_eq!(sent(&c), 0);
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, late);
+        assert_eq!(sent(&c), 1);
+    }
+
+    #[test]
+    fn a_profile_that_cannot_click_is_never_sent() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        for b in ed.staged.get_mut(&0).unwrap().draft.buttons.iter_mut() {
+            *b = Button::mouse(3);
+        }
+        let late = t + Duration::from_secs(10);
+        ed.tick(&snap, &Safety::Ready, false, t + Duration::from_secs(1));
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, late);
+        assert_eq!(sent(&c), 0);
+    }
+
+    #[test]
+    fn a_failed_write_is_not_retried_on_its_own() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + FLASH_QUIET);
+        assert_eq!(sent(&c), 1);
+        let after = ed.writes[&0].after;
+        let mut failed = snap.clone();
+        failed.outcomes = vec![Outcome::failed(after + 1, CmdKind::WriteProfile(0), "boom")];
+        for n in 0..20u64 {
+            let (c, _) = ed.tick(&failed, &Safety::Ready, false, t + Duration::from_secs(10 + n));
+            assert_eq!(sent(&c), 0, "retried on tick {n}");
+        }
+        assert!(matches!(ed.writes[&0].state, WriteState::Failed(_)));
+        // A new edit is a new request, so that one does go.
+        ed.staged.get_mut(&0).unwrap().draft.dpi[0] = 3000;
+        let (c, _) = ed.tick(&failed, &Safety::Ready, false, t + Duration::from_secs(40));
+        assert_eq!(sent(&c), 0);
+        let (c, _) = ed.tick(&failed, &Safety::Ready, false, t + Duration::from_secs(43));
+        assert_eq!(sent(&c), 1);
+    }
+
+    #[test]
+    fn closing_the_window_sends_what_is_still_waiting() {
+        let t = Instant::now();
+        let (mut ed, snap) = edited_at(t);
+        assert_eq!(sent(&ed.flush(&snap, &Safety::Pending)), 0, "no backup, no write");
+        assert_eq!(sent(&ed.flush(&snap, &Safety::Ready)), 1);
+        assert_eq!(sent(&ed.flush(&snap, &Safety::Ready)), 0, "not twice");
+    }
+
+    #[test]
+    fn nothing_staged_means_nothing_sent() {
+        let snap = paint_snapshot(50);
+        let mut ed = ProfileEditor::new();
+        let t = Instant::now();
+        let (c, w) = ed.tick(&snap, &Safety::Ready, false, t + Duration::from_secs(99));
+        assert!(c.is_empty() && w.is_none());
+        assert!(ed.flush(&snap, &Safety::Ready).is_empty());
+    }
+
+    #[test]
+    fn the_status_line_says_why_nothing_has_gone() {
+        let r = Safety::Ready;
+        assert_eq!(send_line(false, None, None, &r), Line::InSync);
+        assert_eq!(send_line(true, None, None, &r), Line::Soon);
+        assert_eq!(send_line(true, None, None, &Safety::Pending), Line::WaitingForBackup);
+        assert_eq!(
+            send_line(true, None, Some(Blocked::NoLeftClick), &r),
+            Line::Blocked(Blocked::NoLeftClick)
+        );
+        assert_eq!(send_line(true, Some(&WriteState::Waiting), None, &r), Line::Writing);
+        assert_eq!(
+            send_line(true, Some(&WriteState::Failed("x".into())), None, &r),
+            Line::Failed("x".into())
+        );
+    }
+
+    #[test]
+    fn a_new_stage_goes_after_the_last_one() {
+        assert_eq!(free_slot(&[800, 1600, 0, 0, 0]), Some(2));
+        assert_eq!(free_slot(&[800, 0, 1600, 0, 0]), Some(3));
+        // Full at the end, a gap earlier: the gap, not nothing.
+        assert_eq!(free_slot(&[800, 0, 1600, 3200, 6400]), Some(1));
+        assert_eq!(free_slot(&[1, 2, 3, 4, 5]), None);
+        assert_eq!(free_slot(&[0; 5]), Some(0));
+    }
+
+    #[test]
+    fn a_new_stage_does_not_repeat_an_existing_value() {
+        let cap = Capability::Range { min: 100, max: 25600, step: 50 };
+        assert_eq!(new_stage_value(&[800, 1600], 2400, Some(&cap)), 2400);
+        assert_eq!(new_stage_value(&[800, 1600, 2400], 2400, Some(&cap)), 3200);
+        assert_eq!(new_stage_value(&[], 0, Some(&cap)), 1600);
+        // Off the grid is snapped before it is compared.
+        assert_eq!(new_stage_value(&[2400], 2410, Some(&cap)), 800);
+    }
+
+    #[test]
+    fn painting_the_stage_editor_stages_nothing_and_sends_nothing() {
+        use std::cell::RefCell;
+        let snap = paint_snapshot(400);
+        let ed = RefCell::new(ProfileEditor::new());
+        let cmds: RefCell<Vec<Cmd>> = RefCell::new(Vec::new());
+        egui::__run_test_ui(|ui| {
+            let out = ed.borrow_mut().stages_ui(ui, &snap, 0);
+            cmds.borrow_mut().extend(out);
+        });
+        assert!(cmds.borrow().is_empty());
+        assert!(!ed.borrow().dirty(), "drawing the sliders edited a stage");
     }
 }

@@ -132,3 +132,24 @@ agreed. **Not yet watched:** the profile button.
 
 A window opened before the build that added this keeps running the old code, so
 it will not follow anything until it is closed and reopened.
+
+## Changes sent by themselves
+
+The window has no Save or Apply buttons for the mouse. A change goes out once
+it has stopped changing: 0.3 s for a live colour, 2 s for anything that writes
+flash (`src/gui/autosend.rs`). Gates, all of which must hold for a flash write:
+no other flash write in flight; the once-per-launch safety backup has been
+taken (`src/backups.rs`, into `~/.local/share/logi/backups`, nothing written if
+the newest backup already matches); the profile still has a left click, a valid
+checksum and at least one DPI stage. A write that fails is shown with Try again
+and is never repeated automatically. Closing the window sends what is still
+waiting.
+
+The Sensor tab's DPI stages are the active profile's stored stages, edited
+through the same staged draft as the Profiles tab: chips to choose, a slider
+over the range the mouse reported, double-click to type, add and remove.
+
+Checked on the G502 HERO: the backup is written, is not duplicated on a second
+launch, and `logi restore` of it changes nothing; opening the window changes no
+byte of the mouse. **Not run on hardware:** an edit made in the window being
+sent. The write it uses is the one verified from the CLI.

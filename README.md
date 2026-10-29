@@ -20,16 +20,19 @@ Run `logi` for the window, or `logi --help` for the command line.
 ## What it does
 
 * **DPI.** The G502 HERO's sensor is continuous, 100 to 25600 in steps of 50,
-  not a handful of fixed stages. The window follows changes made outside it:
-  presses of the DPI button show up within a fraction of a second, and it shows
-  which stage is active.
+  not a handful of fixed stages, and the app reads that range off the mouse.
+  The Sensor tab edits the stages the DPI button cycles through: pick one and
+  drag, or double-click it and type, and add or remove stages. The window
+  follows changes made outside it: presses of the DPI button show up within a
+  fraction of a second, and it shows which stage is active.
 * **Report rate**, written to the active onboard profile.
 * **Lighting.** Off, fixed colour and breathing, set live or stored into a
   profile so it survives without any software. A few host-driven effects
   (rainbow, wave, pulse) while the app runs.
 * **Onboard profiles.** Read, edit and back up all five: name, DPI stages,
-  report rate, lighting, and the eleven buttons. Edits stage in memory and are
-  written by one explicit Save, then read back and verified.
+  report rate, lighting, and the eleven buttons. There is no Save button: a
+  change is sent to the mouse once you stop editing, then read back and
+  verified (see [Safety](#safety)).
 * **Button bindings.** Bind a physical button to a key or chord, typed text, a
   command, or another mouse button, either alongside its normal job or in place
   of it.
@@ -80,7 +83,7 @@ taken first.
 |---|---|
 | Host button bindings: the spy, silencing a button, the virtual input device | **no** |
 | The service acting on bindings | **no** |
-| Saving a profile to flash from the editor panel | **no** (the same write path was verified from the CLI) |
+| Changes sent to the mouse by themselves from the window (profile editor, stage editor, buttons, lighting) | **no** (the same write path was verified from the CLI; launching the window was checked to write nothing) |
 | The tray menu's actions | **no** |
 | A press of the mouse's own *profile* button showing up in the window | **not watched.** Expected through the periodic re-read; whether the mouse also announces it is unknown. Only the DPI buttons were pressed |
 | Any mouse other than the G502 HERO | **no** |
@@ -180,9 +183,14 @@ Button bindings live in `~/.config/logi/bindings.conf`.
 
 ## Safety
 
-* **Onboard profiles are flash with finite endurance.** The app never writes on
-  a keystroke or a drag. Take a backup first (`logi backup`), and do not script
-  profile writes in a loop.
+* **Onboard profiles are flash with finite endurance.** Changes in the window
+  are sent automatically, but never on a keystroke or a drag: two seconds after
+  you stop editing, one write at a time, and a write that fails is not retried
+  on its own. Before the first write each launch the app takes a backup of
+  every sector into `~/.local/share/logi/backups` (nothing is written if the
+  mouse has not changed since the newest one), and sends nothing until that has
+  worked; the status bar says so, and offers "Send anyway", if it cannot.
+  `logi restore <file>` puts one back. Do not script profile writes in a loop.
 * **The button remapping table survives unplugging.** Writing zeros to it leaves
   a mouse that moves but cannot click, and looks exactly like broken hardware.
   The code refuses that write; `logi bind reset` is the way back.
