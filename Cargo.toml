@@ -2,9 +2,13 @@
 name = "logi"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.89"
 description = "Driver and management app for Logitech mice, speaking HID++ 2.0"
 license = "MIT"
+repository = "https://github.com/bishwabikash/logi"
+readme = "README.md"
+keywords = ["logitech", "hidpp", "mouse", "linux", "g502"]
+categories = ["hardware-support", "command-line-utilities"]
 default-run = "logi"
 
 [[bin]]

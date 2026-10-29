@@ -1,195 +1,228 @@
 # logi
 
-A driver and management app for Logitech mice on Linux, written from scratch
-against the HID++ 2.0 protocol. One native binary with a
-graphical app and a command line in it; no daemon, no Python, no runtime
-dependencies beyond the system's own graphics libraries.
+A driver and management app for Logitech mice on Linux, written against the
+HID++ 2.0 protocol. One native binary: a window, a tray icon, a background
+service and a command line. No Python and no runtime dependencies beyond the
+system's own graphics libraries.
 
-Run it with no arguments for the app, or with a subcommand for the shell.
+Run `logi` for the window, or `logi --help` for the command line.
 
-## How this relates to libratbag and Piper
+> **Not affiliated with or endorsed by Logitech.** Logitech, G502 and G HUB are
+> trademarks of their owners. This project talks to the mouse directly and uses
+> none of Logitech's software.
 
-libratbag and Piper already cover basic DPI, lighting and button configuration
-for this mouse, and if that is all you need they are the mature choice. This
-project exists because the hardware exposes more than libratbag's model does:
+> **Version 0.1, tested on one mouse (a G502 HERO).** Read
+> [What has and has not been tested](#what-has-and-has-not-been-tested) before
+> pointing it at anything else, or before using button bindings.
 
-* **DPI is continuous**, 100–25600 in steps of 50. libratbag presents five
-  discrete stages. The device's own descriptor says otherwise, and this app
-  exposes the full range.
-* **Breathing is fully parameterised** — period plus seven waveforms (sine,
-  square, triangle, sawtooth, sharkfin, exponential, default) — rather than an
-  on/off toggle.
-* **Host-streamed effects** that the firmware cannot do on its own.
-* **Whole-device backup and restore** of all 16 flash sectors, including the
-  profile directory.
+## What it does
+
+* **DPI.** The G502 HERO's sensor is continuous, 100 to 25600 in steps of 50,
+  not a handful of fixed stages. The window follows changes made outside it,
+  including the DPI and profile buttons on the mouse, and shows which stage is
+  active.
+* **Report rate**, written to the active onboard profile.
+* **Lighting.** Off, fixed colour and breathing, set live or stored into a
+  profile so it survives without any software. A few host-driven effects
+  (rainbow, wave, pulse) while the app runs.
+* **Onboard profiles.** Read, edit and back up all five: name, DPI stages,
+  report rate, lighting, and the eleven buttons. Edits stage in memory and are
+  written by one explicit Save, then read back and verified.
+* **Button bindings.** Bind a physical button to a key or chord, typed text, a
+  command, or another mouse button, either alongside its normal job or in place
+  of it.
+* **Per-application profiles.** Switch profile while a given program is running.
+* **A tray icon** showing the service state, with a menu.
+* **No model whitelist.** Any Logitech device that answers HID++ is listed by
+  `logi devices`, and gets exactly the controls its own feature table reports.
+
+## How this relates to libratbag, Piper and Solaar
+
+[libratbag](https://github.com/libratbag/libratbag) with
+[Piper](https://github.com/libratbag/piper) already covers basic DPI, lighting
+and button configuration for many mice, and [Solaar](https://github.com/pwr-Solaar/Solaar)
+covers Logitech receivers and a wide range of devices. If that is all you need,
+they are the mature choice.
+
+This project goes further on one device, because the hardware exposes more than
+their models do: continuous DPI, parameterised breathing, whole-device backup
+and restore, host-driven effects, and live following of the mouse.
 
 The LED, profile and button byte layouts and the sector CRC were confirmed
-against libratbag's implementation of the same hardware; it is a far better
-protocol reference than anything Logitech publishes. See
-<https://github.com/libratbag/libratbag>.
+against libratbag's implementation of the same hardware, and the two
+announcements the mouse sends were taken from Solaar's notification handling.
+No code was copied from either; the protocol facts are written up in
+[PROTOCOL.md](PROTOCOL.md).
 
-## Hardware
+## What has and has not been tested
 
-There is no model whitelist. Any Logitech device whose hidraw node answers the
-HID++ root feature is usable, and what it can do is read from its own feature
-table — so a device nobody has tested gets exactly the controls it reports and
-nothing else. `logi devices` lists what is attached:
+Everything below was run against **one G502 HERO** (046d:c08b, firmware U1
+v27.03), and every write was reverted and the device checked against a backup
+taken first.
 
-```
-046d:c08b  G502 HERO Gaming Mouse
-    type      : mouse
-    features  : dpi, rate, rgb, profiles, buttons (19 total)
-    restricted: 0x18a1 0x1e00 0x1e22 0x1eb0 ... (not touched)
-```
+| Verified on the mouse | |
+|---|---|
+| Discovery, capability probing, naming from the device | yes |
+| DPI across the full range, with snapping | yes |
+| Report rate, live and written to a profile | yes |
+| Lighting: off, fixed, breathing, both zones, live | yes |
+| Host-driven effects | yes |
+| Profile decode, backup, restore, flash writes with readback | yes |
+| Button rebinding in flash | yes |
+| Per-application profile switching | yes |
+| The window following DPI and profile changes made by another process | yes |
+| The tray icon registering with GNOME | yes |
 
-The name comes from the device itself (feature `0x0005`), not a table here.
-With more than one attached, pick one with `G502_DEVICE=046d:c08b`.
+| **Implemented and unit-tested, never run against hardware** | |
+|---|---|
+| Host button bindings: the spy, silencing a button, the virtual input device | **no** |
+| The service acting on bindings | **no** |
+| Saving a profile to flash from the editor panel | **no** (the same write path was verified from the CLI) |
+| The tray menu's actions | **no** |
+| A press of the mouse's own DPI or profile button showing up in the window | **not watched directly.** Expected, because the window re-reads the device about every second and a half; whether the mouse also announces the press is unknown |
+| Any mouse other than the G502 HERO | **no** |
 
-**Verified on 046d:c08b** (G502 HERO), firmware `U1 v27.03`, HID++ 4.2. Other
-models should work to the extent their feature tables overlap, but nothing
-else has been tried, and one limit is known in advance: the 256-byte profile
-sector decoder handles `profile_format_id` 2 only. On a device reporting a
-different format, profile switching still works while the contents are not
-decoded and nothing is written to flash.
+The suite has about 420 unit tests, none of which need hardware. They check the
+logic, not the device.
 
-## Build and install
+**Silencing a button is the riskiest untested part.** It rewrites a table on the
+mouse that survives unplugging, and it rests on how that table's values are
+read. If a button stops responding, `logi bind reset` restores the factory
+mapping.
 
-Needs a Rust toolchain. No `-dev` packages: winit dlopens X11, Wayland and
-xkbcommon at runtime, so the build works on a machine with only the runtime
-libraries present.
+## Install
+
+You need a Rust toolchain, 1.89 or newer. The build needs no `-dev` packages:
+the windowing library loads X11, Wayland and xkbcommon at run time.
 
 ```
 cargo build --release
 packaging/install.sh
 ```
 
-Then **unplug and replug the mouse**. `udevadm trigger` re-runs the rules, but
-a node that is already open keeps its old permissions, so the replug is what
-actually grants access.
+Then **unplug and replug the mouse.** The rules take effect when the device is
+added, and a node that is already open keeps its old permissions.
 
-`install.sh` does two independent things, either skippable with `--no-udev` or
-`--no-bin`: it installs the udev rule to `/etc/udev/rules.d` (this is the only
-step needing sudo), and copies the binary plus a desktop entry under `PREFIX`,
-which defaults to `~/.local`. You do not have to install anything to use the
-project — `./target/release/logi` runs from the build directory.
+`install.sh` does three independent things, each skippable with `--no-udev`,
+`--no-bin` or `--no-service`:
 
-## Command line
+* installs two udev rules to `/etc/udev/rules.d` so the mouse and `/dev/uinput`
+  work without root, loads the `uinput` module and arranges for it at boot
+  (this is the only part needing sudo, and the only one that cannot be done
+  from inside the app);
+* copies the binary and a desktop entry under `~/.local`;
+* installs a systemd user service, enables it and starts it.
+
+You can skip it entirely and run `./target/release/logi`; the rules are only
+what removes the need for `sudo`. The rules grant access through your session
+(`uaccess`) and the `plugdev` group, and match on vendor and product only. Why
+not narrower is explained in the rule file.
+
+To remove it: `systemctl --user disable --now logi`, then delete
+`~/.config/systemd/user/logi.service`, `~/.local/bin/logi`,
+`~/.local/share/applications/logi.desktop`, `~/.config/logi/`, the two
+`/etc/udev/rules.d/99-logi*.rules` files, and `/etc/modules-load.d/uinput.conf`.
+
+## Using it
+
+The window has tabs for Sensor, Lighting, Profiles, Buttons, Apps, Service and
+About. The sidebar has the **memory mode** switch. In onboard mode the mouse
+drives itself from its stored profile; in host mode the app drives the
+lighting, and the stored profile is not applied. Host mode does not affect
+buttons or movement.
+
+Some of the command line:
 
 ```
-logi info                   capabilities and current state
-logi dpi 1600               set DPI; snapped to the nearest step and reported
-logi rate 1000              125/250/500/1000 Hz, written to the active profile
-logi rate 1000 --live       set it live instead (host mode, not persistent)
-logi mode onboard           hand the mouse back after live lighting
-logi button                 list bindings
-logi button 10 dpi-cycle    rebind a button (writes flash)
-logi watch                  per-application profile switching
-logi profile 2              switch the active onboard profile
-logi profile show 0         decode a stored profile, buttons and all
-logi led cyan               solid colour, both zones
-logi led breathing ff0066   breathing
-logi led off
-logi effect rainbow         stream an animation until Ctrl-C
-logi backup mouse.json      dump all 16 sectors
-logi restore mouse.json
+logi devices                 every Logitech HID++ device and what it can do
+logi info                    capabilities and current state
+logi state --follow          print a line each time the mouse's state changes
+logi dpi 1600                set DPI, snapped to the sensor's step
+logi rate 1000               written to the active profile; --live for host mode
+logi profile 2               switch the active onboard profile
+logi profile show 0          decode a stored profile
+logi led purple              live lighting; also: breathing <colour>, off
+logi effect rainbow          stream an animation until Ctrl-C
+logi backup mouse.json       dump all sectors; `logi restore` writes them back
+logi bind                    show button bindings; `bind run`, `bind reset`
+logi watch                   per-application profiles (see below)
 ```
 
-## What each module does
+With more than one device attached, choose with `LOGI_DEVICE=046d:c08b`.
 
-| File | Role |
-|---|---|
-| `src/hidpp.rs` | HID++ 2.0 transport: short/long reports, software-id matching, typed errors |
-| `src/discover.rs` | Finds the HID++ endpoint by probing — a G502 has two, only one answers |
-| `src/features.rs` | Feature-id table and type flags |
-| `src/dpi.rs` | 0x2201, including the range-vs-list descriptor decode |
-| `src/rate.rs` | 0x8060 |
-| `src/led.rs` | 0x8070, both zones, per-mode parameter layouts |
-| `src/profiles.rs` | 0x8100: mode, profile switching, sector reads |
-| `src/profile_blob.rs` | The 256-byte profile sector codec and its CRC |
-| `src/profile_io.rs` | Flash writes with readback verification, backup and restore |
-| `src/effects.rs` | Host-side animation |
-| `src/appwatch.rs` | Per-application profile rules, debounced, /proc based |
-| `src/device.rs` | Worker thread owning the device, so the UI never blocks on I/O |
-| `src/gui/` | egui front end |
-
-`PROTOCOL.md` documents the protocol itself, marking every fact as either
-probed from the device or taken from libratbag. Start there rather than reading
-the code if you want to port this elsewhere.
-
-Everything above the protocol layer has been exercised against a real G502
-HERO: reads, DPI and rate changes, profile switching, live lighting, host-side
-effects, button rebinding and profile flash writes, each reverted afterwards
-and confirmed byte-identical to a backup taken first.
-
-`python-reference/` holds the original Python implementation. It is the
-validated reference the Rust was ported from, not something you need to run.
-
-### Per-application rules
-
-`logi watch` reads `~/.config/logi/rules.conf` and writes an annotated example
-there on first run. One `pattern = profile[,dpi]` per line; the first match
-wins, so put specific patterns first.
+The service and `logi watch` read `~/.config/logi/rules.conf`, one
+`pattern = profile[,dpi]` per line, first match wins:
 
 ```
 csgo     = 1, 800
 blender  = 2
 fallback = 0
-poll_ms  = 1000
 ```
 
-## Limitations
+Matching is on whether a program is *running*, not whether it is focused,
+because Wayland does not let an ordinary process see the active window.
+Button bindings live in `~/.config/logi/bindings.conf`.
 
-These are properties of the hardware, not things left to do.
+## Safety
 
-* **The firmware implements four lighting modes**: off, fixed, breathing and
-  cycle. `WAVE`, `STARLIGHT`, `RIPPLE` and `CUSTOM` are defined by HID++ but
-  absent on this device. Since `CUSTOM` is the frame-streaming mode, there is
-  no way to push an animation into the mouse and let it run.
-* **Animated effects therefore stop when the app stops.** They are streamed as
-  solid-colour writes at 30 fps. Lighting stored into an onboard profile does
-  persist without any software, and into Windows.
-* **Live lighting needs host mode.** In onboard mode the LEDs follow the stored
-  profile and 0x8070 writes are ignored. The app switches modes for you and
-  always switches back, including on Ctrl-C and on error — otherwise the
-  mouse's lighting would depend on a process that is gone.
-* **`getZoneEffect` is not implemented** on this device (`ext_caps` 0x0000). It
-  answers with zeros rather than an error, so a zero readback says nothing
-  about whether a write landed. Confirm lighting by eye.
-* **Only fixed and breathing can be set live.** `setZoneEffect` addresses
-  effects by the zone's *effect index*, not the mode id, and this firmware
-  rejects index 0 (off) and index 3 (cycle) under every parameter layout
-  tested. Live "off" is therefore a fixed black, and live cycling has to be
-  streamed from the host. Both modes are still storable in a profile sector,
-  which uses mode ids rather than indices — two number spaces that are easy to
-  conflate.
-* **The report rate cannot be set live in onboard mode** — the device answers
-  `invalid argument`. `logi rate` therefore writes it into the active profile,
-  which is also the only way to make it persist. `--live` takes host mode
-  instead.
-* **Per-application switching matches running processes, not the focused
-  window.** Wayland does not let an ordinary process see the active window, so
-  a rule means "while this program is open".
-* **Surface tuning, lift-off distance and angle snapping are out of scope.**
-  They are not standalone HID++ features here — G HUB drives them through the
-  `engineering`-flagged `TDE_ACCESS` (0x1eb0) and `SPI_DIRECT_ACCESS` (0x1e22),
-  writing sensor registers directly. A wrong write there is not recoverable
-  from userspace.
-* **Firmware update (DFU) is out of scope**, for the same reason.
-* **Button rebinding is CLI and flash only**; the GUI's Buttons tab decodes
-  bindings but does not yet edit them.
-* Onboard profile writes are flash writes with finite endurance. Take a backup
-  first, and do not script them in a loop.
+* **Onboard profiles are flash with finite endurance.** The app never writes on
+  a keystroke or a drag. Take a backup first (`logi backup`), and do not script
+  profile writes in a loop.
+* **The button remapping table survives unplugging.** Writing zeros to it leaves
+  a mouse that moves but cannot click, and looks exactly like broken hardware.
+  The code refuses that write; `logi bind reset` is the way back.
+* **Do not probe unknown HID++ functions with empty parameters.** Some are
+  setters. Doing exactly that is how both of the above were first found.
+* **Surface tuning, lift-off distance and firmware update are deliberately not
+  implemented.** See below.
 
-## Status
+## Limits of the hardware
 
-| Feature | State |
+These are properties of the G502 HERO's firmware, not things left to do.
+
+* It implements four lighting modes: off, fixed, breathing and cycle. Wave,
+  starlight, ripple and frame streaming are defined by HID++ but absent. So
+  richer animation is streamed from the host and **stops when the app stops**.
+* Only fixed and breathing can be set live. `setZoneEffect` addresses an effect
+  by the zone's *effect index*, not its mode id, and the firmware rejects off
+  and cycle at that call. Both can be stored in a profile, which takes mode ids.
+* Live lighting and live report rate need host mode; onboard mode ignores them.
+* `getZoneEffect` is not implemented, and answers with zeros rather than an
+  error. A zero readback says nothing about whether a write landed.
+* Surface tuning, lift-off distance and angle snapping are not standalone
+  features here, and the likely route to them rewrites sensor registers in a way
+  that cannot be undone from the host. Firmware update is out for the same
+  reason.
+
+## Layout
+
+| Path | Role |
 |---|---|
-| DPI, report rate, profile switching | working |
-| Lighting: off, fixed, breathing, cycle, both zones | working |
-| Host-streamed effects | working |
-| Profile decode, backup, restore | working |
-| Profile flash writes | working, readback-verified on hardware |
-| GUI: sensor, lighting, profiles, buttons | working |
-| Button rebinding, CLI and GUI | working |
-| Per-application profile switching | working |
-| Surface tuning / lift-off / DFU | out of scope, see above |
+| `src/hidpp.rs` | HID++ 2.0 transport: reports, software ids, hangup detection |
+| `src/discover.rs`, `capabilities.rs`, `deviceinfo.rs`, `features.rs` | Finding devices and reading what each can do |
+| `src/dpi.rs`, `rate.rs`, `led.rs`, `profiles.rs` | One feature each |
+| `src/profile_blob.rs`, `profile_io.rs` | The 256-byte profile sector and verified flash writes |
+| `src/buttonspy.rs`, `uinput.rs`, `actions.rs` | Button bindings |
+| `src/appwatch.rs`, `effects.rs` | Per-application rules and host-driven lighting |
+| `src/live.rs` | Following changes the mouse announces |
+| `src/device.rs` | The worker thread that owns the device |
+| `src/service.rs`, `tray.rs` | The systemd user unit and the tray icon |
+| `src/gui/` | The window |
+| `packaging/` | udev rules, desktop entry, service unit, installer |
+| `python-reference/` | The earlier Python implementation the Rust was ported from |
+
+[PROTOCOL.md](PROTOCOL.md) documents the protocol, marking each fact as probed
+from the device or taken from libratbag or Solaar. Start there rather than in
+the code if you want to port this. [PROGRESS.md](PROGRESS.md) records what is
+verified and what is not.
+
+## Contributing
+
+`cargo test` runs the suite and needs no hardware. If you have a Logitech mouse
+other than the G502 HERO, the most useful thing is the output of `logi devices`
+and `logi info` and a note of what worked. Be careful with anything that
+writes: take `logi backup` first.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

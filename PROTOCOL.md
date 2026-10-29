@@ -169,57 +169,41 @@ new mode. 50 ms was marginal — a lighting write issued immediately after the
 switch intermittently returned `invalid argument`. 150 ms was reliable across
 repeated runs. **[probed]**
 
+### Announcements
+
+0x8100 sends two unsolicited reports. The event id is the high nibble of byte
+3, and the software id in the low nibble is zero, which is what separates an
+event from the reply to somebody's request. **[Solaar; not yet confirmed on a
+G502 HERO]**
+
+| event | byte 3 | payload |
+|---|---|---|
+| 0, current profile changed | `0x00` | u16 big-endian profile sector |
+| 1, current DPI stage changed | `0x10` | the stage *index*, not a DPI |
+
+The DPI event carries an index, so the value has to be read afterwards. The
+mouse sends nothing for a change the host makes itself: changing the DPI or
+the profile over HID++ produced no announcement. **[probed]** Whether pressing
+the mouse's own DPI and profile buttons does is the open question. The app
+does not depend on it: it also re-reads the device about every second and a
+half, and shows a counter of announcements received (About tab, or
+`logi state --follow`) so a given mouse can be checked.
+
 ## Not covered
 
 **Surface tuning, lift-off distance, angle snapping.** These are not
-standalone HID++ features on this device — the feature table has no entry for
-them. G HUB implements them through the `engineering`-flagged features above
-(`TDE_ACCESS` 0x1eb0 / `SPI_DIRECT_ACCESS` 0x1e22), writing sensor
-registers directly. No open-source implementation exists, and a wrong write
-is not recoverable from userspace.
+standalone HID++ features on this device: the feature table has no entry for
+them. Logitech's own software is thought to drive them through the
+`engineering`-flagged features listed above (`TDE_ACCESS` 0x1eb0,
+`SPI_DIRECT_ACCESS` 0x1e22), which would mean writing sensor registers
+directly. That is a guess, not something this project observed. There is no
+open implementation, and a wrong write to registers like these is not
+recoverable from userspace, so this project does not touch them.
 
-The G HUB installer (`lghub_installer.exe`, 2026.4.9028.0,
-sha256 `4b2f9903…e811e1`) does **not** contain this code. It is a WiX Burn
-downloader chain: six embedded PE binaries, of which three are Burn
-bootstrappers (`burn.pdb`), one is `logi_installer_shared.dll`, and one is
-`lghub_sso_handler.exe`. Zero HID/HID++ strings in any of them. The agent that
-speaks to the device (`lghub_agent.exe`) is fetched at install time from
-Logitech's build pipeline and is not in the installer. Reverse engineering it
-requires obtaining that binary separately.
-
-### Why the agent binary is hard to obtain
-
-The three `.wixburn` bundles inside the installer are **Microsoft Visual C++
-2022 Runtime 14.42.34438** redistributables (x86/x64/arm64) plus the KB2999226
-Universal CRT CABs — bundled dependencies, not G HUB. Their Burn manifests
-carry **zero `DownloadUrl` attributes**, so the vcredists are fully embedded
-and nothing is fetched from them. The G HUB installer is itself not a Burn
-bundle, so WiX's `/layout` download-without-install flag does not apply; its
-only flags are `/install /repair /uninstall /quiet /passive /norestart /?`.
-
-`lghub_agent.exe` is pulled at install time from Logitech's "pipeline" depot:
-
-    pipeline://core/LGHUB/lghub_software_manager.exe
-
-Hosts referenced by `logi_installer_shared.dll`: `pipeline.logitech.io`
-(resolves to RFC1918 addresses — not publicly routable),
-`updates.ghub.logitechg.com` (CloudFront → S3), `2pipeline.s3.amazonaws.com`.
-Endpoints `/pipeline/v2/access/`, `/details.json`, `/content.json`,
-`/update.json`, `/updates/channel`.
-
-The S3 bucket denies `ListBucket` and returns a blanket `AccessDenied` for
-every key including bogus ones, so `NoSuchKey` is masked and response codes
-cannot be used to confirm a path. Blind key guessing is not viable. Even with
-a correct key, fetching is not a plain download: the DLL implements AWS
-SigV4-signed requests (`Authorization: …4-HMAC-SHA256 Credential=…`), RSA
-depot verification (`depot_verifier_rsa`), key rotation (`keymaster`,
-`keys_refresh_download_group`), encryption at rest (`DecryptedStream`,
-`CapsuleResourceProtectedStream`) and protobuf schemas
-`logi.protocol.updates.{Depot,Signature,KeyStatus,ContentRequest}`.
-
-The remaining practical route is to let the installer do the download itself
-inside a throwaway Wine prefix. On this host that is blocked on i386 multiarch
-(`wine32` missing), which is a system-level change.
+The G HUB installer does not contain the component that would answer the
+question: it downloads it at install time, and obtaining it was not pursued.
+Anyone who does go after it should treat these features as able to brick the
+device.
 
 ## 0x8110 MOUSE_BUTTON_SPY
 
