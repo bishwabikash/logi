@@ -414,10 +414,6 @@ impl Device {
         Ok(idx)
     }
 
-    pub fn has_feature(&mut self, id: u16) -> bool {
-        self.feature_index(id).is_ok()
-    }
-
     pub fn protocol_version(&mut self) -> Result<(u8, u8)> {
         let p = self.call(0x00, 0x01, &[])?;
         if p.len() < 2 {

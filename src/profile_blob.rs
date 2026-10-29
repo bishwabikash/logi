@@ -133,6 +133,7 @@ impl Button {
         special_code(name).map(|c| Button([BTN_SPECIAL, c, 0xFF, 0xFF]))
     }
 
+    #[cfg(test)]
     pub fn key(code: u8, modifiers: u8) -> Self {
         Button([BTN_HID, HID_KEYBOARD, modifiers, code])
     }
@@ -146,6 +147,7 @@ impl Button {
 pub struct Led(pub [u8; LED_RECORD]);
 
 impl Led {
+    #[cfg(test)]
     pub fn mode(&self) -> u8 {
         self.0[0]
     }

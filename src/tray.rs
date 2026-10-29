@@ -228,6 +228,7 @@ impl Status {
         self != other
     }
 
+    #[cfg(test)]
     /// The whole menu as plain text, in order, with `[*]` on checked items and
     /// `(disabled)` on dead ones.
     ///

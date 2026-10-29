@@ -709,11 +709,13 @@ impl ProfileEditor {
         }
     }
 
+    #[cfg(test)]
     /// True when any profile has unsaved edits, so the host can warn on exit.
     pub fn dirty(&self) -> bool {
         self.staged.values().any(Staged::dirty)
     }
 
+    #[cfg(test)]
     /// Which profiles have unsaved edits, for a more specific warning.
     pub fn dirty_profiles(&self) -> Vec<u8> {
         let mut v: Vec<u8> =
@@ -722,9 +724,39 @@ impl ProfileEditor {
         v
     }
 
+    #[cfg(test)]
     pub fn discard(&mut self) {
         self.staged.clear();
         self.auto.clear();
+    }
+
+    /// Stage a report rate for profile `index`, to be stored by the next
+    /// automatic send. The Sensor tab's rate buttons call this alongside the
+    /// live setter, so the rate holds after the mouse goes back to onboard mode.
+    pub fn set_rate(&mut self, snap: &Snapshot, index: u8, hz: u16) {
+        if snap.profile_format != 2 {
+            return;
+        }
+        let Some(original) = snap.profiles.get(index as usize) else { return };
+        let Ok(ms) = ReportRate::interval_ms(hz) else { return };
+        let n_buttons = (snap.button_count as usize).min(original.buttons.len());
+        let base = Draft::from_profile(original, n_buttons);
+        let mut st = stage_for(self.staged.remove(&index), &base);
+        st.draft.rate_ms = ms;
+        if st.dirty() {
+            self.staged.insert(index, st);
+        } else {
+            self.drop_settled_write(index);
+        }
+    }
+
+    /// The rate profile `index` will hold once everything staged is sent.
+    pub fn stored_rate_hz(&self, snap: &Snapshot, index: u8) -> Option<u16> {
+        let staged = self.staged.get(&index).map(|s| s.draft.report_rate_hz());
+        let read = snap.profiles.get(index as usize).map(|p| {
+            if p.report_rate_ms == 0 { 0 } else { 1000 / p.report_rate_ms as u16 }
+        });
+        staged.or(read).filter(|hz| *hz != 0)
     }
 
     /// Hand a draft to the worker and start tracking its answer.
@@ -2913,5 +2945,34 @@ mod tests {
         });
         assert!(cmds.borrow().is_empty());
         assert!(!ed.borrow().dirty(), "drawing the sliders edited a stage");
+    }
+
+    #[test]
+    fn a_rate_chosen_on_the_sensor_tab_is_stored_in_the_profile() {
+        let t = Instant::now();
+        let snap = paint_snapshot(50);
+        let mut ed = ProfileEditor::new();
+        let was = ed.stored_rate_hz(&snap, 0).unwrap();
+        let pick = if was == 500 { 250 } else { 500 };
+        ed.set_rate(&snap, 0, pick);
+        assert_eq!(ed.stored_rate_hz(&snap, 0), Some(pick));
+        assert!(ed.dirty());
+        // And it goes out by itself, like any other edit.
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t);
+        assert_eq!(sent(&c), 0);
+        let (c, _) = ed.tick(&snap, &Safety::Ready, false, t + FLASH_QUIET);
+        assert_eq!(sent(&c), 1);
+        // Choosing the rate it already has is not an edit.
+        let mut same = ProfileEditor::new();
+        same.set_rate(&snap, 0, was);
+        assert!(!same.dirty());
+    }
+
+    #[test]
+    fn a_rate_the_sector_cannot_hold_is_not_staged() {
+        let snap = paint_snapshot(50);
+        let mut ed = ProfileEditor::new();
+        ed.set_rate(&snap, 0, 333);
+        assert!(!ed.dirty());
     }
 }

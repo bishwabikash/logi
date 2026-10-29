@@ -110,8 +110,9 @@ first, then describe what led up to it.
 * **Comments say why**, not what. The reasoning behind an odd choice (a delay, a
   refusal, an ordering) belongs next to it, because the odd choices are mostly
   scars.
-* **Do not add new compiler warnings.** There are a few dozen today, mostly
-  unused code.
+* **No compiler warnings.** The tree has none and CI builds with
+  `-D warnings`. Code only a test uses is `#[cfg(test)]`; unused code is
+  deleted, not silenced.
 * **No model whitelist.** Behaviour comes from the device's own feature table. A
   control the device does not report is hidden or disabled with a reason, never
   shown as a button that errors.

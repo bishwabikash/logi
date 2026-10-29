@@ -312,30 +312,8 @@ fn open_error(e: io::Error) -> io::Error {
     }
 }
 
-// Modifiers, named here because chord building and is_modifier both need them.
-pub const KEY_LEFTCTRL: u16 = 29;
+// Named because chord building presses shift itself.
 pub const KEY_LEFTSHIFT: u16 = 42;
-pub const KEY_LEFTALT: u16 = 56;
-pub const KEY_RIGHTCTRL: u16 = 97;
-pub const KEY_RIGHTSHIFT: u16 = 54;
-pub const KEY_RIGHTALT: u16 = 100;
-pub const KEY_LEFTMETA: u16 = 125;
-pub const KEY_RIGHTMETA: u16 = 126;
-
-/// Which key codes are modifiers, for chord building.
-pub fn is_modifier(code: u16) -> bool {
-    matches!(
-        code,
-        KEY_LEFTCTRL
-            | KEY_RIGHTCTRL
-            | KEY_LEFTSHIFT
-            | KEY_RIGHTSHIFT
-            | KEY_LEFTALT
-            | KEY_RIGHTALT
-            | KEY_LEFTMETA
-            | KEY_RIGHTMETA
-    )
-}
 
 /// Canonical name to code. One entry per code: `key_name` reverses this, so a
 /// second spelling of a code belongs in `ALIASES`, not here.
@@ -622,7 +600,7 @@ mod tests {
 
     #[test]
     fn lookup_is_case_insensitive_and_takes_kernel_spellings() {
-        assert_eq!(key_code("CTRL"), Some(KEY_LEFTCTRL));
+        assert_eq!(key_code("CTRL"), Some(29));
         assert_eq!(key_code(" F5 "), key_code("f5"));
         assert_eq!(key_code("KEY_A"), key_code("a"));
         assert_eq!(key_code("BTN_LEFT"), Some(0x110));
@@ -642,12 +620,12 @@ mod tests {
     }
 
     #[test]
-    fn modifiers_are_recognised_and_ordinary_keys_are_not() {
-        for n in ["ctrl", "rctrl", "shift", "rshift", "alt", "altgr", "super", "rmeta"] {
-            assert!(is_modifier(key_code(n).unwrap()), "{n}");
-        }
-        for n in ["a", "f5", "space", "btn_left", "capslock"] {
-            assert!(!is_modifier(key_code(n).unwrap()), "{n}");
+    fn modifier_names_map_to_their_kernel_codes() {
+        for (n, code) in [
+            ("ctrl", 29), ("rctrl", 97), ("shift", 42), ("rshift", 54),
+            ("alt", 56), ("altgr", 100), ("super", 125), ("rmeta", 126),
+        ] {
+            assert_eq!(key_code(n), Some(code), "{n}");
         }
     }
 

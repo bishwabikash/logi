@@ -32,6 +32,7 @@ pub struct Rule {
 }
 
 impl Rule {
+    #[cfg(test)]
     pub fn new(pattern: impl Into<String>, profile: u8) -> Self {
         Rule { pattern: pattern.into(), profile, dpi: None }
     }
@@ -147,10 +148,6 @@ pub struct Watcher {
 impl Watcher {
     pub fn new(cfg: Config) -> Self {
         Watcher { cfg, applied: None, candidate: None }
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.cfg
     }
 
     /// Feed a process list and the current time; get back what to do.

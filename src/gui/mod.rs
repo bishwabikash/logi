@@ -1207,22 +1207,31 @@ impl App {
                         .selectable_label(self.snap.rate == hz, format!("{hz} Hz"))
                         .clicked()
                     {
+                        // Live, so it takes effect now, and into the active
+                        // profile, so it is still the rate once the mouse is
+                        // back on its own. The second goes out by itself.
                         self.dev.send(Cmd::SetRate(hz));
+                        let snap = self.snap.clone();
+                        self.profile_editor.set_rate(&snap, snap.active_profile, hz);
                     }
                 }
             });
+            if let Some(stored) =
+                self.profile_editor.stored_rate_hz(&self.snap, self.snap.active_profile)
+            {
+                ui.add_space(6.0);
+                theme::hint(
+                    ui,
+                    &format!("Stored in profile {}: {stored} Hz.", self.snap.active_profile),
+                );
+            }
             ui.add_space(8.0);
-            // What this button actually sends is `setReportRate`, the live
-            // setter. It does not touch the profile, and PROTOCOL.md has it
-            // measured: in onboard mode the device answers invalid argument,
-            // and a rate set live is lost the moment it goes back. The old
-            // wording here promised the opposite, which is the profile
-            // editor's job, not this one's.
             theme::hint(
                 ui,
-                "Sets the rate live. The mouse only accepts that in host mode, and forgets \
-                 it on the way back to onboard. To make a rate stick, set it on the \
-                 Profiles tab: that writes byte 0 of the profile sector.",
+                "A rate is set live, which switches the mouse to host mode (the mouse \
+                 refuses it otherwise), and stored in the active profile in the same \
+                 step, so it is the rate when the mouse is back on its own. The profile \
+                 write goes out by itself a moment later.",
             );
         });
     }
@@ -1864,13 +1873,35 @@ impl App {
                 }
             });
 
-            if st == State::NotInstalled {
+            // The unit file lives in the user's own home, so writing it needs
+            // no sudo and no terminal. Only the udev rules do, and those are
+            // about the mouse being openable at all, not about this service.
+            let has_unit = self.service.unit_file_exists();
+            let idle = known && self.service.busy().is_none();
+            if idle && !has_unit {
                 ui.add_space(10.0);
+                if ui.button("Install the service").clicked() {
+                    self.service.request(Action::Install);
+                }
+                ui.add_space(6.0);
                 theme::hint(
                     ui,
-                    "The unit file is not installed. Run packaging/install.sh once; it \
-                     needs sudo for the udev rules, which is why the app cannot do it.",
+                    "Writes one file, ~/.config/systemd/user/logi.service, pointing at this \
+                     program, and reloads systemd. Then Start and Start at login work. The \
+                     udev rules that let you open the mouse without sudo are separate: \
+                     packaging/install.sh adds them.",
                 );
+            }
+            // Offered only when installing was refused because a different unit
+            // file is already there: replacing one is the user's call.
+            if idle
+                && has_unit
+                && self.service.last_error().is_some_and(|e| e.contains("Reinstall"))
+            {
+                ui.add_space(10.0);
+                if ui.button("Reinstall (replace the existing file)").clicked() {
+                    self.service.request(Action::Reinstall);
+                }
             }
             if let Some(e) = self.service.last_error() {
                 ui.add_space(8.0);
@@ -1904,6 +1935,9 @@ impl App {
         theme::section(ui, "Device", |ui| {
             theme::row(ui, "model", &self.snap.model);
             theme::row(ui, "node", &self.snap.path);
+            if !self.snap.firmware.is_empty() {
+                theme::row(ui, "firmware", &self.snap.firmware);
+            }
             theme::row(ui, "HID++", &self.snap.protocol);
             theme::row(ui, "mode", crate::profiles::mode_name(self.snap.mode));
         });

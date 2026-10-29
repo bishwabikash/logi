@@ -153,3 +153,20 @@ Checked on the G502 HERO: the backup is written, is not duplicated on a second
 launch, and `logi restore` of it changes nothing; opening the window changes no
 byte of the mouse. **Not run on hardware:** an edit made in the window being
 sent. The write it uses is the one verified from the CLI.
+
+## Report rate from the Sensor tab
+
+The live rate setter is refused by the mouse outside host mode, and the Sensor
+tab used to send it without going there first, so in onboard mode a click did
+nothing. It now switches to host mode first (as the lighting commands do) and
+also stages the rate into the active profile, which is then sent like any other
+edit. Checked on the G502 HERO with the CLI: a rate stored in a profile applies
+once the mouse returns to onboard mode (500 Hz read back after host then
+onboard), and the original state was restored byte for byte.
+
+## Warnings
+
+The tree builds with no warnings and CI denies them. Dead code was deleted or
+made `#[cfg(test)]`; the firmware version is now read at connect and shown on
+the About tab, and the Service tab can install and reinstall the user unit
+itself.

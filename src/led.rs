@@ -61,10 +61,6 @@ pub const WAVEFORMS: &[(&str, u8)] = &[
     ("exponential", 0x06),
 ];
 
-pub fn waveform_id(name: &str) -> Option<u8> {
-    WAVEFORMS.iter().find(|(n, _)| *n == name).map(|(_, v)| *v)
-}
-
 pub fn waveform_name(id: u8) -> &'static str {
     WAVEFORMS.iter().find(|(_, v)| *v == id).map(|(n, _)| *n).unwrap_or("?")
 }
@@ -136,7 +132,6 @@ pub struct Zone {
     pub index: u8,
     pub location: u16,
     pub num_effects: u8,
-    pub persistency_caps: u8,
     /// Mode ids the firmware actually implements.
     pub modes: Vec<u8>,
 }
@@ -150,7 +145,6 @@ impl Zone {
 pub struct Leds {
     idx: u8,
     pub zone_count: u8,
-    pub nv_caps: u16,
     pub ext_caps: u16,
     pub zones: Vec<Zone>,
 }
@@ -166,7 +160,6 @@ impl Leds {
         let mut me = Leds {
             idx,
             zone_count: info[0],
-            nv_caps: u16::from_be_bytes([info[1], info[2]]),
             ext_caps: u16::from_be_bytes([info[3], info[4]]),
             zones: Vec::new(),
         };
@@ -190,7 +183,6 @@ impl Leds {
             index: p[0],
             location: u16::from_be_bytes([p[1], p[2]]),
             num_effects: p[3],
-            persistency_caps: p[4],
             modes: Vec::new(),
         };
         for e in 0..zone.num_effects {

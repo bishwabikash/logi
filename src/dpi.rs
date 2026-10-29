@@ -3,7 +3,6 @@
 use crate::features;
 use crate::hidpp::{Device, Error, Result};
 
-const GET_SENSOR_COUNT: u8 = 0x00;
 const GET_SENSOR_DPI_LIST: u8 = 0x01;
 const GET_SENSOR_DPI: u8 = 0x02;
 const SET_SENSOR_DPI: u8 = 0x03;
@@ -62,10 +61,6 @@ impl Dpi {
         Ok(Dpi { idx: dev.feature_index(features::ADJUSTABLE_DPI)? })
     }
 
-    pub fn sensor_count(&self, dev: &mut Device) -> Result<u8> {
-        Ok(dev.call(self.idx, GET_SENSOR_COUNT, &[])?.first().copied().unwrap_or(0))
-    }
-
     pub fn capability(&self, dev: &mut Device, sensor: u8) -> Result<Capability> {
         let p = dev.call(self.idx, GET_SENSOR_DPI_LIST, &[sensor])?;
         let mut values = Vec::new();
@@ -99,14 +94,6 @@ impl Dpi {
             return Err(Error::Protocol("short getSensorDpi reply".into()));
         }
         Ok(u16::from_be_bytes([p[1], p[2]]))
-    }
-
-    pub fn default(&self, dev: &mut Device, sensor: u8) -> Result<u16> {
-        let p = dev.call(self.idx, GET_SENSOR_DPI, &[sensor])?;
-        if p.len() < 5 {
-            return Err(Error::Protocol("short getSensorDpi reply".into()));
-        }
-        Ok(u16::from_be_bytes([p[3], p[4]]))
     }
 
     pub fn set(&self, dev: &mut Device, dpi: u16, sensor: u8) -> Result<u16> {

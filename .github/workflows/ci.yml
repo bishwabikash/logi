@@ -23,10 +23,15 @@ jobs:
       # No -dev packages are installed: the windowing library loads X11,
       # Wayland and xkbcommon at run time, so a bare runner builds it. The
       # tests need no mouse; they check logic, not the device.
+      # Warnings fail the build: the tree is warning-free, and this keeps it so.
       - name: Build
         run: cargo build --release --locked
+        env:
+          RUSTFLAGS: -D warnings
       - name: Test
         run: cargo test --locked
+        env:
+          RUSTFLAGS: -D warnings
 
   # The manifest and README promise a minimum Rust version. This is what keeps
   # that promise honest: the number was worked out from the dependency tree and

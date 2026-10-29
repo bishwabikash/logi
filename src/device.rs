@@ -298,6 +298,7 @@ impl Snapshot {
         Some((pos, total))
     }
 
+    #[cfg(test)]
     pub fn outcome(&self, id: CmdId) -> Option<&Outcome> {
         self.outcomes.iter().find(|o| o.id == id)
     }
@@ -462,15 +463,6 @@ impl Handle {
         id
     }
 
-    /// The id the next `send` will hand out.
-    ///
-    /// For a caller that cannot keep what `send` returned — the GUI dispatches
-    /// several panels' commands through one loop — this is the other way to
-    /// bound the search of `Snapshot::outcomes` from below.
-    pub fn next_id(&self) -> CmdId {
-        self.next_id.load(Ordering::Relaxed)
-    }
-
     pub fn host_held(&self) -> bool {
         self.host_held.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -600,6 +592,8 @@ struct Live {
     dev: Device,
     name: String,
     kind: String,
+    /// Read once at connect: it does not change while plugged in.
+    firmware: String,
     caps: crate::capabilities::Capabilities,
     // Each is present only if the device's own feature table reports it, so an
     // arbitrary Logitech mouse gets exactly the controls it supports.
@@ -634,18 +628,6 @@ macro_rules! feat {
 }
 
 impl Live {
-    fn leds(&self) -> crate::hidpp::Result<&Leds> {
-        self.leds.as_ref().ok_or_else(|| missing("RGB lighting"))
-    }
-    fn dpi(&self) -> crate::hidpp::Result<&Dpi> {
-        self.dpi.as_ref().ok_or_else(|| missing("adjustable DPI"))
-    }
-    fn rate(&self) -> crate::hidpp::Result<&ReportRate> {
-        self.rate.as_ref().ok_or_else(|| missing("adjustable report rate"))
-    }
-    fn profiles(&self) -> crate::hidpp::Result<&OnboardProfiles> {
-        self.profiles.as_ref().ok_or_else(|| missing("onboard profiles"))
-    }
 }
 
 fn connect() -> Result<Live, String> {
@@ -667,10 +649,19 @@ fn connect() -> Result<Live, String> {
     let listener = profiles.as_ref().and_then(|p| {
         crate::live::Listener::spawn(&dev, p.feature_index(), Arc::clone(&pulse)).ok()
     });
+    // Read-only, and only when the device lists the feature. A failure leaves
+    // the line blank: the firmware version is information, not a control.
+    let firmware = caps
+        .firmware
+        .then(|| crate::deviceinfo::firmware(&mut dev).ok())
+        .flatten()
+        .map(|l| crate::deviceinfo::firmware_summary(&l))
+        .unwrap_or_default();
     Ok(Live {
         dev,
         name: found.name,
         kind: found.kind,
+        firmware,
         caps,
         leds,
         dpi,
@@ -694,6 +685,7 @@ fn read_state(l: &mut Live, into: &mut Snapshot) -> bool {
     into.connected = true;
     into.model = l.name.clone();
     into.kind = l.kind.clone();
+    into.firmware = l.firmware.clone();
     into.path = l.dev.path.clone();
     into.has_dpi = l.dpi.is_some();
     into.has_rate = l.rate.is_some();
@@ -1245,7 +1237,11 @@ fn worker(
                     })
                 })
             }),
-            Cmd::SetRate(hz) => feat!(l, rate, "adjustable report rate")
+            // The live setter is refused outside host mode (measured, see
+            // PROTOCOL.md), so it goes there first, as the lighting commands do.
+            // Without this a click on the Sensor tab got "invalid argument".
+            Cmd::SetRate(hz) => ensure_host(l)
+                .and_then(|_| feat!(l, rate, "adjustable report rate"))
                 .and_then(|(r, dev)| r.set(dev, hz).map(|_| Some(format!("{hz} Hz")))),
             Cmd::SetMode(m) => feat!(l, profiles, "onboard profiles").and_then(|(p, dev)| {
                 p.set_mode(dev, m)

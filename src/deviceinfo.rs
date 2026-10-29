@@ -76,6 +76,25 @@ pub struct Firmware {
     pub build: u16,
 }
 
+impl Firmware {
+    /// "U1 27.03 (build 31)" for one entity.
+    pub fn describe(&self) -> String {
+        format!("{} {} (build {})", self.prefix, self.version, self.build)
+    }
+}
+
+/// The firmware line shown for a device: the main entity, then any others
+/// ("bootloader U2 ...") after it. Empty when the device reported none.
+pub fn firmware_summary(list: &[Firmware]) -> String {
+    let main = list.iter().find(|f| f.kind == "main");
+    let rest = list.iter().filter(|f| f.kind != "main");
+    main.map(|f| f.describe())
+        .into_iter()
+        .chain(rest.map(|f| format!("{} {}", f.kind, f.describe())))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn firmware(dev: &mut Device) -> Result<Vec<Firmware>> {
     let idx = dev.feature_index(features::DEVICE_FW_VERSION)?;
     let n = dev.call(idx, FW_COUNT, &[])?.first().copied().unwrap_or(0);
@@ -116,4 +135,19 @@ pub fn firmware(dev: &mut Device) -> Result<Vec<Firmware>> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_firmware_line_leads_with_the_main_entity() {
+        let f = |kind: &str, prefix: &str, version: &str, build| Firmware {
+            kind: kind.into(), prefix: prefix.into(), version: version.into(), build,
+        };
+        let list = [f("bootloader", "BL", "01.02", 3), f("main", "U1", "27.03", 31)];
+        assert_eq!(firmware_summary(&list), "U1 27.03 (build 31), bootloader BL 01.02 (build 3)");
+        assert_eq!(firmware_summary(&[]), "");
+    }
 }

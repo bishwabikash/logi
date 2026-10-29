@@ -111,11 +111,6 @@ pub fn state() -> State {
     probe().state
 }
 
-/// Whether the unit is enabled, i.e. whether it starts at login.
-pub fn is_enabled() -> bool {
-    probe().enabled
-}
-
 pub fn start() -> Result<(), String> {
     verb("start")
 }
@@ -729,17 +724,10 @@ impl Watcher {
         self.get(|s| s.busy, None)
     }
 
+    #[cfg(test)]
     /// Changes whenever anything above changes.
     pub fn revision(&self) -> u64 {
         self.get(|s| s.rev, 0)
-    }
-
-    pub fn clear_messages(&self) {
-        if let Ok(mut s) = self.shared.lock() {
-            s.error = None;
-            s.notice = None;
-            s.rev = s.rev.wrapping_add(1);
-        }
     }
 
     /// Ask for an update. Returns immediately.

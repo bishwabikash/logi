@@ -2009,7 +2009,7 @@ mod tests {
     fn capture_does_not_survive_leaving_the_tab() {
         let ctx = egui::Context::default();
         let mut e = editor("");
-        let mut frame = |e: &mut BindingsEditor, draws_panel: bool| {
+        let frame = |e: &mut BindingsEditor, draws_panel: bool| {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     if draws_panel {

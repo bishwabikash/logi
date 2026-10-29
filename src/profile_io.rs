@@ -551,20 +551,3 @@ pub fn set_button(
     write_profile(dev, profiles, index, &p)?;
     Ok(())
 }
-
-/// Store lighting into a profile's flash sector, both zones and their alts.
-pub fn set_lighting(
-    dev: &mut Device,
-    profiles: &OnboardProfiles,
-    index: u8,
-    leds: [crate::profile_blob::Led; 2],
-) -> Result<()> {
-    let (blob, mut p) = load_profile(dev, profiles, index)?;
-    p.leds = leds;
-    p.alt_leds = leds;
-    if !changed(&p, &blob) {
-        return Ok(());
-    }
-    write_profile(dev, profiles, index, &p)?;
-    Ok(())
-}

@@ -16,29 +16,6 @@ pub const MEMORY_ADDR_WRITE: u8 = 0x06;
 pub const MEMORY_WRITE: u8 = 0x07;
 pub const MEMORY_WRITE_END: u8 = 0x08;
 const GET_CURRENT_DPI_INDEX: u8 = 0x0B;
-const SET_CURRENT_DPI_INDEX: u8 = 0x0C;
-
-/// Fold the outcome of handing the mouse back to its previous mode into the
-/// outcome of the work done while it was held.
-///
-/// A failed hand-back is never dropped: the mouse is then still in host mode,
-/// its stored profile is not applying, and the user has to be told which
-/// command gets them out. A vanished device stays an `Io` error either way,
-/// because that is how the worker knows to drop the handle, and a mouse that
-/// is gone is not being held in host mode by anyone.
-fn finish_host_mode<T>(restored: Result<()>, out: Result<T>) -> Result<T> {
-    const WAY_OUT: &str = "run `logi mode onboard`";
-    match (restored, out) {
-        (Ok(()), out) => out,
-        (Err(e @ Error::Io(_)), _) | (Err(_), Err(e @ Error::Io(_))) => Err(e),
-        (Err(re), Ok(_)) => Err(Error::Protocol(format!(
-            "done, but the mouse could not be handed back to onboard mode ({re}); {WAY_OUT}"
-        ))),
-        (Err(re), Err(e)) => Err(Error::Protocol(format!(
-            "{e}; and the mouse could not be handed back to onboard mode ({re}); {WAY_OUT}"
-        ))),
-    }
-}
 
 /// Device drives itself from stored profiles.
 pub const MODE_ONBOARD: u8 = 0x01;
@@ -57,14 +34,11 @@ pub fn mode_name(m: u8) -> &'static str {
 pub struct Info {
     pub memory_model_id: u8,
     pub profile_format_id: u8,
-    pub macro_format_id: u8,
     pub profile_count: u8,
     pub profile_count_oob: u8,
     pub button_count: u8,
     pub sector_count: u8,
     pub sector_size: u16,
-    pub mechanical_layout: u8,
-    pub various_info: u8,
 }
 
 pub struct OnboardProfiles {
@@ -84,14 +58,11 @@ impl OnboardProfiles {
             info: Info {
                 memory_model_id: p[0],
                 profile_format_id: p[1],
-                macro_format_id: p[2],
                 profile_count: p[3],
                 profile_count_oob: p[4],
                 button_count: p[5],
                 sector_count: p[6],
                 sector_size: u16::from_be_bytes([p[7], p[8]]),
-                mechanical_layout: p[9],
-                various_info: p.get(10).copied().unwrap_or(0),
             },
         })
     }
@@ -116,32 +87,6 @@ impl OnboardProfiles {
         Ok(())
     }
 
-    /// Hold the device in host mode for the duration of `f`, then put it back.
-    ///
-    /// Leaving the mouse in host mode makes its lighting depend on this process
-    /// still running, so the restore runs even when `f` returns an error. A
-    /// panic is not covered — release builds abort — so `logi mode onboard` is
-    /// the way back if the process dies holding host mode.
-    pub fn with_host_mode<T>(
-        &self,
-        dev: &mut Device,
-        f: impl FnOnce(&mut Device) -> Result<T>,
-    ) -> Result<T> {
-        let previous = self.mode(dev).unwrap_or(MODE_ONBOARD);
-        let restore = if previous == MODE_HOST { MODE_HOST } else { MODE_ONBOARD };
-        if previous != MODE_HOST {
-            if let Err(e) = self.set_mode(dev, MODE_HOST) {
-                // A setter that timed out may still have been applied, and
-                // then the mouse is in host mode with nobody holding it. Put
-                // it back; the original error is the one worth reporting,
-                // unless the put-back fails as well.
-                return finish_host_mode(self.set_mode(dev, restore), Err(e));
-            }
-        }
-        let out = f(dev);
-        finish_host_mode(self.set_mode(dev, restore), out)
-    }
-
     /// Active profile, 0-based.
     pub fn current(&self, dev: &mut Device) -> Result<u8> {
         let p = dev.call(self.idx, GET_CURRENT_PROFILE, &[])?;
@@ -162,11 +107,6 @@ impl OnboardProfiles {
 
     pub fn dpi_index(&self, dev: &mut Device) -> Result<u8> {
         Ok(dev.call(self.idx, GET_CURRENT_DPI_INDEX, &[])?.first().copied().unwrap_or(0))
-    }
-
-    pub fn set_dpi_index(&self, dev: &mut Device, i: u8) -> Result<()> {
-        dev.call(self.idx, SET_CURRENT_DPI_INDEX, &[i])?;
-        Ok(())
     }
 
     /// Read one profile sector, 16 bytes per long report.
@@ -199,52 +139,5 @@ impl OnboardProfiles {
             offset += 16;
         }
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn timeout() -> Error {
-        Error::Timeout { feature: 0x0c, function: 1 }
-    }
-
-    fn gone() -> Error {
-        Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "device disconnected"))
-    }
-
-    #[test]
-    fn a_clean_hand_back_passes_the_work_result_through() {
-        assert_eq!(finish_host_mode(Ok(()), Ok(7)).unwrap(), 7);
-        assert!(matches!(finish_host_mode::<()>(Ok(()), Err(timeout())), Err(Error::Timeout { .. })));
-    }
-
-    #[test]
-    fn a_failed_hand_back_after_good_work_is_not_a_clean_finish() {
-        let err = finish_host_mode(Err(timeout()), Ok(())).unwrap_err().to_string();
-        assert!(err.contains("could not be handed back") && err.contains("logi mode onboard"), "{err}");
-    }
-
-    #[test]
-    fn a_failed_hand_back_after_failed_work_reports_both() {
-        let err = finish_host_mode::<()>(Err(timeout()), Err(Error::Protocol("write refused".into())))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("write refused"), "{err}");
-        assert!(err.contains("could not be handed back") && err.contains("logi mode onboard"), "{err}");
-    }
-
-    #[test]
-    fn a_vanished_device_stays_an_io_error() {
-        assert!(matches!(finish_host_mode(Err(gone()), Ok(())), Err(Error::Io(_))));
-        assert!(matches!(
-            finish_host_mode::<()>(Err(timeout()), Err(gone())),
-            Err(Error::Io(_))
-        ));
-        assert!(matches!(
-            finish_host_mode::<()>(Err(gone()), Err(timeout())),
-            Err(Error::Io(_))
-        ));
     }
 }

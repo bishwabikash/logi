@@ -141,25 +141,6 @@ impl Model {
         (model, notes)
     }
 
-    /// What `parse_rules` will make of this model once it is written.
-    pub fn to_config(&self) -> Config {
-        let n = self.normalized();
-        Config {
-            rules: n
-                .rows
-                .iter()
-                .map(|r| appwatch::Rule {
-                    pattern: r.pattern.clone(),
-                    profile: r.profile,
-                    dpi: r.dpi,
-                })
-                .collect(),
-            fallback: n.fallback,
-            poll: Duration::from_millis(n.poll_ms),
-            ..Config::default()
-        }
-    }
-
     /// Trim patterns and clamp the poll interval, matching what the parser
     /// does on the way back in. Comparisons and rendering both use this, so a
     /// trailing space is not reported as an unsaved change.
@@ -718,14 +699,6 @@ impl RulesEditor {
             acknowledged: None,
             requested: None,
         }
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn model(&self) -> &Model {
-        &self.model
     }
 
     /// Read the file, separating "there is no file yet" from "there is one

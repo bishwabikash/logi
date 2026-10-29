@@ -49,7 +49,6 @@ fn sysfs_ids(node: &str) -> Option<(u16, u16)> {
 pub struct Found {
     pub device: Device,
     pub pid: u16,
-    pub path: PathBuf,
     pub name: String,
     pub kind: String,
     pub protocol: (u8, u8),
@@ -83,7 +82,7 @@ fn candidates() -> Vec<(PathBuf, u16)> {
     out
 }
 
-fn interrogate(mut dev: Device, pid: u16, path: PathBuf) -> Option<Found> {
+fn interrogate(mut dev: Device, pid: u16) -> Option<Found> {
     let protocol = dev.protocol_version().ok()?;
     let caps = Capabilities::probe(&mut dev);
     // A node that answers the root feature but exposes nothing is a sibling
@@ -100,7 +99,7 @@ fn interrogate(mut dev: Device, pid: u16, path: PathBuf) -> Option<Found> {
         .map(deviceinfo::device_type_name)
         .unwrap_or("unknown")
         .to_string();
-    Some(Found { device: dev, pid, path, name, kind, protocol, caps })
+    Some(Found { device: dev, pid, name, kind, protocol, caps })
 }
 
 /// Probe every Logitech node and return each distinct device that answers.
@@ -119,7 +118,7 @@ pub fn list_devices() -> Vec<Found> {
             continue;
         }
         let Ok(dev) = Device::open(&path) else { continue };
-        if let Some(f) = interrogate(dev, pid, path) {
+        if let Some(f) = interrogate(dev, pid) {
             found.push(f);
         }
     }
@@ -178,7 +177,7 @@ pub fn open_device_matching(want: Option<&str>) -> Result<Found> {
                 // Stop at the first node that answers. The siblings of a
                 // device we already have add nothing, and every node that
                 // does not answer costs a full reply timeout.
-                if let Some(f) = interrogate(dev, pid, path) {
+                if let Some(f) = interrogate(dev, pid) {
                     return Ok(f);
                 }
             }
