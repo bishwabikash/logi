@@ -992,17 +992,16 @@ impl ProfileEditor {
                             }
                         }
                         ui.add_space(6.0);
-                        let mut rgb = [
-                            led_draft.color[0] as f32 / 255.0,
-                            led_draft.color[1] as f32 / 255.0,
-                            led_draft.color[2] as f32 / 255.0,
-                        ];
-                        if ui.color_edit_button_rgb(&mut rgb).changed() {
-                            led_draft.color = [
-                                (rgb[0] * 255.0).round() as u8,
-                                (rgb[1] * 255.0).round() as u8,
-                                (rgb[2] * 255.0).round() as u8,
-                            ];
+                        // The sRGB entry point, on a copy. The f32 one reads its
+                        // argument as *linear*, so the picker previewed a
+                        // lighter colour than the bytes it stored: a grey
+                        // chosen as #808080 went into the profile as 0x37 and
+                        // the zone came out darker than anything on screen.
+                        // The bytes in the record are what the LED is driven
+                        // with, so they are the ones the picker must show.
+                        let mut rgb = led_draft.color;
+                        if ui.color_edit_button_srgb(&mut rgb).changed() {
+                            led_draft.color = rgb;
                             led_draft.mark();
                         }
                     });
@@ -1271,7 +1270,13 @@ impl ProfileEditor {
                     // second one taken after a bad write would replace the
                     // good one with the bad state. The field shows where it
                     // actually went.
-                    let target = free_backup_path(&self.backup_path, |p| {
+                    //
+                    // Trimmed first: the enable check above already ignores
+                    // surrounding blanks, but the path itself kept them, so a
+                    // pasted path with a trailing space made a file whose
+                    // name ends in one, which no later look for it finds.
+                    let typed = self.backup_path.trim().to_string();
+                    let target = free_backup_path(&typed, |p| {
                         self.backup_sent.iter().any(|s| s == p)
                             || std::path::Path::new(p).exists()
                     });
@@ -2265,6 +2270,24 @@ mod tests {
         assert!(cmds.borrow().is_empty(), "painting queued {:?}", cmds.borrow());
         assert!(!e.dirty(), "painting made the editor think the profile had edits");
         assert!(e.dirty_profiles().is_empty());
+    }
+
+    #[test]
+    fn painting_the_colour_picker_leaves_the_stored_bytes_alone() {
+        // The picker is handed the record's own bytes through the sRGB entry
+        // point. Whatever it does with them internally, drawing it must hand
+        // back exactly what went in and report no change.
+        for start in [[0x37u8, 0x80, 0xff], [0, 0, 0], [0xff, 0xff, 0xff], [0x12, 0x34, 0x56]] {
+            let rgb = std::cell::Cell::new(start);
+            let changed = std::cell::Cell::new(false);
+            egui::__run_test_ui(|ui| {
+                let mut c = rgb.get();
+                changed.set(ui.color_edit_button_srgb(&mut c).changed());
+                rgb.set(c);
+            });
+            assert!(!changed.get(), "painting {start:?} reported a change");
+            assert_eq!(rgb.get(), start, "painting rewrote the colour");
+        }
     }
 
     #[test]

@@ -334,13 +334,18 @@ pub struct BindingsEditor {
     /// alone settles the status on the wrong command and never hears the
     /// second one fail.
     pending_applies: usize,
-    /// The newest Save was not sent to the device (none connected, or it
-    /// cannot report presses), so an earlier apply that answers later is not
-    /// news about the file as it now stands.
+    /// The mouse does not hold the newest Save: it was not sent (none
+    /// connected, or it cannot report presses) or the mouse refused it. An
+    /// earlier apply that answers later is not news about the file as it now
+    /// stands, and Save stays available while this is set.
     tail_unapplied: bool,
     /// Where the last Save put the file it replaced, when that file held
     /// something a rewrite would lose. Taken by the caller for the status line.
     kept_copy: Option<std::path::PathBuf>,
+    /// The bytes the config file held when this editor last read or wrote it,
+    /// so a Save can tell that something else changed the file since. `None`
+    /// when it has not been read (or could not be).
+    on_disk: Option<Vec<u8>>,
     loaded: bool,
 }
 
@@ -368,6 +373,7 @@ impl BindingsEditor {
             pending_applies: 0,
             tail_unapplied: false,
             kept_copy: None,
+            on_disk: None,
             loaded: false,
         }
     }
@@ -375,10 +381,14 @@ impl BindingsEditor {
     /// Read the bindings file. A missing file is the normal first run, not an
     /// error; an unreadable one is reported.
     pub fn load(&mut self) {
+        self.load_from(&actions::config_path());
+    }
+
+    fn load_from(&mut self, path: &std::path::Path) {
         self.loaded = true;
-        let path = actions::config_path();
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(path) {
             Ok(text) => {
+                self.on_disk = Some(text.clone().into_bytes());
                 self.set_from_text(&text);
                 let n = self.rows.iter().filter(|r| r.is_set()).count();
                 self.status = Some((
@@ -387,6 +397,7 @@ impl BindingsEditor {
                 ));
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.on_disk = Some(Vec::new());
                 self.set_from_text("");
                 self.status = Some((
                     format!("no bindings yet; Save writes {}", path.display()),
@@ -394,6 +405,7 @@ impl BindingsEditor {
                 ));
             }
             Err(e) => {
+                self.on_disk = None;
                 self.set_from_text("");
                 self.status = Some((format!("cannot read {}: {e}", path.display()), false));
             }
@@ -501,7 +513,7 @@ impl BindingsEditor {
         // Before anything is written: a rewrite drops comments and lines the
         // editor could not parse, and a file it could not read at all would
         // be replaced by whatever the rows now say.
-        let kept = keep_previous(&path, &keys)?;
+        let kept = keep_previous(&path, &keys, self.on_disk.as_deref())?;
         // Through a temporary in the same directory, then renamed. A plain
         // write truncates first, so a crash or a full disk between the two
         // leaves half a file — and the service reads this file as the user's
@@ -515,6 +527,12 @@ impl BindingsEditor {
         let written = (|| -> std::io::Result<()> {
             use std::io::Write;
             let mut f = std::fs::File::create(&tmp)?;
+            // The file being replaced keeps its permissions. A temporary gets
+            // the default ones, and a `text` binding can hold a password: a
+            // config the user made private must not come out world-readable.
+            if let Ok(m) = std::fs::metadata(&path) {
+                let _ = f.set_permissions(m.permissions());
+            }
             f.write_all(text.as_bytes())?;
             f.sync_all()
         })();
@@ -531,7 +549,16 @@ impl BindingsEditor {
         self.saved = self.rows.clone();
         self.problems.clear();
         self.kept_copy = kept;
+        self.on_disk = Some(text.into_bytes());
         Ok(silence)
+    }
+
+    /// The last Save wrote the file but the mouse does not hold it (never told,
+    /// or it refused), and the mouse can be told now. Nothing is dirty then, so
+    /// without this Save would stay disabled and the only way to apply the file
+    /// was to make an edit.
+    fn apply_pending(&self, snap: &Snapshot) -> bool {
+        self.tail_unapplied && snap.connected && snap.has_button_spy
     }
 
     /// Take the next key press out of egui's own event stream.
@@ -614,6 +641,18 @@ impl BindingsEditor {
         if let Some(r) = self.rows.iter_mut().find(|r| r.button == button) {
             r.kind = Kind::Key;
             r.key = chord;
+        }
+    }
+
+    /// A text field that just took keyboard focus ends any capture in progress.
+    ///
+    /// Capture reads the raw key events at the top of the panel, before any
+    /// field has seen them. Left armed, a user who clicked into a text field
+    /// to type found every keystroke going to the capture instead: the first
+    /// one rewrote the captured row's chord and the field never received it.
+    fn end_capture_for(&mut self, field: &egui::Response) {
+        if field.gained_focus() {
+            self.capturing = None;
         }
     }
 
@@ -719,8 +758,17 @@ impl BindingsEditor {
                 ui.add_space(8.0);
                 theme::hint(
                     ui,
-                    "No mouse connected, so all 16 possible buttons are listed. \
-                     Bindings can still be edited and saved.",
+                    &if snap.button_count == 0 {
+                        format!(
+                            "No mouse connected, so all {MAX_BUTTON} possible buttons are \
+                             listed. Bindings can still be edited and saved."
+                        )
+                    } else {
+                        format!(
+                            "No mouse connected. The {count} buttons of the last one are \
+                             listed. Bindings can still be edited and saved."
+                        )
+                    },
                 );
             } else if !snap.has_button_spy {
                 ui.add_space(8.0);
@@ -761,7 +809,7 @@ impl BindingsEditor {
                     ui.painter().hline(
                         r.x_range(),
                         ui.cursor().top() - 2.0,
-                        egui::Stroke::new(1.0, theme::LINE),
+                        egui::Stroke::new(1.0_f32, theme::LINE),
                     );
                     ui.add_space(6.0);
                 }
@@ -873,11 +921,12 @@ impl BindingsEditor {
                             if ui.selectable_label(capturing, label).clicked() {
                                 self.capturing = if capturing { None } else { Some(button) };
                             }
-                            ui.add(
+                            let r = ui.add(
                                 egui::TextEdit::singleline(&mut row.key)
                                     .hint_text("ctrl+c")
                                     .desired_width(w),
                             );
+                            self.end_capture_for(&r);
                         });
                         if self.capturing == Some(button) {
                             ui.add_space(4.0);
@@ -892,11 +941,12 @@ impl BindingsEditor {
                         }
                     }
                     Kind::Text => {
-                        ui.add(
+                        let r = ui.add(
                             egui::TextEdit::singleline(&mut row.text)
                                 .hint_text("Hello there")
                                 .desired_width(w),
                         );
+                        self.end_capture_for(&r);
                         ui.add_space(4.0);
                         theme::hint(
                             ui,
@@ -914,11 +964,12 @@ impl BindingsEditor {
                             });
                     }
                     Kind::Command => {
-                        ui.add(
+                        let r = ui.add(
                             egui::TextEdit::singleline(&mut row.command)
                                 .hint_text("notify-send hi")
                                 .desired_width(w),
                         );
+                        self.end_capture_for(&r);
                         ui.add_space(4.0);
                         theme::hint(
                             ui,
@@ -1063,7 +1114,8 @@ impl BindingsEditor {
                 ui.add_space(14.0);
                 ui.horizontal(|ui| {
                     let w = (ui.available_width() - 90.0).max(160.0);
-                    ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.backup_path).desired_width(w));
+                    self.end_capture_for(&r);
                     if ui
                         .add_enabled(snap.has_profiles, egui::Button::new("Back up"))
                         .clicked()
@@ -1099,7 +1151,9 @@ impl BindingsEditor {
             // mouse's table is in an unknown state and that is still news.
             return format!(
                 "saved to {}; not applied, because no connected mouse can report \
-                 button presses",
+                 button presses. The mouse's own table is as it was: a button \
+                 silenced earlier stays silenced until Restore physical buttons, \
+                 or a Save with the mouse connected",
                 path.display()
             );
         }
@@ -1130,8 +1184,8 @@ impl BindingsEditor {
     ///
     /// The file is already written by then, so a failure here means the file
     /// and the mouse's remapping table disagree, and the user needs to hear
-    /// that rather than keep reading a success. Save is not offered again for
-    /// the same edit (nothing is dirty), so the way out is named.
+    /// that rather than keep reading a success. Nothing is dirty, so a failure
+    /// sets `tail_unapplied`, which keeps Save available to try again.
     fn settle_apply(&mut self, snap: &Snapshot) {
         let Some(after) = self.awaiting_apply else { return };
         let Some(o) = snap.outcome_after(after, CmdKind::ApplyBindings) else { return };
@@ -1148,6 +1202,13 @@ impl BindingsEditor {
             // says so, and this answer is about an older set.
             return;
         }
+        // A refused apply leaves nothing dirty, exactly like a Save that was
+        // never sent, so it re-arms Save the same way: without this the only
+        // ways to try again were an unrelated edit or giving up on the set and
+        // restoring the factory table.
+        if !o.ok {
+            self.tail_unapplied = true;
+        }
         self.status = Some(if o.ok {
             (
                 format!(
@@ -1160,8 +1221,8 @@ impl BindingsEditor {
             (
                 format!(
                     "saved to the file, but the mouse did not take it: {}. Its remapping \
-                     table may still hold the old silenced set; Restore physical buttons \
-                     puts every button back.",
+                     table may still hold the old silenced set; Save bindings tries \
+                     again, and Restore physical buttons puts every button back.",
                     o.message.as_deref().unwrap_or("no reason given")
                 ),
                 false,
@@ -1175,7 +1236,10 @@ impl BindingsEditor {
             let ok = errs.is_empty() && !blocked;
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(ok && self.dirty(), egui::Button::new("Save bindings"))
+                    .add_enabled(
+                        ok && (self.dirty() || self.apply_pending(snap)),
+                        egui::Button::new("Save bindings"),
+                    )
                     .clicked()
                 {
                     match self.save(count) {
@@ -1240,6 +1304,15 @@ impl BindingsEditor {
                 );
             }
 
+            if self.apply_pending(snap) && !self.dirty() {
+                ui.add_space(6.0);
+                theme::hint(
+                    ui,
+                    "The mouse does not have the last save: it is in the file but was \
+                     not applied. Save bindings sends it again.",
+                );
+            }
+
             if let Some((msg, good)) = self.status.clone() {
                 ui.add_space(10.0);
                 ui.add(
@@ -1283,7 +1356,9 @@ impl BindingsEditor {
             theme::hint(
                 ui,
                 "Those buttons are unbound until they are set here. Saving rewrites the \
-                 file, which drops the bad lines.",
+                 file, which drops the bad lines; the old file is kept beside it as \
+                 bindings.conf.bak, or bindings.conf.bak.2 and so on if that name is \
+                 already taken.",
             );
         });
     }
@@ -1325,16 +1400,24 @@ fn hidden_replace_error(hidden: &[u8], count: u8) -> Option<String> {
     ))
 }
 
+/// How many copies of replaced files to keep side by side before refusing.
+const MAX_KEPT_COPIES: u32 = 20;
+
 /// Keep the file a Save is about to replace, when replacing it loses something.
 ///
 /// The app's own output survives a parse and render unchanged, and then there
-/// is nothing to keep. Anything else (comments, lines the editor could not
-/// read, a file that is not UTF-8) is copied to `bindings.conf.bak` first. If
-/// that copy cannot be made the Save is refused, because the alternative is
-/// destroying a file nothing else holds.
+/// is nothing to keep, unless something else changed the file since this
+/// editor read or wrote it (`seen`): that Save would drop those edits, so the
+/// file is kept. Anything else (comments, lines the editor could not read, a
+/// file that is not UTF-8) is copied to `bindings.conf.bak` first, or to the
+/// next free `bindings.conf.bak.N` when that name already holds something
+/// different, because the older copy may be the only one with the user's
+/// comments in it. If no copy can be made the Save is refused, because the
+/// alternative is destroying a file nothing else holds.
 fn keep_previous(
     path: &std::path::Path,
     keys: &dyn Keymap,
+    seen: Option<&[u8]>,
 ) -> Result<Option<std::path::PathBuf>, String> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
@@ -1346,16 +1429,72 @@ fn keep_previous(
             ))
         }
     };
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        let (b, problems) = Bindings::parse(text, keys);
-        if problems.is_empty() && format!("{SAVE_HEADER}{}", b.render(keys)) == text {
-            return Ok(None);
+    // A blank file has nothing in it to lose.
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(None);
+    }
+    // Never read (or unreadable when it was): the editor's rows were not built
+    // from this file, so even the app's own format may hold bindings the
+    // editor knows nothing about.
+    let unchanged_since_read = seen.is_some_and(|s| s == bytes.as_slice());
+    if unchanged_since_read {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            let (b, problems) = Bindings::parse(text, keys);
+            if problems.is_empty() && format!("{SAVE_HEADER}{}", b.render(keys)) == text {
+                return Ok(None);
+            }
         }
     }
-    let bak = path.with_extension("conf.bak");
-    std::fs::write(&bak, &bytes)
-        .map_err(|e| format!("cannot keep a copy of {} as {}: {e}", path.display(), bak.display()))?;
-    Ok(Some(bak))
+    let base = path.with_extension("conf.bak");
+    let meta = std::fs::metadata(path).ok();
+    for n in 1..=MAX_KEPT_COPIES {
+        let cand = if n == 1 {
+            base.clone()
+        } else {
+            let mut name = base.as_os_str().to_owned();
+            name.push(format!(".{n}"));
+            std::path::PathBuf::from(name)
+        };
+        match std::fs::read(&cand) {
+            // Already kept, byte for byte.
+            Ok(existing) if existing == bytes => return Ok(Some(cand)),
+            Ok(_) => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!("cannot check {} before keeping a copy there: {e}", cand.display()))
+            }
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // The copy is as private as the file it came from.
+            if let Some(m) = &meta {
+                opts.mode(m.permissions().mode() & 0o777);
+            }
+        }
+        let fail = |e: std::io::Error| {
+            format!("cannot keep a copy of {} as {}: {e}", path.display(), cand.display())
+        };
+        match opts.open(&cand) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(&bytes).and_then(|_| f.sync_all()) {
+                    let _ = std::fs::remove_file(&cand);
+                    return Err(fail(e));
+                }
+                return Ok(Some(cand));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(fail(e)),
+        }
+    }
+    Err(format!(
+        "{MAX_KEPT_COPIES} older copies of {} are already kept beside it; \
+         delete the ones you no longer need and Save again",
+        path.display()
+    ))
 }
 
 fn default_backup_path() -> String {
@@ -2055,6 +2194,155 @@ mod tests {
         e.save_to(&path, 11).unwrap();
         assert_eq!(e.kept_copy, None);
         assert_eq!(std::fs::read_to_string(&bak).unwrap(), hand);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The first copy may be the only one holding the user's comments. A second
+    /// lossy Save must not write over it.
+    #[test]
+    fn a_second_lossy_save_does_not_overwrite_the_first_copy() {
+        let dir = scratch("twice");
+        let path = dir.join("bindings.conf");
+        let hand = "# my notes\nbutton 2 = key f5\n";
+        std::fs::write(&path, hand).unwrap();
+        let mut e = editor(hand);
+        e.rows.iter_mut().find(|r| r.button == 4).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+
+        // Someone adds a comment to the app's output; the next Save loses it.
+        let edited = format!("{}# one more\n", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &edited).unwrap();
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        assert_eq!(e.kept_copy.as_deref(), Some(dir.join("bindings.conf.bak.2").as_path()));
+        assert_eq!(std::fs::read_to_string(dir.join("bindings.conf.bak")).unwrap(), hand);
+        assert_eq!(std::fs::read_to_string(dir.join("bindings.conf.bak.2")).unwrap(), edited);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The app's own format is only "nothing to keep" if it is what this editor
+    /// last saw. Another writer's edit in that format is still an edit.
+    #[test]
+    fn a_file_changed_since_it_was_read_is_kept_even_in_the_apps_format() {
+        let dir = scratch("changed");
+        let path = dir.join("bindings.conf");
+        std::fs::write(&path, format!("{SAVE_HEADER}button 2 = key f5\n")).unwrap();
+        let mut e = BindingsEditor::new();
+        e.load_from(&path);
+        assert!(e.problems.is_empty());
+
+        let theirs = format!("{SAVE_HEADER}button 2 = key f6\n");
+        std::fs::write(&path, &theirs).unwrap();
+        e.rows.iter_mut().find(|r| r.button == 4).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        let bak = dir.join("bindings.conf.bak");
+        assert_eq!(e.kept_copy.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), theirs);
+
+        // And once it has written the file itself, that is what it expects.
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        assert_eq!(e.kept_copy, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The editor's rows are only a faithful picture of the file if the editor
+    /// read it. After a failed read the rows are empty, and a Save over a file
+    /// that has since become readable, in the app's own format, would replace
+    /// its bindings with that emptiness and keep nothing.
+    #[test]
+    fn a_file_the_editor_never_read_is_kept_even_in_the_apps_format() {
+        let dir = scratch("neverread");
+        let path = dir.join("bindings.conf");
+        let theirs = format!("{SAVE_HEADER}button 2 = key f6\n");
+        std::fs::write(&path, &theirs).unwrap();
+        let mut e = editor("");
+        assert!(e.on_disk.is_none());
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        let bak = dir.join("bindings.conf.bak");
+        assert_eq!(e.kept_copy.as_deref(), Some(bak.as_path()));
+        assert_eq!(std::fs::read_to_string(&bak).unwrap(), theirs);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Save that never reached the mouse leaves nothing dirty. Once the mouse
+    /// can take it, Save has to be available again, or the message that says
+    /// "a Save with the mouse connected" points at a disabled button.
+    #[test]
+    fn an_unapplied_save_can_be_applied_once_the_mouse_is_there() {
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        assert!(!e.apply_pending(&snap));
+        e.queue_apply(false, Vec::new(), 0);
+        assert!(!e.dirty());
+        assert!(!e.apply_pending(&snap), "no mouse yet");
+        snap.connected = true;
+        assert!(!e.apply_pending(&snap), "a mouse that cannot report presses");
+        snap.has_button_spy = true;
+        assert!(e.apply_pending(&snap));
+        // The Save that applies it clears the flag.
+        e.queue_apply(true, Vec::new(), 0);
+        assert!(!e.apply_pending(&snap));
+    }
+
+    /// A refused apply leaves the file written and nothing dirty. Save has to
+    /// come back, or the status that tells the user the mouse may still hold the
+    /// old set leaves them only Restore and an unrelated edit.
+    #[test]
+    fn a_refused_apply_makes_save_available_again() {
+        use crate::device::Outcome;
+        let mut e = editor("");
+        let mut snap = Snapshot::default();
+        snap.connected = true;
+        snap.has_button_spy = true;
+        e.queue_apply(true, vec![3], snap.newest_outcome_id());
+        assert!(!e.apply_pending(&snap), "nothing to retry while it is in flight");
+
+        snap.record(Outcome::failed(1, CmdKind::ApplyBindings, "timed out"));
+        e.settle_apply(&snap);
+        assert!(!e.dirty());
+        assert!(e.apply_pending(&snap), "Save stayed disabled after a refused apply");
+        // Not offered to a mouse that could not take it anyway.
+        snap.connected = false;
+        assert!(!e.apply_pending(&snap));
+        snap.connected = true;
+
+        // Trying again, and succeeding, closes it.
+        e.queue_apply(true, vec![3], snap.newest_outcome_id());
+        snap.record(Outcome::ok(2, CmdKind::ApplyBindings, None));
+        e.settle_apply(&snap);
+        assert!(!e.apply_pending(&snap));
+    }
+
+    /// The text that tells someone with a dead left click what to type has to
+    /// name a command the binary has. It is the only way out when this window
+    /// can no longer be clicked.
+    #[test]
+    fn the_escape_hatch_names_a_command_that_exists() {
+        let main = include_str!("../main.rs");
+        assert_eq!(RESTORE_CLI, "logi bind reset");
+        assert!(main.contains("\"bind\" => cmd_bind("), "no `bind` subcommand");
+        assert!(main.contains("Some(\"reset\") =>"), "`bind` has no `reset` arm");
+        assert!(main.contains(RESTORE_CLI), "the CLI's own help does not name it");
+    }
+
+    /// A private config stays private, and so does the copy of it.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_keeps_the_files_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("perm");
+        let path = dir.join("bindings.conf");
+        std::fs::write(&path, "# secret\nbutton 2 = text hunter2\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut e = BindingsEditor::new();
+        e.load_from(&path);
+        e.rows.iter_mut().find(|r| r.button == 5).unwrap().kind = Kind::Mouse;
+        e.save_to(&path, 11).unwrap();
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(&dir.join("bindings.conf.bak")), 0o600);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

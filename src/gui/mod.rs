@@ -131,6 +131,43 @@ impl App {
         }
     }
 
+    /// Send a panel's command, whichever panel it came from.
+    ///
+    /// A backup is the way back from a flash write, so none may land on a file
+    /// that is already there. Three panels send one: this tab, the profile
+    /// editor and the host-bindings editor, whose "Back up" button used to send
+    /// the same default path on every press. Each numbers for itself only
+    /// against what it has sent, so a path another panel had just sent (the
+    /// file is written later, on the device thread) or one it did not know
+    /// about could be sent twice, and the second dump, taken after a bad
+    /// write, replaced the good one taken before it. Choosing the path here,
+    /// where every panel's backup passes, is what makes the check shared.
+    fn dispatch(&mut self, cmd: Cmd) {
+        match cmd {
+            Cmd::Backup(path) => {
+                self.send_backup(path);
+            }
+            other => self.send_tracked(other),
+        }
+    }
+
+    /// Send a backup to `path`, or to the first numbered path beside it that
+    /// nothing is at and nothing has been sent to. Returns where it went.
+    fn send_backup(&mut self, path: String) -> String {
+        // Trimmed here, where every panel's backup passes: the enable checks
+        // already ignore surrounding blanks, but the path kept them, so a
+        // pasted path with a trailing space made a file whose name ends in
+        // one, which nothing later looks for.
+        let path = path.trim().to_string();
+        let sent = &self.backup_sent;
+        let target = free_backup_path(&path, |p| {
+            sent.iter().any(|s| s == p) || std::path::Path::new(p).exists()
+        });
+        self.backup_sent.push(target.clone());
+        self.dev.send(Cmd::Backup(target.clone()));
+        target
+    }
+
     fn rgb(&self) -> [u8; 3] {
         [
             (self.color[0] * 255.0).round() as u8,
@@ -229,12 +266,15 @@ fn still_waiting(id: device::CmdId, newest_outcome: device::CmdId, waited: std::
 
 /// Whether a tab has nothing to show without a mouse attached.
 ///
-/// The service and the app rules are not the device's: the rules are a config
-/// file and the service is a systemd unit. With no mouse found, the service is
-/// often the very thing to look at (it may be failing, or be what the user
-/// needs to restart), so the whole window must not collapse to "no device".
+/// The service, the app rules and the host bindings are not the device's: the
+/// rules and the bindings are config files and the service is a systemd unit.
+/// With no mouse found, the service is often the very thing to look at (it may
+/// be failing, or be what the user needs to restart), so the whole window must
+/// not collapse to "no device". The bindings editor is written for exactly this
+/// case: it lists every possible button and says the file can still be edited
+/// and saved with no mouse, which the window never let anyone reach.
 fn tab_needs_device(t: Tab) -> bool {
-    !matches!(t, Tab::Apps | Tab::Service)
+    !matches!(t, Tab::Apps | Tab::Service | Tab::Buttons)
 }
 
 /// Every label the per-button menu offers.
@@ -285,6 +325,31 @@ fn lighting_record(mode: u8, color: [u8; 3], period_ms: u16, waveform: u8, inten
         led::BREATHING => Some(Led::breathing(color, period_ms, waveform, intensity)),
         led::CYCLE => Some(Led::cycle(period_ms, intensity)),
         _ => None,
+    }
+}
+
+/// The modes every selected zone offers, in the first zone's order.
+///
+/// Read per zone off the device, and this app has no model whitelist, so zones
+/// are not assumed alike. Offering what only the first one has meant "All"
+/// could send a mode another zone has no effect for. `live` picks the modes
+/// the live setter takes instead of the ones the zone has a record for.
+fn common_modes(zones: &[&device::ZoneInfo], live: bool) -> Vec<u8> {
+    let of = |z: &device::ZoneInfo| if live { z.live_modes.clone() } else { z.modes.clone() };
+    let Some((first, rest)) = zones.split_first() else {
+        return Vec::new();
+    };
+    let mut out = of(first);
+    out.retain(|m| rest.iter().all(|z| of(z).contains(m)));
+    out
+}
+
+/// The zones the panel is currently aimed at: all of them, or the chosen one.
+fn selected_zones(zones: &[device::ZoneInfo], all_zones: bool, zone_sel: usize) -> Vec<&device::ZoneInfo> {
+    if all_zones {
+        zones.iter().collect()
+    } else {
+        zones.get(zone_sel).into_iter().collect()
     }
 }
 
@@ -409,8 +474,22 @@ fn free_backup_path(path: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 fn default_backup_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    format!("{home}/logi-backup.json")
+    backup_path_in(std::env::var("HOME").ok(), std::env::current_dir().ok())
+}
+
+/// The default backup file inside `home`, or inside `cwd` when there is no
+/// usable home, so the path is absolute either way.
+///
+/// A bare `.` fallback wrote into whatever directory the app happened to be
+/// started from, which for a desktop launcher is not somewhere a person looks
+/// for the one file that undoes a flash write.
+fn backup_path_in(home: Option<String>, cwd: Option<std::path::PathBuf>) -> String {
+    let dir = home
+        .filter(|h| h.starts_with('/'))
+        .map(std::path::PathBuf::from)
+        .or(cwd)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"));
+    dir.join("logi-backup.json").to_string_lossy().into_owned()
 }
 
 impl eframe::App for App {
@@ -471,6 +550,11 @@ impl eframe::App for App {
             // whatever comes back: Apply writes flash.
             self.btn_action.clear();
             self.btn_profile = None;
+            // A drag in progress when the mouse went is never finished: the
+            // slider is not drawn while there is no device, so it never sees
+            // the release that clears this. Left set, it would keep the slider
+            // on the dragged value after the replug instead of the mouse's own.
+            self.dpi_touched = false;
         }
         if let Some((id, since)) = self.flash_inflight {
             if !still_waiting(id, self.snap.newest_outcome_id(), since.elapsed()) {
@@ -833,6 +917,19 @@ impl App {
                 theme::hint(ui, "This sensor reports fixed stages rather than a range, \
                                  so these are the only values it accepts.");
             });
+        } else if self.snap.dpi_cap.is_none() {
+            // The range read failed or has not landed. Drawing a slider over
+            // numbers invented here, with a hint stating them as the device's,
+            // would be a claim about hardware nobody asked.
+            theme::section(ui, "Sensor", |ui| {
+                theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+                ui.add_space(10.0);
+                theme::hint(
+                    ui,
+                    "The sensor has not reported which DPI values it accepts, so there \
+                     is nothing to choose from here. Press Refresh.",
+                );
+            });
         } else {
         theme::section(ui, "Sensor", |ui| {
             theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
@@ -851,8 +948,16 @@ impl App {
             if resp.changed() {
                 self.dpi_touched = true;
             }
-            if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
+            // Only a value the user moved to is sent. A press and release on
+            // the handle with no movement used to send `self.dpi` anyway,
+            // which is the device's own value, or the 1600 placeholder when it
+            // has not reported one.
+            if (resp.drag_stopped() && self.dpi_touched)
+                || (resp.changed() && !resp.dragged())
+            {
                 self.dev.send(Cmd::SetDpi(self.dpi));
+                self.dpi_touched = false;
+            } else if resp.drag_stopped() {
                 self.dpi_touched = false;
             }
             ui.add_space(8.0);
@@ -917,9 +1022,24 @@ impl App {
             return;
         }
         let zones = self.snap.zones.clone();
-        let live_ok = |m: u8| {
-            zones.first().map(|z| z.live_modes.contains(&m)).unwrap_or(false) || m == led::OFF
-        };
+        // A zone list that shrank (a different mouse, a replug) must not leave
+        // the selection pointing past its end.
+        if self.zone_sel >= zones.len() {
+            self.zone_sel = 0;
+        }
+        // What the panel is aimed at decides what it offers: the modes every
+        // selected zone has, and the ones every selected zone takes live. Off
+        // is always live, as a fixed black.
+        let aimed = selected_zones(&zones, self.all_zones, self.zone_sel);
+        let live_modes = common_modes(&aimed, true);
+        let live_ok = |m: u8| live_modes.contains(&m) || m == led::OFF;
+        let offered = common_modes(&aimed, false);
+        // A mode carried over from before the selection changed that the zones
+        // do not have would otherwise stay armed behind a list that does not
+        // show it, and Save would write it to flash.
+        if !offered.is_empty() && !offered.contains(&self.mode) {
+            self.mode = offered[0];
+        }
 
         theme::section(ui, "Zone", |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -941,10 +1061,11 @@ impl App {
 
         ui.add_space(14.0);
         theme::section(ui, "Mode", |ui| {
-            let available: Vec<u8> = zones
-                .first()
-                .map(|z| z.modes.clone())
-                .unwrap_or_else(|| vec![led::OFF, led::FIXED, led::BREATHING, led::CYCLE]);
+            let available: Vec<u8> = if zones.is_empty() {
+                vec![led::OFF, led::FIXED, led::BREATHING, led::CYCLE]
+            } else {
+                offered.clone()
+            };
             ui.horizontal_wrapped(|ui| {
                 for m in &available {
                     let label = if live_ok(*m) {
@@ -1245,7 +1366,7 @@ impl App {
                 theme::hint(ui, "Waiting for the mouse to confirm the last write.");
             }
             for cmd in cmds {
-                self.send_tracked(cmd);
+                self.dispatch(cmd);
             }
         }
 
@@ -1260,13 +1381,7 @@ impl App {
                 {
                     // Never onto a file that is already there. The field shows
                     // where it actually went.
-                    let target = free_backup_path(&self.backup_path, |p| {
-                        self.backup_sent.iter().any(|s| s == p)
-                            || std::path::Path::new(p).exists()
-                    });
-                    self.backup_path = target.clone();
-                    self.backup_sent.push(target.clone());
-                    self.dev.send(Cmd::Backup(target));
+                    self.backup_path = self.send_backup(self.backup_path.clone());
                 }
             });
             ui.add_space(8.0);
@@ -1285,7 +1400,7 @@ impl App {
         // people are looking for.
         let snap = self.snap.clone();
         for cmd in self.bindings.ui(ui, &snap) {
-            self.dev.send(cmd);
+            self.dispatch(cmd);
         }
         // The editor also queues things Cmd could not express when it was
         // written. Draining this is what makes Save actually reach the device.
@@ -1298,6 +1413,15 @@ impl App {
             });
         }
         ui.add_space(18.0);
+        // The grid below is the mouse's own table. With no mouse there is
+        // nothing to read, and "does not report onboard profiles" would be a
+        // claim about a device that is not there.
+        if !self.snap.connected {
+            theme::section(ui, "Buttons", |ui| {
+                theme::hint(ui, "No mouse is connected, so its stored bindings cannot be shown.");
+            });
+            return;
+        }
         if !self.snap.has_profiles {
             theme::unsupported(ui, "onboard profiles, so bindings cannot be read");
             return;
@@ -1523,6 +1647,19 @@ impl App {
                 format!("The firmware implements {} lighting modes: {}.",
                         modes.len(), modes.join(", "))
             };
+            // Which of those the live setter takes is also the device's to say
+            // (`live_modes`), so it is read the same way. A fixed sentence
+            // naming fixed and breathing is true of one firmware.
+            let live = match self.snap.zones.first() {
+                Some(z) if !z.live_modes.is_empty() => format!(
+                    "Set live: {}. Any other mode has to be stored or streamed.",
+                    z.live_modes.iter().map(|m| led::mode_name(*m)).collect::<Vec<_>>().join(", ")
+                ),
+                Some(_) => "None of its lighting modes can be set live; they have to be \
+                            stored or streamed."
+                    .to_string(),
+                None => String::new(),
+            };
             let dpi = match &self.snap.dpi_cap {
                 Some(Capability::Range { min, max, step }) =>
                     format!("DPI is continuous, {min}-{max} in steps of {step}."),
@@ -1534,15 +1671,18 @@ impl App {
             };
             for line in [
                 lighting.as_str(),
+                live.as_str(),
                 "Wave, starlight, ripple and frame streaming are in HID++ but may be absent.",
-                "Only fixed and breathing can be set live; cycle has to be stored or streamed.",
                 "Animated effects are streamed from this app and stop when it stops.",
                 dpi.as_str(),
-                "Report rate cannot be set live in onboard mode, so it is written to flash.",
-                "Surface tuning and lift-off distance are out of scope: they sit behind",
-                "engineering-flagged features that can brick the mouse.",
+                "The live report rate is only accepted in host mode. To make one stick, \
+                 set it on the Profiles tab, which writes it to the profile.",
+                "Surface tuning and lift-off distance are out of scope: they sit behind \
+                 engineering-flagged features that can brick the mouse.",
             ] {
-                theme::hint(ui, line);
+                if !line.is_empty() {
+                    theme::hint(ui, line);
+                }
             }
             ui.add_space(8.0);
             theme::hint(ui, "Protocol detail is in PROTOCOL.md.");
@@ -1660,6 +1800,30 @@ mod tests {
     }
 
     #[test]
+    fn the_mode_list_is_what_every_selected_zone_has() {
+        let zone = |index: u8, modes: &[u8], live: &[u8]| device::ZoneInfo {
+            index,
+            location: String::new(),
+            modes: modes.to_vec(),
+            live_modes: live.to_vec(),
+        };
+        let a = zone(0, &[led::OFF, led::FIXED, led::BREATHING, led::CYCLE], &[led::FIXED, led::BREATHING]);
+        let b = zone(1, &[led::OFF, led::FIXED], &[led::FIXED]);
+        let zones = [a, b];
+        // One zone: its own list.
+        let one = selected_zones(&zones, false, 0);
+        assert_eq!(common_modes(&one, false), vec![led::OFF, led::FIXED, led::BREATHING, led::CYCLE]);
+        // All: only what both have, so "All" cannot send a mode the second
+        // zone has no effect for.
+        let all = selected_zones(&zones, true, 0);
+        assert_eq!(common_modes(&all, false), vec![led::OFF, led::FIXED]);
+        assert_eq!(common_modes(&all, true), vec![led::FIXED]);
+        // Nothing selected offers nothing.
+        assert!(selected_zones(&zones, false, 5).is_empty());
+        assert!(common_modes(&selected_zones(&zones, false, 5), false).is_empty());
+    }
+
+    #[test]
     fn a_zone_with_no_record_slot_writes_nothing() {
         // A third zone has no record behind it, and neither does a stale
         // selection on a device that reports none.
@@ -1685,7 +1849,10 @@ mod tests {
     fn the_service_and_the_rules_do_not_wait_for_a_mouse() {
         assert!(!tab_needs_device(Tab::Service));
         assert!(!tab_needs_device(Tab::Apps));
-        for t in [Tab::Sensor, Tab::Lighting, Tab::Profiles, Tab::Buttons, Tab::About] {
+        // The host bindings are a file, and their editor is built to be used
+        // with no mouse.
+        assert!(!tab_needs_device(Tab::Buttons));
+        for t in [Tab::Sensor, Tab::Lighting, Tab::Profiles, Tab::About] {
             assert!(tab_needs_device(t));
         }
     }
@@ -1792,10 +1959,20 @@ mod tests {
 
     #[test]
     fn a_backup_path_is_absolute_even_with_no_home() {
-        // `HOME` unset is not worth a panic, and a bare filename would write
-        // into whatever directory the app happened to be started from.
-        let p = default_backup_path();
-        assert!(p.ends_with("logi-backup.json"), "{p}");
-        assert!(p.len() > "logi-backup.json".len(), "{p} has no directory");
+        assert_eq!(
+            backup_path_in(Some("/home/u".into()), Some("/tmp".into())),
+            "/home/u/logi-backup.json"
+        );
+        // `HOME` unset, empty or relative is not worth a panic, and a bare
+        // filename would write into whatever directory the app was started
+        // from.
+        for home in [None, Some(String::new()), Some("relative".to_string())] {
+            assert_eq!(
+                backup_path_in(home, Some("/work".into())),
+                "/work/logi-backup.json"
+            );
+        }
+        assert_eq!(backup_path_in(None, None), "/logi-backup.json");
+        assert!(default_backup_path().starts_with('/'));
     }
 }

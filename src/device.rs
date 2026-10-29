@@ -465,13 +465,28 @@ impl Handle {
 /// One try at handing the mouse back on a handle of its own. True when the
 /// job is done or cannot be done by trying again (the endpoint is gone).
 fn hand_back_once() -> bool {
-    let Ok(found) = crate::discover::open_device() else { return false };
+    let found = match crate::discover::open_device() {
+        Ok(f) => f,
+        Err(e) => return hand_back_is_final(&e),
+    };
     let mut dev = found.device;
-    let Ok(p) = OnboardProfiles::new(&mut dev) else { return false };
+    let p = match OnboardProfiles::new(&mut dev) {
+        Ok(p) => p,
+        Err(e) => return hand_back_is_final(&e),
+    };
     match back_to_onboard(&p, &mut dev) {
-        Ok(()) | Err(crate::hidpp::Error::Io(_)) => true,
-        Err(_) => false,
+        Ok(()) => true,
+        Err(e) => hand_back_is_final(&e),
     }
+}
+
+/// Whether another try at handing the mouse back could not change this
+/// failure: the endpoint is gone, the device has no onboard mode to hand back
+/// to, or the node cannot be opened at all. Anything else may be one lost
+/// reply, which is exactly what the retries are for.
+fn hand_back_is_final(e: &crate::hidpp::Error) -> bool {
+    use crate::hidpp::Error;
+    matches!(e, Error::Io(_) | Error::NoSuchFeature(_) | Error::Permission(_))
 }
 
 /// Spawn the device worker. Returns immediately; the first snapshot arrives
@@ -987,17 +1002,20 @@ fn worker(
         // `Cmd::takes_host_mode`.
         let takes_host = cmd.takes_host_mode();
         let touches_mode = takes_host || cmd.touches_mode();
-        if takes_host {
-            host_held.store(true, Ordering::Relaxed);
-        }
 
         let Some(l) = live.as_mut() else {
             // Still an outcome: a panel waiting on this id must be told it
-            // failed, or it waits for an answer that is never coming.
+            // failed, or it waits for an answer that is never coming. No
+            // device was touched, so the host flag is left as it was: setting
+            // it here made every exit with the mouse unplugged hunt for a
+            // device to hand back.
             snap.record(Outcome::failed(id, kind, "device not connected"));
             publish(&shared, &snap);
             continue;
         };
+        if takes_host {
+            host_held.store(true, Ordering::Relaxed);
+        }
 
         let name_for_backup = l.name.clone();
         let wrote_flash = cmd.rereads_profiles();
@@ -1221,6 +1239,12 @@ fn worker(
                     // probing nodes: the snapshot should not claim a live
                     // mouse for that long.
                     snap.connected = false;
+                    // Carried over the reconnect like the effect's message:
+                    // a mouse that is already back (a USB hiccup, a replug)
+                    // is reconnected before the next frame, and the reconnect
+                    // wipes `error`, so the click that was lost would leave
+                    // nothing in the status bar.
+                    carried_error = snap.error.clone();
                 }
                 publish(&shared, &snap);
                 if gone {
@@ -1653,6 +1677,23 @@ mod tests {
         let kept = note_short_read(Some("profile 1 written to flash".into()), 0, 5).unwrap();
         assert!(kept.starts_with("profile 1 written to flash"), "{kept}");
         assert!(kept.contains("0 of 5"), "{kept}");
+    }
+
+    #[test]
+    fn only_a_failure_another_try_cannot_change_ends_the_hand_back() {
+        use crate::hidpp::Error;
+        // Nothing to hand back to, or nothing to hand back on.
+        assert!(hand_back_is_final(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        ))));
+        assert!(hand_back_is_final(&Error::NoSuchFeature(0x8100)));
+        assert!(hand_back_is_final(&Error::Permission("no permission".into())));
+        // One lost reply, a busy device, a node that has not reappeared yet:
+        // the mouse may still be in host mode, so these are tried again.
+        assert!(!hand_back_is_final(&Error::Timeout { feature: 0x0f, function: 1 }));
+        assert!(!hand_back_is_final(&Error::Device { code: 0x08, feature: 0x0f, function: 1 }));
+        assert!(!hand_back_is_final(&Error::NotFound("no Logitech device found".into())));
+        assert!(!hand_back_is_final(&Error::Protocol("short getInfo reply".into())));
     }
 
     #[test]

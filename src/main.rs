@@ -52,6 +52,9 @@ logi — control a Logitech mouse over HID++ 2.0
   logi bind run               act on those bindings until Ctrl-C
   logi bind reset             put the factory button mapping back. The escape
                               hatch if a button has stopped responding.
+  logi serve                  the background service: per-application profiles
+                              and button bindings, with no window. What the
+                              systemd user unit runs.
   logi backup <file>          dump every sector to JSON
   logi restore <file>         write a backup back to flash
   logi --help
@@ -62,16 +65,15 @@ e.g. G502_DEVICE=046d:c08b logi info
 ";
 
 fn main() -> std::process::ExitCode {
-    // Rust masks SIGPIPE, so `logi info | head` makes println! panic on EPIPE
-    // instead of exiting quietly. Restore the default so piping behaves.
-    // SAFETY: restoring a signal's default disposition before any threads or
-    // output exist.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
+        // The GUI keeps Rust's default of ignoring SIGPIPE. Its display
+        // connection and the tray's D-Bus socket are written to all the time,
+        // and with the default disposition restored, the compositor or the
+        // bus going away would kill the process outright instead of showing
+        // up as a failed write. A death by signal runs no Drop, so the effect
+        // thread would not hand the mouse back and a silenced button would
+        // stay silenced in the device.
         return match gui::run() {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(e) => {
@@ -80,6 +82,15 @@ fn main() -> std::process::ExitCode {
                 std::process::ExitCode::FAILURE
             }
         };
+    }
+
+    // Rust masks SIGPIPE, so `logi info | head` makes println! panic on EPIPE
+    // instead of exiting quietly. Restore the default so piping behaves. Only
+    // for the command line: see the GUI branch above.
+    // SAFETY: restoring a signal's default disposition before any threads or
+    // output exist.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     match run(&args) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -656,11 +667,15 @@ extern "C" fn on_hangup(_sig: libc::c_int) {
 
 fn install_interrupt_handler() {
     // SAFETY: installing handlers that do nothing but one relaxed atomic
-    // store, for three signals whose default action we are deliberately
+    // store, for four signals whose default action we are deliberately
     // replacing.
     unsafe {
         libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
         libc::signal(libc::SIGTERM, on_interrupt as *const () as libc::sighandler_t);
+        // Ctrl-\ is the other key people reach for when Ctrl-C seems slow.
+        // Its default action kills the process, and a kill skips the teardown
+        // exactly as SIGHUP's did.
+        libc::signal(libc::SIGQUIT, on_interrupt as *const () as libc::sighandler_t);
         // SIGHUP's default action is to kill us outright, and dying here skips
         // the teardown that un-silences buttons. Two ordinary things send it:
         // the installed unit's own `ExecReload=/bin/kill -HUP $MAINPID`, so
@@ -671,7 +686,7 @@ fn install_interrupt_handler() {
     }
 }
 
-/// Asked to stop: Ctrl-C or SIGTERM.
+/// Asked to stop: Ctrl-C, Ctrl-\ or SIGTERM.
 fn stopping() -> bool {
     INTERRUPTED.load(Ordering::Relaxed)
 }
@@ -771,6 +786,21 @@ fn survive_closed_output() {
     }
 }
 
+/// Run a device operation, and once more if it failed for any reason other
+/// than the endpoint being gone.
+///
+/// For the button-table restore, which is idempotent and is the one write whose
+/// failure leaves a mouse that cannot click. A reply the device drops is the
+/// ordinary way a single call fails, and at teardown there is no second chance
+/// short of the user noticing and running `logi bind reset`. An endpoint that
+/// is gone will not come back inside this call, so that is not retried.
+fn try_twice<T>(mut op: impl FnMut() -> hidpp::Result<T>) -> hidpp::Result<T> {
+    match op() {
+        Err(e) if !endpoint_gone(&e) => op(),
+        r => r,
+    }
+}
+
 /// Whether a table this process silenced is still not known to be put back.
 fn restore_owed() -> bool {
     OWED_RESTORE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
@@ -792,10 +822,52 @@ fn settle_owed_restore(dev: &mut hidpp::Device) -> hidpp::Result<()> {
         ));
     };
     if spy.get_remapping(dev)? != saved {
-        spy.restore(dev)?;
+        try_twice(|| spy.restore(dev))?;
         eprintln!("logi: button mapping restored on the reconnected mouse");
     }
     Ok(())
+}
+
+/// `settle_owed_restore` on whichever mouse is attached, for a service with
+/// nothing else to connect for.
+///
+/// `serve_once` settles on every connection, but the service only connects
+/// when there are rules or bindings to run. A teardown that failed because the
+/// mouse was unplugged, followed by the user emptying the bindings file, would
+/// otherwise leave the silenced table in the device for as long as the service
+/// idled, with nothing anywhere trying to put it back.
+fn settle_offline() -> hidpp::Result<()> {
+    let mut f = discover::open_device_matching(wanted_device().as_deref())?;
+    if !f.caps.button_spy {
+        return Err(hidpp::Error::Protocol(format!(
+            "{} has no button-spy feature, so the silenced table cannot be checked on it",
+            f.name
+        )));
+    }
+    settle_owed_restore(&mut f.device)?;
+    restore_done();
+    Ok(())
+}
+
+/// Wait out an idle period, trying to settle an owed restore first and again
+/// sooner than `secs` while one is still owed.
+///
+/// `announced` keeps a failure that repeats every ten seconds from filling the
+/// journal.
+fn idle_nap(secs: u64, announced: &mut Option<String>) {
+    if restore_owed() {
+        match settle_offline() {
+            Ok(()) => *announced = None,
+            Err(e) => {
+                let msg = format!("the button mapping may still be silenced from the last run: {e}");
+                if announced.as_deref() != Some(msg.as_str()) {
+                    eprintln!("logi: {msg}. `logi bind reset` puts it back.");
+                    *announced = Some(msg);
+                }
+            }
+        }
+    }
+    nap(if restore_owed() { secs.min(10) } else { secs });
 }
 
 /// Make a panic undo any silencing before the process dies.
@@ -1056,19 +1128,30 @@ fn cmd_bind_run() -> Result<(), CliError> {
     if let Err(e) = spy.stop(&mut f.device) {
         eprintln!("logi: could not stop the spy: {e}");
     }
+    let mut restore_failed = false;
     if silenced {
-        match spy.restore(&mut f.device) {
+        match try_twice(|| spy.restore(&mut f.device)) {
             Ok(()) => {
                 restore_done();
                 println!("logi: button mapping restored")
             }
-            Err(e) => eprintln!(
-                "logi: COULD NOT RESTORE the button mapping: {e}\n\
-                 Run `logi bind reset` to put it back."
-            ),
+            Err(e) => {
+                restore_failed = true;
+                eprintln!(
+                    "logi: COULD NOT RESTORE the button mapping: {e}\n\
+                     Run `logi bind reset` to put it back."
+                )
+            }
         }
     }
-    outcome
+    match outcome {
+        // A clean Ctrl-C that left buttons silenced is not a success: a script
+        // or a unit that sees exit 0 has no reason to look at the mouse.
+        Ok(()) if restore_failed => Err(CliError::Failed(
+            "the button mapping was not put back; `logi bind reset` does it".into(),
+        )),
+        other => other,
+    }
 }
 
 /// The bindings the service should act on: none when there is no file, or it
@@ -1160,6 +1243,7 @@ fn cmd_serve() -> Result<(), CliError> {
     let mut announced_problem: Option<String> = None;
     let mut announced_bindings_problem: Option<String> = None;
     let mut announced_parse: Vec<String> = Vec::new();
+    let mut announced_settle: Option<String> = None;
     while !stopping() {
         // A hangup is the unit's ExecReload. serve_once has already torn down
         // by the time we get here, so re-reading the file is all it takes.
@@ -1169,6 +1253,7 @@ fn cmd_serve() -> Result<(), CliError> {
             announced_problem = None;
             announced_bindings_problem = None;
             announced_parse.clear();
+            announced_settle = None;
         }
         // A file that is there but unreadable is not the same as no file, and
         // saying "no rules" about it sends the user to write an example over
@@ -1183,7 +1268,7 @@ fn cmd_serve() -> Result<(), CliError> {
                     eprintln!("logi: {msg}; retrying every 60s until it clears");
                     announced_problem = Some(msg);
                 }
-                nap(60);
+                idle_nap(60, &mut announced_settle);
                 continue;
             }
         };
@@ -1218,7 +1303,7 @@ fn cmd_serve() -> Result<(), CliError> {
                         announced_idle = true;
                     }
                     // Nothing to do, so wait rather than spin or exit.
-                    nap(60);
+                    idle_nap(60, &mut announced_settle);
                     None
                 }
             }
@@ -1234,7 +1319,7 @@ fn cmd_serve() -> Result<(), CliError> {
                         eprintln!("logi: {} has no rules yet; idling", path.display());
                         announced_idle = true;
                     }
-                    nap(30);
+                    idle_nap(30, &mut announced_settle);
                     None
                 } else {
                     Some(cfg)
@@ -1256,8 +1341,21 @@ fn cmd_serve() -> Result<(), CliError> {
             Ok(()) => announced_problem = None,
         }
     }
+    // Stopping with a restore still owed: the teardown that silenced buttons
+    // could not finish, typically because the mouse had been unplugged, and
+    // the mouse may have been plugged back in since. This is the last chance
+    // to put the non-volatile table back; after it nothing remembers.
+    // Unsettled is a failure, not a clean stop: a unit that exits 0 here gives
+    // nobody a reason to look at the mouse.
+    let unsettled = if restore_owed() { settle_offline().err() } else { None };
     eprintln!("logi: service stopping");
-    Ok(())
+    match unsettled {
+        None => Ok(()),
+        Some(e) => Err(CliError::Failed(format!(
+            "stopping with the button mapping possibly still silenced: {e}\n\
+             `logi bind reset` puts it back."
+        ))),
+    }
 }
 
 /// One connected run of the service: per-application profile switching and
@@ -1422,14 +1520,17 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
             eprintln!("logi: could not stop the spy: {e}");
         }
         if s.silenced {
-            match s.spy.restore(dev) {
+            match try_twice(|| s.spy.restore(dev)) {
                 Ok(()) => {
                     restore_done();
                     eprintln!("logi: button mapping restored")
                 }
+                // Still owed, so the next connection (or the idle loop) tries
+                // again; the manual command is for when the service is not
+                // running.
                 Err(e) => eprintln!(
-                    "logi: COULD NOT RESTORE the button mapping: {e}. \
-                     Run `logi bind reset`."
+                    "logi: COULD NOT RESTORE the button mapping: {e}. The service tries \
+                     again when the mouse is back; `logi bind reset` does it now."
                 ),
             }
         }
@@ -1487,7 +1588,7 @@ fn start_spy(
         Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced }),
         Err(e) => {
             if silenced {
-                match spy.restore(dev) {
+                match try_twice(|| spy.restore(dev)) {
                     Ok(()) => restore_done(),
                     Err(e2) => eprintln!(
                         "logi: COULD NOT RESTORE the button mapping: {e2}. \
@@ -1673,8 +1774,9 @@ fn cmd_restore(path: &str) -> Result<(), CliError> {
         CliError::Failed(format!(
             "{e}\n\
              \n\
-             Some sectors may already have been written, so the mouse can be\n\
-             part way between this backup and what it held before. Run\n\
+             Unless the message above says nothing was written, some sectors may\n\
+             already have been, so the mouse can be part way between this backup\n\
+             and what it held before. Run\n\
              \x20   logi restore {path}\n\
              again once the device answers: it rewrites only the sectors that\n\
              still differ."
@@ -1821,6 +1923,45 @@ mod tests {
         assert!(super::restore_owed());
         super::restore_done();
         assert!(!super::restore_owed());
+    }
+
+    #[test]
+    fn a_dropped_reply_is_tried_again_but_a_gone_endpoint_is_not() {
+        use crate::hidpp::Error;
+        // The restore at teardown is the write that must not fail for want of
+        // one lost reply.
+        let mut calls = 0;
+        let r = super::try_twice(|| {
+            calls += 1;
+            if calls == 1 { Err(Error::Timeout { feature: 1, function: 4 }) } else { Ok(calls) }
+        });
+        assert_eq!(r.unwrap(), 2);
+
+        // Both attempts failing is still a failure, reported, after exactly two.
+        let mut calls = 0;
+        let r: crate::hidpp::Result<()> = super::try_twice(|| {
+            calls += 1;
+            Err(Error::Timeout { feature: 1, function: 4 })
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 2);
+
+        // A dead descriptor stays dead inside one call.
+        let mut calls = 0;
+        let r: crate::hidpp::Result<()> = super::try_twice(|| {
+            calls += 1;
+            Err(Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)))
+        });
+        assert!(r.is_err());
+        assert_eq!(calls, 1);
+
+        // Success is not repeated.
+        let mut calls = 0;
+        let _ = super::try_twice(|| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 1);
     }
 
     #[test]
