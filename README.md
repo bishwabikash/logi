@@ -232,11 +232,14 @@ verified and what is not.
 
 ## Contributing
 
-CI builds and tests every push and pull request. Releases are described in
-[RELEASING.md](RELEASING.md). `cargo test` runs the suite and needs no hardware. If you have a Logitech mouse
-other than the G502 HERO, the most useful thing is the output of `logi devices`
-and `logi info` and a note of what worked. Be careful with anything that
-writes: take `logi backup` first.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers what is
+most useful, how to build and test, and the rules for anything that writes to
+a mouse. The most valuable thing you can do is report what happens on a mouse
+other than the G502 HERO: send the output of `logi devices` and `logi info`.
+Take `logi backup` before running anything that writes.
+
+CI builds and tests every push and pull request, and `cargo test` needs no
+hardware. Releases are described in [RELEASING.md](RELEASING.md).
 
 ## License
 

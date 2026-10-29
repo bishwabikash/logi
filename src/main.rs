@@ -61,6 +61,7 @@ logi — control a Logitech mouse over HID++ 2.0
                               systemd user unit runs.
   logi backup <file>          dump every sector to JSON
   logi restore <file>         write a backup back to flash
+  logi --version
   logi --help
 
 Colours take hex (ff0066, #ff0066) or a name (red, cyan, purple...).
@@ -159,6 +160,10 @@ fn open() -> Result<discover::Found, CliError> {
 
 fn run(args: &[String]) -> Result<(), CliError> {
     match args[0].as_str() {
+        "-V" | "--version" | "version" => {
+            println!("logi {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "-h" | "--help" | "help" => {
             print!("{USAGE}");
             Ok(())
