@@ -96,6 +96,25 @@ Each of these cost real debugging; they are written up in PROTOCOL.md.
 * Profile sector DPI stages are little-endian; the sector CRC is big-endian
   CRC-16/CCITT-FALSE over bytes 0..253.
 
+## Code review: ended at round seven, by decision
+
+Ten units were reviewed in rounds by independent agents, each fixing in place.
+Non-minor findings per round: 25, 17, 16, 9, 13, 4, 2. Criticals: 4, 2, 2, then
+none from round four on. 408 tests.
+
+Every unit's last completed review found nothing non-minor except `cli`, whose
+two round-seven fixes (retrying the button-table restore at teardown, and
+settling a restore still owed from an earlier unplug) were made and then not
+re-reviewed, because round eight was stopped as it began.
+
+**This is static review, and it cannot confirm what the hardware does.** Every
+protocol fact that broke something in this project was found on the mouse, not
+in review. Not yet exercised against the device: the service acting on button
+bindings, silencing a button (which rests on how the remapping table's values
+are read), the profile editor saving to flash, and the Rust virtual input
+device. Silencing matters most, since the table is non-volatile and a wrong
+assumption leaves a mouse that cannot click. `logi bind reset` restores it.
+
 ## Next: the app should follow the device live
 
 Today nothing the mouse does on its own reaches the app. The worker waits for
