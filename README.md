@@ -1,5 +1,7 @@
 # logi
 
+[![CI](https://github.com/bishwabikash/logi/actions/workflows/ci.yml/badge.svg)](https://github.com/bishwabikash/logi/actions/workflows/ci.yml)
+
 A driver and management app for Logitech mice on Linux, written against the
 HID++ 2.0 protocol. One native binary: a window, a tray icon, a background
 service and a command line. No Python and no runtime dependencies beyond the
