@@ -16,6 +16,7 @@ mod features;
 mod gui;
 mod hidpp;
 mod led;
+mod live;
 mod profile_blob;
 mod profile_io;
 mod profiles;
@@ -32,6 +33,9 @@ logi — control a Logitech mouse over HID++ 2.0
   logi                        open the graphical app
   logi devices                every Logitech HID++ device, and what it can do
   logi info                   capabilities and current state
+  logi state [--follow]       what the app shows right now; with --follow, print
+                              a line each time the mouse's own state changes
+                              (DPI button, profile button, other software)
   logi dpi [<n>]              show or set DPI (continuous, snapped to the step)
   logi rate [<hz>] [--live]   show or set the report rate; persists to the
                               active profile unless --live is given
@@ -161,6 +165,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         }
         "devices" | "list" => cmd_devices(),
         "info" => cmd_info(),
+        "state" => cmd_state(&args[1..]),
         "dpi" => cmd_dpi(args.get(1)),
         "rate" => cmd_rate(&args[1..]),
         "profile" => cmd_profile(&args[1..]),
@@ -208,6 +213,74 @@ fn cmd_devices() -> Result<(), CliError> {
     }
     if found.len() > 1 {
         println!("Pick one with G502_DEVICE=<id>, e.g. G502_DEVICE={}", found[0].id());
+    }
+    Ok(())
+}
+
+fn state_line(s: &device::Snapshot) -> String {
+    let stage = match s.dpi_stage() {
+        Some((pos, total)) => format!("  stage {pos}/{total}"),
+        None => String::new(),
+    };
+    let event = match &s.last_event {
+        Some(e) => format!("  (last: {e})"),
+        None => String::new(),
+    };
+    format!(
+        "dpi {}{stage}  profile {}  rate {} Hz  mode {}  announced {}{event}",
+        s.dpi,
+        s.active_profile,
+        s.rate,
+        profiles::mode_name(s.mode),
+        s.events_seen,
+    )
+}
+
+/// Print what the window would show, once, or each time it changes.
+///
+/// Goes through the same worker and snapshot as the GUI, so watching this is
+/// watching what the GUI would draw. It never writes to the device.
+fn cmd_state(args: &[String]) -> Result<(), CliError> {
+    let follow = args.iter().any(|a| a == "--follow" || a == "-f");
+    let handle = device::spawn();
+
+    let started = std::time::Instant::now();
+    let mut snap = handle.snapshot();
+    while !snap.connected && started.elapsed() < std::time::Duration::from_secs(6) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        snap = handle.snapshot();
+    }
+    if !snap.connected {
+        return Err(CliError::Failed(
+            snap.error.unwrap_or_else(|| "no device found".to_string()),
+        ));
+    }
+    println!("{}  ({})", snap.model, snap.path);
+    println!("{}", state_line(&snap));
+    if !follow {
+        return Ok(());
+    }
+
+    println!("following; Ctrl-C to stop");
+    install_interrupt_handler();
+    let t0 = std::time::Instant::now();
+    let mut last = state_line(&snap);
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let s = handle.snapshot();
+        if !s.connected {
+            if last != "disconnected" {
+                println!("[{:6.1}s] disconnected: {}", t0.elapsed().as_secs_f32(),
+                         s.error.as_deref().unwrap_or("no reason given"));
+                last = "disconnected".to_string();
+            }
+            continue;
+        }
+        let line = state_line(&s);
+        if line != last {
+            println!("[{:6.1}s] {line}", t0.elapsed().as_secs_f32());
+            last = line;
+        }
     }
     Ok(())
 }

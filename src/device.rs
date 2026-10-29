@@ -187,6 +187,8 @@ pub struct Snapshot {
     pub firmware: String,
     pub protocol: String,
     pub dpi: u16,
+    /// Which DPI stage is active, as an index into the profile's stages.
+    pub dpi_index: Option<u8>,
     pub dpi_cap: Option<Capability>,
     pub rate: u16,
     pub rates: Vec<u16>,
@@ -196,6 +198,13 @@ pub struct Snapshot {
     pub zones: Vec<ZoneInfo>,
     pub profiles: Vec<Profile>,
     pub mode: u8,
+    /// How many times the mouse has announced a change on its own since this
+    /// connection. Zero for a long time while the buttons are being pressed
+    /// means this mouse does not announce them, and the slow re-read is what
+    /// keeps the app current.
+    pub events_seen: u64,
+    /// What the last announcement was, for the diagnostics line.
+    pub last_event: Option<String>,
     pub effect_running: Option<String>,
     /// Most recent error, for the status bar.
     pub error: Option<String>,
@@ -249,6 +258,22 @@ impl Snapshot {
     }
 
     /// The outcome for `id`, if it is still in the ring.
+    /// The active DPI stage as (position, total) among the enabled stages,
+    /// counting from one: "stage 2 of 4".
+    ///
+    /// None when the index is unknown or names a slot that is disabled or past
+    /// the end, rather than guessing a position for it.
+    pub fn dpi_stage(&self) -> Option<(usize, usize)> {
+        let i = self.dpi_index? as usize;
+        let stages = &self.profiles.get(self.active_profile as usize)?.dpi;
+        if stages.get(i).copied().unwrap_or(0) == 0 {
+            return None;
+        }
+        let pos = stages[..=i].iter().filter(|d| **d != 0).count();
+        let total = stages.iter().filter(|d| **d != 0).count();
+        Some((pos, total))
+    }
+
     pub fn outcome(&self, id: CmdId) -> Option<&Outcome> {
         self.outcomes.iter().find(|o| o.id == id)
     }
@@ -558,6 +583,11 @@ struct Live {
     dpi: Option<Dpi>,
     rate: Option<ReportRate>,
     profiles: Option<OnboardProfiles>,
+    /// What the listener thread has seen. Present even without a listener, so
+    /// the worker does not have to ask whether there is one.
+    pulse: Arc<crate::live::Pulse>,
+    /// Dropped with the connection, which stops and joins its thread.
+    _listener: Option<crate::live::Listener>,
 }
 
 /// Fail a command cleanly when the device lacks the feature it needs.
@@ -607,7 +637,24 @@ fn connect() -> Result<Live, String> {
         .onboard_profiles
         .then(|| OnboardProfiles::new(&mut dev).ok())
         .flatten();
-    Ok(Live { dev, name: found.name, kind: found.kind, caps, leds, dpi, rate, profiles })
+    // Only onboard profiles announce anything. A device without them, or one
+    // whose second handle will not open, simply falls back on the slow re-read.
+    let pulse = Arc::new(crate::live::Pulse::default());
+    let listener = profiles.as_ref().and_then(|p| {
+        crate::live::Listener::spawn(&dev, p.feature_index(), Arc::clone(&pulse)).ok()
+    });
+    Ok(Live {
+        dev,
+        name: found.name,
+        kind: found.kind,
+        caps,
+        leds,
+        dpi,
+        rate,
+        profiles,
+        pulse,
+        _listener: listener,
+    })
 }
 
 /// Cheap state: about seven HID++ round trips.
@@ -651,6 +698,11 @@ fn read_state(l: &mut Live, into: &mut Snapshot) -> bool {
         into.button_count = p.info.button_count;
         into.profile_format = p.info.profile_format_id;
         into.active_profile = p.current(&mut l.dev).unwrap_or(into.active_profile);
+        // Kept on a failed read rather than cleared, so one dropped reply does
+        // not make the stage indicator flicker away.
+        if let Ok(i) = p.dpi_index(&mut l.dev) {
+            into.dpi_index = Some(i);
+        }
         if let Ok(m) = p.mode(&mut l.dev) {
             into.mode = m;
             mode_read = true;
@@ -828,6 +880,75 @@ fn write_backup(
 /// Published in one assignment, so the outcome of a flash write and the
 /// re-read that followed it still become visible together: the profile editor
 /// settles a write by reading both out of the same snapshot.
+/// How often an idle worker looks up: for a nudge from the listener, for an
+/// effect that has died, for a command. Also the most a nudge is delayed.
+const IDLE_TICK: Duration = Duration::from_millis(150);
+
+/// How often an idle worker re-reads the device whether or not anything
+/// announced a change. The backstop for a mouse that does not announce, and for
+/// changes made by other software or by the service in another process.
+const RECONCILE: Duration = Duration::from_millis(1500);
+
+/// The fields a re-read can change and a panel can show.
+///
+/// Compared before and after so a re-read that found nothing new does not
+/// publish, which would clone the whole snapshot (profiles included) ten times
+/// a second for no one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveKey {
+    dpi: u16,
+    dpi_index: Option<u8>,
+    rate: u16,
+    profile: u8,
+    mode: u8,
+    events: u64,
+}
+
+impl LiveKey {
+    fn of(s: &Snapshot) -> Self {
+        LiveKey {
+            dpi: s.dpi,
+            dpi_index: s.dpi_index,
+            rate: s.rate,
+            profile: s.active_profile,
+            mode: s.mode,
+            events: s.events_seen,
+        }
+    }
+}
+
+enum Resync {
+    /// Nothing a panel shows has changed.
+    Same,
+    Changed,
+    /// The endpoint is gone: unplugged, or the node was replaced.
+    Gone,
+}
+
+/// Re-read the cheap state and say whether it moved.
+fn resync(l: &mut Live, snap: &mut Snapshot) -> Resync {
+    // A read that fails is indistinguishable from "unchanged" if every error is
+    // swallowed, which is how an unplugged mouse used to read as healthy. Only
+    // an I/O failure means the endpoint is gone; a timeout means busy, and the
+    // next pass will try again.
+    match l.dev.protocol_version() {
+        Err(crate::hidpp::Error::Io(_)) | Err(crate::hidpp::Error::NotFound(_)) => {
+            return Resync::Gone;
+        }
+        Err(_) => return Resync::Same,
+        Ok(_) => {}
+    }
+    let before = LiveKey::of(snap);
+    read_state(l, snap);
+    snap.events_seen = l.pulse.count();
+    snap.last_event = l.pulse.last().map(|e| e.describe());
+    if LiveKey::of(snap) == before {
+        Resync::Same
+    } else {
+        Resync::Changed
+    }
+}
+
 fn publish(shared: &Mutex<Snapshot>, snap: &Snapshot) {
     if let Ok(mut g) = shared.lock() {
         *g = snap.clone();
@@ -866,6 +987,7 @@ fn worker(
     // wipes `error` along with everything else read off the device, so a
     // message set at retirement was gone again before the UI could draw it.
     let mut carried_error: Option<String> = None;
+    let mut last_resync = std::time::Instant::now();
 
     loop {
         // Reconnect lazily so unplug/replug is handled without crashing.
@@ -882,6 +1004,7 @@ fn worker(
                         read_profiles(&mut l, &mut snap);
                         snap.error = carried_error.take();
                         live = Some(l);
+                        last_resync = std::time::Instant::now();
                         publish(&shared, &snap);
                     }
                     Err(e) => {
@@ -903,7 +1026,7 @@ fn worker(
         // Anything queued by the previous iteration runs before we block.
         let (id, cmd) = match pending.pop_front() {
             Some(c) => c,
-            None => match rx.recv_timeout(Duration::from_millis(400)) {
+            None => match rx.recv_timeout(IDLE_TICK) {
                 Ok(c) => c,
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // An effect thread that died on its own (the mouse was
@@ -944,6 +1067,31 @@ fn worker(
                             carried_error = snap.error.clone();
                         }
                         publish(&shared, &snap);
+                    }
+
+                    // Follow the device. Nothing else is asking it anything, so
+                    // this is where a change made on the mouse itself, or by
+                    // other software, gets noticed. Not while an effect holds
+                    // the device: it has its own handle, and `live` is empty.
+                    if effect.is_none() && live.is_some() {
+                        let nudged = live.as_ref().map_or(false, |l| l.pulse.take_dirty());
+                        if nudged || last_resync.elapsed() >= RECONCILE {
+                            last_resync = std::time::Instant::now();
+                            // Closed once the exit-time restore has the device.
+                            if let Some(_busy) = gate.enter() {
+                                match live.as_mut().map(|l| resync(l, &mut snap)) {
+                                    Some(Resync::Changed) => publish(&shared, &snap),
+                                    Some(Resync::Gone) => {
+                                        snap.connected = false;
+                                        snap.error =
+                                            Some("the mouse was disconnected".to_string());
+                                        live = None;
+                                        publish(&shared, &snap);
+                                    }
+                                    Some(Resync::Same) | None => {}
+                                }
+                            }
+                        }
                     }
                     continue;
                 }
@@ -1280,6 +1428,64 @@ fn worker(
 
 #[cfg(test)]
 mod tests {
+    fn snap_with_stages(stages: [u16; 5], active: u8, index: Option<u8>) -> Snapshot {
+        // A profile parsed from a real-shaped sector, with only the DPI slots set.
+        let mut blob = [0xFFu8; crate::profile_blob::SECTOR_SIZE];
+        for (n, d) in stages.iter().enumerate() {
+            blob[3 + n * 2..5 + n * 2].copy_from_slice(&d.to_le_bytes());
+        }
+        let crc = crate::profile_blob::crc_ccitt(&blob[..crate::profile_blob::OFF_CRC]);
+        blob[crate::profile_blob::OFF_CRC..].copy_from_slice(&crc.to_be_bytes());
+        let mut s = Snapshot::default();
+        s.profiles = vec![Profile::parse(&blob).unwrap()];
+        s.active_profile = active;
+        s.dpi_index = index;
+        s
+    }
+
+    #[test]
+    fn the_stage_counts_only_enabled_slots() {
+        // Slot 1 is disabled, so slot 2 is the second stage, not the third.
+        let s = snap_with_stages([800, 0, 1600, 3200, 0], 0, Some(2));
+        assert_eq!(s.dpi_stage(), Some((2, 3)));
+        let s = snap_with_stages([800, 0, 1600, 3200, 0], 0, Some(0));
+        assert_eq!(s.dpi_stage(), Some((1, 3)));
+    }
+
+    #[test]
+    fn a_stage_that_is_not_there_has_no_position() {
+        // Disabled slot, past the end, no index, and no such profile.
+        assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 0, Some(1)).dpi_stage(), None);
+        assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 0, Some(9)).dpi_stage(), None);
+        assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 0, None).dpi_stage(), None);
+        assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 3, Some(0)).dpi_stage(), None);
+    }
+
+    #[test]
+    fn the_live_key_sees_every_field_a_panel_shows() {
+        let base = Snapshot::default();
+        let key = LiveKey::of(&base);
+        let mut s = base.clone();
+        s.dpi = 1600;
+        assert_ne!(LiveKey::of(&s), key, "dpi");
+        let mut s = base.clone();
+        s.dpi_index = Some(1);
+        assert_ne!(LiveKey::of(&s), key, "dpi stage");
+        let mut s = base.clone();
+        s.rate = 500;
+        assert_ne!(LiveKey::of(&s), key, "rate");
+        let mut s = base.clone();
+        s.active_profile = 2;
+        assert_ne!(LiveKey::of(&s), key, "profile");
+        let mut s = base.clone();
+        s.mode = 2;
+        assert_ne!(LiveKey::of(&s), key, "mode");
+        let mut s = base.clone();
+        s.events_seen = 1;
+        assert_ne!(LiveKey::of(&s), key, "event count");
+        assert_eq!(LiveKey::of(&base.clone()), key, "an untouched copy is the same");
+    }
+
     use super::*;
     use crate::profile_blob::{Button, Led, LED_RECORD, OFF_CRC, OFF_RATE, SECTOR_SIZE};
 

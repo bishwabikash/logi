@@ -564,7 +564,10 @@ impl eframe::App for App {
         self.sync_tray(ctx);
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
-        ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        // The worker can publish a change at any time, and nothing wakes the
+        // window when it does, so this is the longest a change can wait to be
+        // drawn. Cheap: the frame is small and nothing else is animating.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
 
         self.draw_sidebar(ctx);
         self.draw_status(ctx);
@@ -873,6 +876,17 @@ impl App {
         });
     }
 
+    /// "stage 2 of 4", under the DPI figure, once the mouse says which stage is
+    /// active. It is what changes when the DPI button on the mouse is pressed.
+    fn stage_hint(&self, ui: &mut egui::Ui) {
+        if let Some((pos, total)) = self.snap.dpi_stage() {
+            theme::hint(
+                ui,
+                &format!("stage {pos} of {total} in profile {}", self.snap.active_profile),
+            );
+        }
+    }
+
     fn draw_sensor(&mut self, ui: &mut egui::Ui) {
         if !self.snap.has_dpi && !self.snap.has_rate {
             theme::unsupported(ui, "an adjustable sensor");
@@ -898,6 +912,7 @@ impl App {
         } else if let Some(stages) = stages {
             theme::section(ui, "Sensor", |ui| {
                 theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+                self.stage_hint(ui);
                 ui.add_space(10.0);
                 if stages.is_empty() {
                     theme::hint(ui, "The sensor reported no DPI values, so there is \
@@ -923,6 +938,7 @@ impl App {
             // would be a claim about hardware nobody asked.
             theme::section(ui, "Sensor", |ui| {
                 theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+                self.stage_hint(ui);
                 ui.add_space(10.0);
                 theme::hint(
                     ui,
@@ -933,6 +949,7 @@ impl App {
         } else {
         theme::section(ui, "Sensor", |ui| {
             theme::readout(ui, &self.snap.dpi.to_string(), "DPI");
+                self.stage_hint(ui);
             ui.add_space(10.0);
             let resp = ui.add(
                 egui::Slider::new(&mut self.dpi, min..=max)
@@ -1628,6 +1645,22 @@ impl App {
             theme::row(ui, "node", &self.snap.path);
             theme::row(ui, "HID++", &self.snap.protocol);
             theme::row(ui, "mode", crate::profiles::mode_name(self.snap.mode));
+        });
+        ui.add_space(14.0);
+        theme::section(ui, "Following the mouse", |ui| {
+            theme::row(ui, "announced", &self.snap.events_seen.to_string());
+            if let Some(last) = &self.snap.last_event {
+                theme::row(ui, "last", last);
+            }
+            ui.add_space(4.0);
+            theme::hint(
+                ui,
+                "The window follows changes made on the mouse itself, such as the \
+                 DPI and profile buttons. A mouse that announces them is picked up \
+                 at once; either way the device is re-read about every second and a \
+                 half. If the DPI buttons are pressed and this stays at zero, this \
+                 mouse does not announce them and that re-read is doing the work.",
+            );
         });
         ui.add_space(14.0);
         theme::section(ui, "What this hardware can and cannot do", |ui| {
