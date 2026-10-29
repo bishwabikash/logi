@@ -979,7 +979,11 @@ impl App {
             }
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
-                for p in [400u16, 800, 1600, 3200, 6400, 12800, 25600] {
+                // The stages stored in the active profile, which are what the
+                // DPI button on the mouse cycles through. Not a list of common
+                // values: that had no 2400 in it, and a mouse whose fourth
+                // stage is 2400 lit nothing at that level.
+                for p in self.snap.dpi_stages() {
                     if p < min || p > max {
                         continue;
                     }
@@ -991,9 +995,19 @@ impl App {
                 }
             });
             ui.add_space(8.0);
+            let stages = self.snap.dpi_stages();
             theme::hint(
                 ui,
-                &format!("Continuous: {min}-{max} in steps of {step}. Not fixed stages."),
+                &if stages.is_empty() {
+                    format!("The slider takes any value from {min} to {max} in steps of {step}.")
+                } else {
+                    format!(
+                        "The buttons are the stages stored in profile {}, the ones the DPI \
+                         button on the mouse cycles through. The slider takes any value from \
+                         {min} to {max} in steps of {step}.",
+                        self.snap.active_profile
+                    )
+                },
             );
         });
         }

@@ -258,15 +258,33 @@ impl Snapshot {
     }
 
     /// The outcome for `id`, if it is still in the ring.
+    /// The enabled DPI stages of the active profile, in slot order, as the
+    /// mouse stores them. These are what its DPI button cycles through.
+    ///
+    /// Read off the sector, never assumed: a fixed list of "common" values
+    /// has no 2400 in it, and a mouse whose fourth stage is 2400 then lit
+    /// nothing at that level.
+    pub fn dpi_stages(&self) -> Vec<u16> {
+        self.profiles
+            .get(self.active_profile as usize)
+            .map(|p| p.dpi.iter().copied().filter(|d| *d != 0).collect())
+            .unwrap_or_default()
+    }
+
     /// The active DPI stage as (position, total) among the enabled stages,
     /// counting from one: "stage 2 of 4".
     ///
-    /// None when the index is unknown or names a slot that is disabled or past
-    /// the end, rather than guessing a position for it.
+    /// None when the index is unknown, names a disabled slot or one past the
+    /// end, or when the DPI is not that stage's value. The last matters
+    /// because the stage index and the sensor DPI are two registers that do
+    /// not always change together: a read taken between the two updates, or a
+    /// DPI set from the host that is not any stage, would otherwise be shown
+    /// as a stage it is not.
     pub fn dpi_stage(&self) -> Option<(usize, usize)> {
         let i = self.dpi_index? as usize;
         let stages = &self.profiles.get(self.active_profile as usize)?.dpi;
-        if stages.get(i).copied().unwrap_or(0) == 0 {
+        let here = stages.get(i).copied().unwrap_or(0);
+        if here == 0 || here != self.dpi {
             return None;
         }
         let pos = stages[..=i].iter().filter(|d| **d != 0).count();
@@ -1440,6 +1458,8 @@ mod tests {
         s.profiles = vec![Profile::parse(&blob).unwrap()];
         s.active_profile = active;
         s.dpi_index = index;
+        // The sensor reads what the stage says, which is the normal case.
+        s.dpi = index.and_then(|i| stages.get(i as usize).copied()).unwrap_or(0);
         s
     }
 
@@ -1459,6 +1479,32 @@ mod tests {
         assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 0, Some(9)).dpi_stage(), None);
         assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 0, None).dpi_stage(), None);
         assert_eq!(snap_with_stages([800, 0, 1600, 0, 0], 3, Some(0)).dpi_stage(), None);
+    }
+
+    #[test]
+    fn the_stages_are_the_ones_stored_on_the_mouse() {
+        // A fourth stage of 2400 is not in any list of common values.
+        let s = snap_with_stages([400, 800, 1600, 2400, 0], 0, Some(3));
+        assert_eq!(s.dpi_stages(), vec![400, 800, 1600, 2400]);
+        // Disabled slots are skipped, and the order is the slot order.
+        let s = snap_with_stages([800, 0, 3200, 0, 6400], 0, Some(0));
+        assert_eq!(s.dpi_stages(), vec![800, 3200, 6400]);
+        // Nothing read yet means nothing to offer, not a made-up list.
+        assert!(Snapshot::default().dpi_stages().is_empty());
+        assert!(snap_with_stages([400, 800, 0, 0, 0], 3, None).dpi_stages().is_empty());
+    }
+
+    #[test]
+    fn a_stage_is_shown_only_when_the_dpi_is_that_stage() {
+        let mut s = snap_with_stages([400, 800, 1600, 2400, 0], 0, Some(2));
+        assert_eq!(s.dpi_stage(), Some((3, 4)));
+        // The index moved and the sensor has not caught up yet: the two
+        // registers do not change together, and this must not read as stage 3.
+        s.dpi = 800;
+        assert_eq!(s.dpi_stage(), None);
+        // A DPI set from the host that is no stage at all.
+        s.dpi = 3200;
+        assert_eq!(s.dpi_stage(), None);
     }
 
     #[test]
