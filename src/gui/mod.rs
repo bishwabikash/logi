@@ -2050,9 +2050,10 @@ fn run_with(open_window_first: bool) -> eframe::Result {
         } else {
             // Started without a window: start the registration and see whether
             // there is anywhere to put the icon before settling in to wait.
-            host.sync(&crate::device::Snapshot::default(), &mut |_| {});
-            host.wait_for_tray(std::time::Duration::from_secs(5));
-            if !host.has_tray() {
+            //
+            // For minutes, not seconds: this is the login start, and the panel
+            // may not have its icon area up yet.
+            if !host.await_tray(std::time::Duration::from_secs(300)) {
                 eprintln!("logi: no panel icon area on this desktop; nothing to show.");
                 return Ok(());
             }

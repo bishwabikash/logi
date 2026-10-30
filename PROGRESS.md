@@ -189,6 +189,13 @@ click started a window from that unit. The installer also adds the bin
 directory to PATH (tested in a scratch home with bash and zsh, twice, for one
 block per file).
 
+Found after a reboot: the service started the icon before GNOME had brought up
+its tray support (the AppIndicator extension), the single registration attempt
+found no host and the process exited, so there was no icon. Registration is now
+retried every 3 s (up to 100 times; a tray-only start waits up to five
+minutes). Reproduced with a private session bus whose watcher appears 8 s late:
+the tray stayed up, logged once, and registered when the watcher came.
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or

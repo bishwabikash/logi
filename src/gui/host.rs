@@ -24,9 +24,22 @@ pub enum Signal {
     Quit,
 }
 
+/// How soon, and how many times, a failed registration is tried again.
+///
+/// At login the panel's icon host often comes up after the programs that want
+/// it: GNOME Shell loads its tray extension a little into the session, and the
+/// service starts the moment the session does. A single attempt found nothing
+/// and gave up for good, so after a restart the icon was missing until someone
+/// opened the window.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+const MAX_ATTEMPTS: u32 = 100;
+
 #[derive(Default)]
 struct TrayCell {
     tried: bool,
+    attempts: u32,
+    /// When the last attempt failed.
+    failed_at: Option<std::time::Instant>,
     /// Registration in flight. `Tray::spawn` blocks on a session-bus round trip,
     /// and where the watcher name is activatable but never comes up it blocks
     /// for the 25s D-Bus reply timeout, so it runs on its own thread and the
@@ -66,12 +79,41 @@ impl Host {
                 cell.rx = None;
             }
             Some(Ok(Err(e))) => {
-                eprintln!("logi: no tray icon: {e}");
+                // Said once, not on every retry.
+                if cell.attempts == 1 {
+                    eprintln!("logi: no tray icon yet: {e}");
+                }
                 cell.rx = None;
+                cell.failed_at = Some(std::time::Instant::now());
             }
-            Some(Err(mpsc::TryRecvError::Disconnected)) => cell.rx = None,
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                cell.rx = None;
+                cell.failed_at = Some(std::time::Instant::now());
+            }
             _ => {}
         }
+    }
+
+    /// Keep trying to get an icon up for as long as `limit`, for a start with no
+    /// window: nothing else drives the retries then. True once there is one.
+    pub fn await_tray(&self, limit: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            self.sync(&Snapshot::default(), &mut |_| {});
+            if self.has_tray() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline || self.gave_up() {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    /// Out of attempts, so waiting longer is pointless.
+    fn gave_up(&self) -> bool {
+        let cell = self.tray.borrow();
+        cell.tray.is_none() && cell.rx.is_none() && cell.attempts >= MAX_ATTEMPTS
     }
 
     /// Wait, for a short while, for a registration that is still in flight.
@@ -110,8 +152,18 @@ impl Host {
         let status = status_for(snap, self.service.state());
         let mut cell = self.tray.borrow_mut();
 
+        // A failed attempt is tried again after a pause, up to a limit.
+        if cell.tried
+            && cell.tray.is_none()
+            && cell.rx.is_none()
+            && cell.attempts < MAX_ATTEMPTS
+            && cell.failed_at.is_some_and(|t| t.elapsed() >= RETRY_EVERY)
+        {
+            cell.tried = false;
+        }
         if !cell.tried {
             cell.tried = true;
+            cell.attempts += 1;
             // Registering blocks, so it goes on a thread of its own, exactly
             // as `Tray::spawn` says it must.
             let (tx, rx) = mpsc::channel();
