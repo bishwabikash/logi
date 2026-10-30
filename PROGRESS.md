@@ -178,6 +178,17 @@ the process and removes the icon with the mouse left in onboard mode. **Not
 checked:** the look of the icon in the dock, which needs the desktop entry and
 icon installed by `packaging/install.sh`.
 
+## The icon follows the service
+
+`logi serve` starts `logi tray` through `systemd-run --user` as a transient unit
+of its own (`logi-tray`), so the icon is up whenever the service is, and is not
+taken down with it: stopping or restarting the service leaves the one icon in
+place. Checked on GNOME: restarting the service brought the icon up, a second
+restart did not duplicate it, stopping the service kept it, and the icon's
+click started a window from that unit. The installer also adds the bin
+directory to PATH (tested in a scratch home with bash and zsh, twice, for one
+block per file).
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or

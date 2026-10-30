@@ -2004,6 +2004,17 @@ fn background(host: &host::Host) -> host::Signal {
 
 /// Show the window; when it is closed, stay as the panel icon if there is one.
 pub fn run() -> eframe::Result {
+    run_with(true)
+}
+
+/// The panel icon with no window, until it asks for one. Ends at once when the
+/// desktop has no panel icon area, since there would be nothing to show or to
+/// reopen it from.
+pub fn run_tray_only() -> eframe::Result {
+    run_with(false)
+}
+
+fn run_with(open_window_first: bool) -> eframe::Result {
     use host::Signal;
     // Before the lock, not after: the first instance must already be able to
     // receive SIGUSR1 by the time a second one finds it, because the default
@@ -2026,16 +2037,28 @@ pub fn run() -> eframe::Result {
         }
     };
     let host = std::sync::Arc::new(host::Host::new());
+    let mut show_window = open_window_first;
     loop {
-        window(std::sync::Arc::clone(&host))?;
-        if !host.quitting() {
-            host.wait_for_tray(std::time::Duration::from_secs(3));
-        }
-        if host.quitting() || !host.has_tray() {
-            return Ok(());
+        if show_window {
+            window(std::sync::Arc::clone(&host))?;
+            if !host.quitting() {
+                host.wait_for_tray(std::time::Duration::from_secs(3));
+            }
+            if host.quitting() || !host.has_tray() {
+                return Ok(());
+            }
+        } else {
+            // Started without a window: start the registration and see whether
+            // there is anywhere to put the icon before settling in to wait.
+            host.sync(&crate::device::Snapshot::default(), &mut |_| {});
+            host.wait_for_tray(std::time::Duration::from_secs(5));
+            if !host.has_tray() {
+                eprintln!("logi: no panel icon area on this desktop; nothing to show.");
+                return Ok(());
+            }
         }
         match background(&host) {
-            Signal::Open => continue,
+            Signal::Open => show_window = true,
             Signal::Quit => return Ok(()),
         }
     }

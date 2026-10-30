@@ -57,6 +57,8 @@ logi — control a Logitech mouse over HID++ 2.0
   logi bind run               act on those bindings until Ctrl-C
   logi bind reset             put the factory button mapping back. The escape
                               hatch if a button has stopped responding.
+  logi tray                   the panel icon with no window (the service starts
+                              it; \"Open Logi\" in its menu shows the window)
   logi serve                  the background service: per-application profiles
                               and button bindings, with no window. What the
                               systemd user unit runs.
@@ -179,6 +181,7 @@ fn run(args: &[String]) -> Result<(), CliError> {
         "mode" => cmd_mode(args.get(1)),
         "watch" => cmd_watch(&args[1..]),
         "serve" => cmd_serve(),
+        "tray" => gui::run_tray_only().map_err(|e| CliError::Usage(format!("tray: {e}"))),
         "bind" => cmd_bind(&args[1..]),
         "led" => cmd_led(&args[1..]),
         "effect" => cmd_effect(&args[1..]),
@@ -1305,11 +1308,38 @@ fn silence_fits(silence: &[u8], count: u8) -> Result<(), String> {
 /// Deliberately tolerant: with no rule file, or no device attached, it idles
 /// rather than exiting. A service that quits because its config is missing
 /// just flaps under systemd's restart policy and buries the real reason.
+/// Make sure the panel icon is up while the service is.
+///
+/// The icon is its own process (`logi tray`), and started through systemd as a
+/// transient unit of its own: a child of this service would be killed with it,
+/// and the icon is most useful when the service is stopped, because that is when
+/// its menu offers to start it. The tray takes a lock, so one already running
+/// (the window's, or an earlier one) makes this a no-op. Best effort: with no
+/// systemd-run, or no panel to show an icon in, the service carries on without.
+fn ensure_tray() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let started = std::process::Command::new("systemd-run")
+        .args(["--user", "--quiet", "--collect", "--unit=logi-tray", "--"])
+        .arg(&exe)
+        .arg("tray")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match started {
+        Ok(s) if s.success() => eprintln!("logi: panel icon started"),
+        // A unit of that name already exists: the icon is already up.
+        Ok(_) => {}
+        Err(e) => eprintln!("logi: could not start the panel icon: {e}"),
+    }
+}
+
 fn cmd_serve() -> Result<(), CliError> {
     install_interrupt_handler();
     install_panic_restore();
     survive_closed_output();
     eprintln!("logi: service starting");
+    ensure_tray();
 
     let path = appwatch::config_path();
     let bindings_path = actions::config_path();

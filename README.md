@@ -37,7 +37,8 @@ Run `logi` for the window, or `logi --help` for the command line.
   command, or another mouse button, either alongside its normal job or in place
   of it.
 * **Per-application profiles.** Switch profile while a given program is running.
-* **A tray icon** showing the service state, with a menu.
+* **A tray icon** showing the service state, with a menu. It is there whenever
+  the service is running, window or not.
 * **No model whitelist.** Any Logitech device that answers HID++ is listed by
   `logi devices`, and gets exactly the controls its own feature table reports.
 
@@ -121,15 +122,20 @@ packaging/install.sh
 Then **unplug and replug the mouse.** The rules take effect when the device is
 added, and a node that is already open keeps its old permissions.
 
-`install.sh` does three independent things, each skippable with `--no-udev`,
-`--no-bin` or `--no-service`:
+`install.sh` does four independent things, each skippable with `--no-udev`,
+`--no-bin`, `--no-service` or `--no-path`:
 
 * installs two udev rules to `/etc/udev/rules.d` so the mouse and `/dev/uinput`
   work without root, loads the `uinput` module and arranges for it at boot
   (this is the only part needing sudo, and the only one that cannot be done
   from inside the app);
 * copies the binary, a desktop entry and an icon under `~/.local`;
-* installs a systemd user service, enables it and starts it.
+* installs a systemd user service, enables it and starts it. The service also
+  brings up the panel icon (`logi tray`, its own process, so stopping the
+  service leaves the icon there to start it again from);
+* puts `~/.local/bin` on your `PATH` if it is not already, with a marked block
+  in `~/.profile` and in `~/.bashrc`, `~/.zshrc` and fish's `conf.d` where those
+  exist. Open a new terminal afterwards.
 
 You can skip it entirely and run `./target/release/logi`; the rules are only
 what removes the need for `sudo`. The rules grant access through your session
@@ -139,7 +145,8 @@ not narrower is explained in the rule file.
 To remove it: `systemctl --user disable --now logi`, then delete
 `~/.config/systemd/user/logi.service`, `~/.local/bin/logi`,
 `~/.local/share/applications/logi.desktop`,
-`~/.local/share/icons/hicolor/scalable/apps/logi.svg`, `~/.config/logi/`, the two
+`~/.local/share/icons/hicolor/scalable/apps/logi.svg`, the "added by the logi
+installer" block in your shell profiles, `~/.config/logi/`, the two
 `/etc/udev/rules.d/99-logi*.rules` files, and `/etc/modules-load.d/uinput.conf`.
 
 ## Using it

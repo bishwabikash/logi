@@ -14,13 +14,13 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
-DO_UDEV=1; DO_BIN=1; DO_SERVICE=1
+DO_UDEV=1; DO_BIN=1; DO_SERVICE=1; DO_PATH=1
 
 usage() {
     sed -n '2,12p' "$0" | sed 's/^# \?//'
     cat <<USAGE
 
-Usage: packaging/install.sh [--no-udev] [--no-bin] [--no-service] [--help]
+Usage: packaging/install.sh [--no-udev] [--no-bin] [--no-service] [--no-path] [--help]
 Env:
   PREFIX   where the binary and desktop file go (default: \$HOME/.local)
 USAGE
@@ -31,6 +31,7 @@ for arg in "$@"; do
         --no-udev)    DO_UDEV=0 ;;
         --no-bin)     DO_BIN=0 ;;
         --no-service) DO_SERVICE=0 ;;
+        --no-path)    DO_PATH=0 ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "install.sh: unknown option $arg" >&2; usage; exit 2 ;;
     esac
@@ -46,6 +47,47 @@ if { [ "$DO_BIN" = 1 ] || [ "$DO_SERVICE" = 1 ]; } && [ ! -x "$BIN" ]; then
     echo "or run this from an extracted release tarball." >&2
     exit 1
 fi
+
+# ---------------------------------------------------------------- path -----
+# Put a directory on PATH for future shells, by a marked block in the profile
+# files the user's shells read. Idempotent: a file that already has the block is
+# left alone, and nothing is touched if the directory is already on PATH.
+add_to_path() {
+    dir="$1"
+    case ":$PATH:" in
+        *":$dir:"*) return 0 ;;
+    esac
+    # Written with $HOME unexpanded where it can be, so the line survives the
+    # home directory being moved.
+    shown="$dir"
+    case "$dir" in "$HOME"/*) shown="\$HOME${dir#"$HOME"}" ;; esac
+    marker="# added by the logi installer"
+    block="$marker
+case \":\$PATH:\" in *\":$shown:\"*) ;; *) export PATH=\"$shown:\$PATH\" ;; esac"
+    touched=""
+    # ~/.profile is read by login shells; the others by interactive ones, so
+    # both a terminal and a graphical login find it. Only files that exist are
+    # extended (except .profile), so no shell's config is created for a shell
+    # the user does not use.
+    for f in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+        if [ ! -f "$f" ] && [ "$f" != "$HOME/.profile" ]; then continue; fi
+        if grep -qF "$marker" "$f" 2>/dev/null; then continue; fi
+        printf '\n%s\n' "$block" >> "$f"
+        touched="$touched $f"
+    done
+    if [ -d "$HOME/.config/fish" ]; then
+        f="$HOME/.config/fish/conf.d/logi.fish"
+        if [ ! -f "$f" ]; then
+            mkdir -p "$HOME/.config/fish/conf.d"
+            printf '%s\nfish_add_path %s\n' "$marker" "$shown" > "$f"
+            touched="$touched $f"
+        fi
+    fi
+    if [ -n "$touched" ]; then
+        echo "  Added $dir to PATH in:$touched"
+        echo "  Open a new terminal, or log out and back in, for it to take effect."
+    fi
+}
 
 # ---------------------------------------------------------------- udev -----
 if [ "$DO_UDEV" = 1 ]; then
@@ -106,10 +148,14 @@ if [ "$DO_BIN" = 1 ]; then
         gtk-update-icon-cache -q -t "$PREFIX/share/icons/hicolor" 2>/dev/null || true
     command -v update-desktop-database >/dev/null 2>&1 &&
         update-desktop-database "$PREFIX/share/applications" 2>/dev/null || true
-    case ":$PATH:" in
-        *":$PREFIX/bin:"*) ;;
-        *) echo "  Note: $PREFIX/bin is not on your PATH. Add it to use 'logi' directly." ;;
-    esac
+    if [ "$DO_PATH" = 1 ]; then
+        add_to_path "$PREFIX/bin"
+    else
+        case ":$PATH:" in
+            *":$PREFIX/bin:"*) ;;
+            *) echo "  Note: $PREFIX/bin is not on your PATH. Add it to use 'logi' directly." ;;
+        esac
+    fi
 fi
 
 # ------------------------------------------------------------- service -----
