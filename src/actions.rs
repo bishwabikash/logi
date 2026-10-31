@@ -607,7 +607,7 @@ pub const EXAMPLE: &str = "\
 # its own job. For example, the sniper button still holds its DPI stage, and
 # three quick presses run a command:
 #
-#   button 6 x3 = command notify-send "three presses"
+#   button 6 x3 = command notify-send three-presses
 #   button 6 x2 within 300 = command my-script --flag
 #
 # `logi bind watch` prints each button's number as you press it. A press count
