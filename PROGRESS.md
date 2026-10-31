@@ -218,8 +218,12 @@ runs an action on the press that completes the last one (`Sequences` in
 `src/streak.rs`, syntax in `src/actions.rs`). Counts are exact, every press must
 follow the last within the limit, adjacent steps are different buttons, and two
 combos sharing a start are fine. Buttons keep their own jobs. A "Button combos"
-section sits under Macros in the Buttons tab. Unit-tested; **not yet run on the
-mouse**.
+section sits under Macros in the Buttons tab. Run on the G502 HERO with `logi
+bind run`: sniper (button 6) twice then the front thumb button (reports as 8)
+fired once, and sniper three times then right click twice (button 2) fired once,
+with a 1.5 s limit; the same presses at the 500 ms default were too slow to
+match, as intended. **Not run on hardware:** through the service, and the
+section on screen.
 
 ## Warnings
 

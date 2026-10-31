@@ -90,6 +90,7 @@ taken first.
 | The window following presses of the mouse's own DPI buttons | yes (the mouse announces each press; about 75 tracked in 50 s) |
 | The tray icon registering with GNOME | yes |
 | A macro on the sniper button (button 6) firing on the third press of three, via `logi bind run` | yes |
+| Button combos (sniper twice then button 8; sniper three times then right click twice), via `logi bind run` | yes |
 
 | **Implemented and unit-tested, never run against hardware** | |
 |---|---|
