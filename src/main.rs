@@ -23,6 +23,7 @@ mod profile_io;
 mod profiles;
 mod rate;
 mod service;
+mod streak;
 mod tray;
 mod uinput;
 
@@ -55,6 +56,9 @@ logi — control a Logitech mouse over HID++ 2.0
   logi bind [list]            host actions bound to buttons, from
                               ~/.config/logi/bindings.conf
   logi bind run               act on those bindings until Ctrl-C
+  logi bind watch             print the number of each button as it is pressed
+                              and released, to tell which is which. Changes
+                              nothing on the mouse.
   logi bind reset             put the factory button mapping back. The escape
                               hatch if a button has stopped responding.
   logi tray                   the panel icon with no window (the service starts
@@ -1034,6 +1038,61 @@ fn perform(action: &actions::Action, vd: &mut uinput::VirtualDevice) -> std::io:
     }
 }
 
+/// Print each button press and release by number, until Ctrl-C.
+///
+/// Read-only: it starts the spy and listens, and silences nothing. The spy is
+/// stopped on the way out only when the service is not running, because the
+/// service may be using it for bindings and stopping it would end those.
+fn cmd_bind_watch() -> Result<(), CliError> {
+    let mut f = open()?;
+    if !f.caps.button_spy {
+        return Err(CliError::Failed(format!(
+            "{} does not report the button-spy feature (0x8110)",
+            f.name
+        )));
+    }
+    let spy = buttonspy::ButtonSpy::new(&mut f.device)?;
+    install_interrupt_handler();
+    survive_closed_output();
+    // Whether the service is acting on bindings, and so needs the spy left on.
+    let service_up = service::state() == service::State::Active
+        && matches!(bindings_in(&actions::config_path()), Ok(true));
+    spy.start(&mut f.device)?;
+    let mut listener = f.device.open_listener()?;
+    let idx = spy.feature_index();
+    println!(
+        "logi: {} reports {} buttons. Press them; Ctrl-C to stop.",
+        f.name,
+        spy.button_count()
+    );
+    let mut prev: u16 = 0;
+    let started = std::time::Instant::now();
+    let outcome = (|| -> Result<(), CliError> {
+        while !leaving() {
+            let Some(report) = listener.read_event(std::time::Duration::from_millis(250))? else {
+                continue;
+            };
+            let Some(now) = buttonspy::decode_event(&report, idx) else { continue };
+            let (pressed, released) = buttonspy::transitions(prev, now);
+            prev = now;
+            let t = started.elapsed().as_secs_f32();
+            for b in pressed {
+                println!("{t:8.2}s  button {b} pressed");
+            }
+            for b in released {
+                println!("{t:8.2}s  button {b} released");
+            }
+        }
+        Ok(())
+    })();
+    if !service_up {
+        if let Err(e) = spy.stop(&mut f.device) {
+            eprintln!("logi: could not stop the spy: {e}");
+        }
+    }
+    outcome
+}
+
 fn cmd_bind(args: &[String]) -> Result<(), CliError> {
     let path = actions::config_path();
     match args.first().map(|s| s.as_str()) {
@@ -1049,6 +1108,7 @@ fn cmd_bind(args: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         Some("run") => cmd_bind_run(),
+        Some("watch") => cmd_bind_watch(),
         None | Some("list") => {
             // Only a file that is genuinely absent or genuinely blank gets the
             // example written over it. `unwrap_or_default()` here conflated
@@ -1185,6 +1245,7 @@ fn cmd_bind_run() -> Result<(), CliError> {
         let idx = spy.feature_index();
         println!("logi: acting on {} binding(s); Ctrl-C to stop", bindings.list.len());
         let mut prev: u16 = 0;
+        let mut streaks = streak::Streaks::new();
         while !leaving() {
             let Some(report) =
                 listener.read_event(std::time::Duration::from_millis(250))?
@@ -1194,8 +1255,12 @@ fn cmd_bind_run() -> Result<(), CliError> {
             let Some(now) = buttonspy::decode_event(&report, idx) else { continue };
             let (pressed, _released) = buttonspy::transitions(prev, now);
             prev = now;
+            let at = std::time::Instant::now();
             for b in pressed {
                 if let Some(bind) = bindings.get(b) {
+                    if !streaks.press(bind, at) {
+                        continue;
+                    }
                     if let Err(e) = perform(&bind.action, &mut vd) {
                         eprintln!("logi: button {b}: {e}");
                     }
@@ -1562,8 +1627,12 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
                     if let Some(now) = buttonspy::decode_event(&report, s.spy.feature_index()) {
                         let (pressed, _) = buttonspy::transitions(prev_mask, now);
                         prev_mask = now;
+                        let at = std::time::Instant::now();
                         for b in pressed {
                             if let Some(bind) = s.bindings.get(b) {
+                                if !s.streaks.press(bind, at) {
+                                    continue;
+                                }
                                 if let Err(e) = perform(&bind.action, &mut s.vd) {
                                     eprintln!("logi: button {b}: {e}");
                                 }
@@ -1653,6 +1722,8 @@ struct SpyState {
     listener: hidpp::Device,
     vd: uinput::VirtualDevice,
     bindings: actions::Bindings,
+    /// Counts presses for bindings that wait for a streak of them.
+    streaks: streak::Streaks,
     silenced: bool,
 }
 
@@ -1694,7 +1765,7 @@ fn start_spy(
     })();
 
     match brought_up {
-        Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), silenced }),
+        Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), streaks: streak::Streaks::new(), silenced }),
         Err(e) => {
             if silenced {
                 match try_twice(|| spy.restore(dev)) {

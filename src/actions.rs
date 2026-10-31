@@ -261,11 +261,42 @@ pub enum BindMode {
     Replace,
 }
 
+/// The most presses a binding can wait for. Past this a person is counting,
+/// not pressing, and a long streak is mostly the mouse's own jitter.
+pub const MAX_PRESSES: u8 = 8;
+
+/// The default time allowed between one press and the next.
+pub const DEFAULT_WITHIN_MS: u16 = 500;
+
+/// The bounds on that time. Below the floor a deliberate press cannot make it;
+/// above the ceiling a streak is just ordinary use of the button.
+pub const WITHIN_MS_RANGE: std::ops::RangeInclusive<u16> = 100..=3000;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Binding {
     pub button: u8,
     pub action: Action,
     pub mode: BindMode,
+    /// How many presses in a row run the action. One means every press, as
+    /// before; more means the action waits for a streak, and a lone press does
+    /// nothing. This is how a button that already has a job (the sniper button
+    /// holds a DPI stage) can also trigger a macro without getting in the
+    /// way of that job.
+    pub presses: u8,
+    /// The longest pause allowed between presses of a streak.
+    pub within_ms: u16,
+}
+
+impl Binding {
+    /// A binding that fires on every press.
+    #[cfg(test)]
+    pub fn new(button: u8, action: Action, mode: BindMode) -> Self {
+        Binding { button, action, mode, presses: 1, within_ms: DEFAULT_WITHIN_MS }
+    }
+
+    pub fn is_streak(&self) -> bool {
+        self.presses > 1
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -317,7 +348,7 @@ impl Bindings {
                 problems.push(format!("line {}: expected `button N = action`", n + 1));
                 continue;
             };
-            let (button, mode) = match parse_target(lhs) {
+            let (button, mode, presses, within_ms) = match parse_target(lhs) {
                 Ok(v) => v,
                 Err(e) => {
                     problems.push(format!("line {}: {e}", n + 1));
@@ -336,9 +367,9 @@ impl Bindings {
                     "line {}: button {button} was already bound; this line wins",
                     n + 1
                 ));
-                out.list[pos] = Binding { button, action, mode };
+                out.list[pos] = Binding { button, action, mode, presses, within_ms };
             } else {
-                out.list.push(Binding { button, action, mode });
+                out.list.push(Binding { button, action, mode, presses, within_ms });
             }
         }
         (out, problems)
@@ -352,10 +383,18 @@ impl Bindings {
                 BindMode::Replace => " replace",
                 BindMode::Augment => "",
             };
+            let mut streak = String::new();
+            if b.is_streak() {
+                streak.push_str(&format!(" x{}", b.presses));
+                if b.within_ms != DEFAULT_WITHIN_MS {
+                    streak.push_str(&format!(" within {}", b.within_ms));
+                }
+            }
             s.push_str(&format!(
-                "button {}{} = {}\n",
+                "button {}{}{} = {}\n",
                 b.button,
                 mode,
+                streak,
                 b.action.describe(keys)
             ));
         }
@@ -384,8 +423,12 @@ fn strip_comment(line: &str) -> &str {
     line
 }
 
-/// The left-hand side: `button 10`, `button 10 replace`, or just `10`.
-fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode), String> {
+/// The left-hand side: `button 10`, `button 10 replace`, `button 6 x3`,
+/// `button 6 x3 within 400`, or just `10`.
+///
+/// `xN` is how many presses in a row run the action, and `within` the longest
+/// pause between them in milliseconds.
+fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), String> {
     let mut words = lhs.split_whitespace().peekable();
     if words.peek().map(|w| w.eq_ignore_ascii_case("button")) == Some(true) {
         words.next();
@@ -399,16 +442,68 @@ fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode), String> {
     if button == 0 || button > MAX_BUTTON {
         return Err(format!("button {button} is out of range (1..={MAX_BUTTON})"));
     }
-    let mode = match words.next() {
-        None => BindMode::Augment,
-        Some(w) if w.eq_ignore_ascii_case("replace") => BindMode::Replace,
-        Some(w) if w.eq_ignore_ascii_case("augment") => BindMode::Augment,
-        Some(w) => return Err(format!("expected `replace` or `augment`, got {w:?}")),
-    };
-    if let Some(extra) = words.next() {
-        return Err(format!("unexpected {extra:?} after the button"));
+    let mut mode = None;
+    let mut presses = None;
+    let mut within = None;
+    while let Some(w) = words.next() {
+        let lower = w.to_ascii_lowercase();
+        if lower == "replace" || lower == "augment" {
+            if mode.is_some() {
+                return Err(format!("unexpected {w:?}: the mode is already given"));
+            }
+            mode = Some(if lower == "replace" { BindMode::Replace } else { BindMode::Augment });
+        } else if let Some(n) = lower.strip_prefix('x').filter(|n| !n.is_empty()) {
+            if presses.is_some() {
+                return Err(format!("unexpected {w:?}: the press count is already given"));
+            }
+            let n: u8 = n.parse().map_err(|_| format!("bad press count {w:?}; want x2 .. x{MAX_PRESSES}"))?;
+            if n == 0 || n > MAX_PRESSES {
+                return Err(format!("{w:?} is out of range; want x1 .. x{MAX_PRESSES}"));
+            }
+            presses = Some(n);
+        } else if lower == "within" {
+            if within.is_some() {
+                return Err("`within` given twice".into());
+            }
+            let Some(v) = words.next() else {
+                return Err("`within` needs a time in milliseconds, like `within 400`".into());
+            };
+            let digits = v.to_ascii_lowercase();
+            let digits = digits.strip_suffix("ms").unwrap_or(&digits);
+            // Wider than the range allows, so "99999" is out of range rather
+            // than unreadable.
+            let ms: u32 = digits
+                .parse()
+                .map_err(|_| format!("bad time {v:?} after `within`; want milliseconds"))?;
+            let ms = u16::try_from(ms).unwrap_or(u16::MAX);
+            if !WITHIN_MS_RANGE.contains(&ms) {
+                return Err(format!(
+                    "`within {ms}` is out of range; want {} to {} milliseconds",
+                    WITHIN_MS_RANGE.start(),
+                    WITHIN_MS_RANGE.end()
+                ));
+            }
+            within = Some(ms);
+        } else {
+            return Err(format!("expected `replace`, `augment`, `xN` or `within MS`, got {w:?}"));
+        }
     }
-    Ok((button, mode))
+    let mode = mode.unwrap_or(BindMode::Augment);
+    let presses = presses.unwrap_or(1);
+    if within.is_some() && presses == 1 {
+        return Err("`within` only means something with a press count, like `x3`".into());
+    }
+    // A streak keeps the button's own job: that is the point of it, and a
+    // replaced button would lose that job on every press while only the last
+    // one of the streak did anything.
+    if presses > 1 && mode == BindMode::Replace {
+        return Err(
+            "a press count needs `augment`: the button keeps its own job, and the \
+             action waits for the streak"
+                .into(),
+        );
+    }
+    Ok((button, mode, presses, within.unwrap_or(DEFAULT_WITHIN_MS)))
 }
 
 /// Metacharacters that mean the string wants a shell rather than a bare exec.
@@ -505,6 +600,18 @@ pub const EXAMPLE: &str = "\
 #                           extra forward back task, or a raw BTN_ code
 #   command notify-send hi  run a program, detached from this one
 #   nothing                 do nothing
+#
+# MACROS. Add `xN` after the button to run the action only on the Nth press
+# in a row, and `within MS` for the longest pause allowed between presses
+# (default 500). A single press then does nothing extra, so the button keeps
+# its own job. For example, the sniper button still holds its DPI stage, and
+# three quick presses run a command:
+#
+#   button 6 x3 = command notify-send "three presses"
+#   button 6 x2 within 300 = command my-script --flag
+#
+# `logi bind watch` prints each button's number as you press it. A press count
+# needs the default `augment`, never `replace`.
 #
 # A binding AUGMENTS the button by default: the mouse's own click still gets
 # through and the action happens as well. Writing `replace` instead silences
@@ -812,5 +919,77 @@ mod tests {
     fn config_path_is_under_logi() {
         let p = config_path();
         assert!(p.ends_with("logi/bindings.conf"), "{p:?}");
+    }
+
+    // ---- press counts ----
+
+    fn parse_one(line: &str) -> (Bindings, Vec<String>) {
+        Bindings::parse(line, &FakeKeys)
+    }
+
+    #[test]
+    fn a_press_count_is_read_and_written_back() {
+        let (b, problems) = parse_one("button 6 x3 = command notify-send hi\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        let bind = b.get(6).unwrap();
+        assert_eq!((bind.presses, bind.within_ms), (3, DEFAULT_WITHIN_MS));
+        assert_eq!(b.render(&FakeKeys), "button 6 x3 = command notify-send hi\n");
+    }
+
+    #[test]
+    fn the_time_limit_is_read_written_and_omitted_when_it_is_the_default() {
+        let (b, problems) = parse_one("button 6 x2 within 400 = command true\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(b.get(6).unwrap().within_ms, 400);
+        assert_eq!(b.render(&FakeKeys), "button 6 x2 within 400 = command true\n");
+        let (b, _) = parse_one("button 6 x2 within 500ms = command true\n");
+        assert_eq!(b.render(&FakeKeys), "button 6 x2 = command true\n");
+    }
+
+    #[test]
+    fn a_binding_without_a_count_fires_on_every_press() {
+        let (b, _) = parse_one("button 3 = command true\n");
+        let bind = b.get(3).unwrap();
+        assert_eq!(bind.presses, 1);
+        assert!(!bind.is_streak());
+        // And is written back without any trace of the feature.
+        assert_eq!(b.render(&FakeKeys), "button 3 = command true\n");
+    }
+
+    #[test]
+    fn a_press_count_cannot_replace_the_button() {
+        let (b, problems) = parse_one("button 6 replace x3 = command true\n");
+        assert!(b.list.is_empty());
+        assert!(problems.iter().any(|p| p.contains("augment")), "{problems:?}");
+    }
+
+    #[test]
+    fn bad_counts_and_times_are_refused_with_a_reason() {
+        for (line, want) in [
+            ("button 6 x0 = command true", "out of range"),
+            ("button 6 x9 = command true", "out of range"),
+            ("button 6 xq = command true", "bad press count"),
+            ("button 6 x3 within = command true", "needs a time"),
+            ("button 6 x3 within soon = command true", "bad time"),
+            ("button 6 x3 within 5 = command true", "out of range"),
+            ("button 6 x3 within 99999 = command true", "out of range"),
+            ("button 6 within 400 = command true", "only means something"),
+            ("button 6 x2 x3 = command true", "already given"),
+            ("button 6 x2 sometimes = command true", "expected"),
+        ] {
+            let (b, problems) = parse_one(line);
+            assert!(b.list.is_empty(), "{line} should not load");
+            assert!(
+                problems.iter().any(|p| p.contains(want)),
+                "{line}: wanted {want:?} in {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sniper_example_in_the_docs_parses() {
+        let (b, problems) = parse_one("button 6 x3 = command notify-send \"three presses\"\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(b.get(6).unwrap().presses, 3);
     }
 }

@@ -109,6 +109,10 @@ struct Row {
     text: String,
     command: String,
     mouse: u16,
+    /// Presses in a row that run the action. One is every press.
+    presses: u8,
+    /// The longest pause between those presses, in milliseconds.
+    within_ms: u16,
 }
 
 impl Row {
@@ -122,7 +126,15 @@ impl Row {
             command: String::new(),
             // Middle: the one button most people rebind something to.
             mouse: 0x112,
+            presses: 1,
+            within_ms: actions::DEFAULT_WITHIN_MS,
         }
+    }
+
+    /// A macro: an action that waits for a streak of presses, shown in its own
+    /// section and not among the plain buttons.
+    fn is_macro(&self) -> bool {
+        self.presses > 1
     }
 
     /// Whether this row says anything. A row with no action that still leaves
@@ -174,6 +186,8 @@ impl Row {
     fn from_binding(b: &Binding, keys: &dyn Keymap) -> Self {
         let mut r = Row::blank(b.button);
         r.mode = b.mode;
+        r.presses = b.presses;
+        r.within_ms = b.within_ms;
         match &b.action {
             Action::Nothing => r.kind = Kind::None,
             Action::Key { .. } => {
@@ -201,6 +215,31 @@ impl Row {
         }
         r
     }
+}
+
+/// Presses a new macro waits for. Three is hard to do by accident and quick to
+/// do on purpose.
+const DEFAULT_MACRO_PRESSES: u8 = 3;
+
+/// A profile button's job as a person would name it.
+fn friendly_job(job: &str) -> String {
+    match job {
+        // The G502's thumb button, whose job is to hold a lower DPI.
+        "dpi-shift" => "sniper (dpi-shift)".into(),
+        other => other.to_string(),
+    }
+}
+
+/// What each of the mouse's buttons does on the mouse, button 1 first, read
+/// from the active profile. The spy numbers its buttons in the order of the
+/// profile's table; an empty string where the profile does not say.
+fn button_labels(snap: &Snapshot) -> Vec<String> {
+    let Some(p) = snap.profiles.get(snap.active_profile as usize) else { return Vec::new() };
+    p.buttons
+        .iter()
+        .take(snap.button_count as usize)
+        .map(|b| friendly_job(&b.describe()))
+        .collect()
 }
 
 /// The key-name tables live in uinput; `FnKeymap` is the seam.
@@ -346,6 +385,9 @@ pub struct BindingsEditor {
     /// so a Save can tell that something else changed the file since. `None`
     /// when it has not been read (or could not be).
     on_disk: Option<Vec<u8>>,
+    /// What each button does on the mouse itself, from the active profile, to
+    /// tell the user which number is which. Index 0 is button 1.
+    labels: Vec<String>,
     loaded: bool,
 }
 
@@ -374,6 +416,7 @@ impl BindingsEditor {
             tail_unapplied: false,
             kept_copy: None,
             on_disk: None,
+            labels: Vec::new(),
             loaded: false,
         }
     }
@@ -453,6 +496,8 @@ impl BindingsEditor {
                     button: r.button,
                     action,
                     mode: r.mode,
+                    presses: r.presses,
+                    within_ms: r.within_ms,
                 }),
                 Err(e) => errs.push(format!("button {}: {e}", r.button)),
             }
@@ -738,6 +783,7 @@ impl BindingsEditor {
         if self.capturing.is_some_and(|b| b > count) {
             self.capturing = None;
         }
+        self.labels = button_labels(snap);
         let keys = keymap();
         let (bindings, mut errs) = self.to_bindings(&keys);
         let silence = bindings.to_silence();
@@ -783,11 +829,204 @@ impl BindingsEditor {
             }
         });
 
+        self.draw_macros(ui, count, &keys);
         self.draw_rows(ui, count, &keys);
         self.draw_safety(ui, snap, &silence, count, &mut cmds);
         self.draw_save(ui, snap, &errs, count);
         self.draw_problems(ui);
         cmds
+    }
+
+    /// What the mouse itself does on `button`, for the label, when known.
+    fn label_for(&self, button: u8) -> Option<String> {
+        self.labels
+            .get(button as usize - 1)
+            .filter(|l| !l.is_empty())
+            .cloned()
+    }
+
+    fn button_title(&self, button: u8) -> String {
+        match self.label_for(button) {
+            Some(l) => format!("Button {button}  ({l})"),
+            None => format!("Button {button}"),
+        }
+    }
+
+    /// Add a macro on the best free button: the sniper button if it is free,
+    /// since that is the one people want a spare job on, else the first free.
+    fn add_macro(&mut self, count: u8) {
+        let free: Vec<u8> = (1..=count)
+            .filter(|b| self.rows.iter().any(|r| r.button == *b && !r.is_set()))
+            .collect();
+        let sniper = free
+            .iter()
+            .copied()
+            .find(|b| self.label_for(*b).is_some_and(|l| l.contains("sniper")));
+        let Some(button) = sniper.or(free.first().copied()) else { return };
+        if let Some(r) = self.rows.iter_mut().find(|r| r.button == button) {
+            *r = Row::blank(button);
+            r.kind = Kind::Command;
+            r.presses = DEFAULT_MACRO_PRESSES;
+        }
+    }
+
+    /// Move the macro on `from` to `to`, which must be free.
+    fn move_macro(&mut self, from: u8, to: u8) {
+        if from == to {
+            return;
+        }
+        let Some(src) = self.rows.iter().find(|r| r.button == from).cloned() else { return };
+        let free = self.rows.iter().any(|r| r.button == to && !r.is_set());
+        if !free {
+            return;
+        }
+        if let Some(dst) = self.rows.iter_mut().find(|r| r.button == to) {
+            *dst = Row { button: to, ..src };
+        }
+        if let Some(old) = self.rows.iter_mut().find(|r| r.button == from) {
+            *old = Row::blank(from);
+        }
+        if self.capturing == Some(from) {
+            self.capturing = None;
+        }
+    }
+
+    fn draw_macros(&mut self, ui: &mut egui::Ui, count: u8, keys: &dyn Keymap) {
+        let buttons: Vec<u8> = (1..=count)
+            .filter(|b| self.rows.iter().any(|r| r.button == *b && r.is_macro()))
+            .collect();
+        theme::section(ui, "Macros", |ui| {
+            theme::hint(
+                ui,
+                "Run a command you type when a button is pressed several times in a row. \
+                 One press does nothing extra, so the button keeps its own job: the sniper \
+                 button still holds its DPI stage. Press it the number of times set here, \
+                 each within the time limit of the last, and the macro runs.",
+            );
+            ui.add_space(10.0);
+
+            let mut remove: Option<u8> = None;
+            let mut moved: Option<(u8, u8)> = None;
+            for (n, button) in buttons.iter().copied().enumerate() {
+                if n > 0 {
+                    ui.add_space(6.0);
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(
+                        r.x_range(),
+                        ui.cursor().top() - 2.0,
+                        egui::Stroke::new(1.0_f32, theme::LINE),
+                    );
+                    ui.add_space(6.0);
+                }
+                let Some(idx) = self.rows.iter().position(|r| r.button == button) else { continue };
+                let mut row = self.rows[idx].clone();
+                let free: Vec<u8> = (1..=count)
+                    .filter(|b| *b == button || self.rows.iter().any(|r| r.button == *b && !r.is_set()))
+                    .collect();
+
+                ui.horizontal_wrapped(|ui| {
+                    let mut to = button;
+                    egui::ComboBox::from_id_salt(("macro-button", button))
+                        .selected_text(self.button_title(button))
+                        .show_ui(ui, |ui| {
+                            for b in &free {
+                                ui.selectable_value(&mut to, *b, self.button_title(*b));
+                            }
+                        });
+                    if to != button {
+                        moved = Some((button, to));
+                    }
+                    ui.label(egui::RichText::new("pressed").color(theme::DIM).size(12.5));
+                    egui::ComboBox::from_id_salt(("macro-presses", button))
+                        .selected_text(format!("{} times", row.presses))
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            for p in 2..=actions::MAX_PRESSES {
+                                ui.selectable_value(&mut row.presses, p, format!("{p} times"));
+                            }
+                        });
+                    ui.label(egui::RichText::new("within").color(theme::DIM).size(12.5));
+                    // A local copy, assigned only on a change: the widget would
+                    // otherwise clamp what the file holds just by being drawn.
+                    let mut ms = row.within_ms;
+                    let r = ui.add(
+                        egui::DragValue::new(&mut ms)
+                            .speed(10.0)
+                            .suffix(" ms"),
+                    );
+                    if r.changed() {
+                        row.within_ms = ms.clamp(
+                            *actions::WITHIN_MS_RANGE.start(),
+                            *actions::WITHIN_MS_RANGE.end(),
+                        );
+                    }
+                    if ui.button("Remove").clicked() {
+                        remove = Some(button);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(("macro-kind", button))
+                        .selected_text(row.kind.label())
+                        .width(136.0)
+                        .show_ui(ui, |ui| {
+                            for k in Kind::ALL.iter().filter(|k| **k != Kind::None) {
+                                ui.selectable_value(&mut row.kind, *k, k.label());
+                            }
+                        });
+                    if row.kind != Kind::Key && self.capturing == Some(button) {
+                        self.capturing = None;
+                    }
+                });
+                ui.add_space(4.0);
+                let w = (ui.available_width() - 40.0).max(160.0);
+                self.draw_value(ui, &mut row, button, false, w, keys);
+                if row.kind == Kind::Command {
+                    ui.add_space(2.0);
+                    theme::hint(
+                        ui,
+                        &format!(
+                            "Runs after {} presses of button {button}, each within {} ms of \
+                             the last, and again for every {} after that.",
+                            row.presses, row.within_ms, row.presses
+                        ),
+                    );
+                }
+                merge_row(&mut self.rows[idx], row);
+            }
+
+            if let Some(b) = remove {
+                if let Some(r) = self.rows.iter_mut().find(|r| r.button == b) {
+                    *r = Row::blank(b);
+                }
+                if self.capturing == Some(b) {
+                    self.capturing = None;
+                }
+            }
+            if let Some((from, to)) = moved {
+                self.move_macro(from, to);
+            }
+
+            if !buttons.is_empty() {
+                ui.add_space(10.0);
+            }
+            let any_free = (1..=count).any(|b| self.rows.iter().any(|r| r.button == b && !r.is_set()));
+            if ui.add_enabled(any_free, egui::Button::new("Add a macro")).clicked() {
+                self.add_macro(count);
+            }
+            if !any_free {
+                ui.add_space(4.0);
+                theme::hint(ui, "Every button already has a binding below. Set one to Nothing to free it.");
+            }
+            ui.add_space(6.0);
+            theme::hint(
+                ui,
+                "Which number is which button: the names in brackets come from the active \
+                 profile's button table and are usually right. To check, run `logi bind watch` \
+                 in a terminal and press the button.",
+            );
+        });
+        ui.add_space(14.0);
     }
 
     fn draw_rows(&mut self, ui: &mut egui::Ui, count: u8, keys: &dyn Keymap) {
@@ -802,6 +1041,10 @@ impl BindingsEditor {
             ui.add_space(12.0);
             for i in 0..count {
                 let button = i + 1;
+                // Macros have their own section above.
+                if self.rows.iter().any(|r| r.button == button && r.is_macro()) {
+                    continue;
+                }
                 self.draw_row(ui, button, count, keys);
                 if button != count {
                     ui.add_space(6.0);
@@ -848,6 +1091,107 @@ impl BindingsEditor {
         });
     }
 
+    /// The editor for what a row does: the key to capture, the text to type,
+    /// the command to run. Shared by the plain rows and the macro rows, so the
+    /// two cannot drift apart in what they accept.
+    fn draw_value(
+        &mut self,
+        ui: &mut egui::Ui,
+        row: &mut Row,
+        button: u8,
+        replaced: bool,
+        w: f32,
+        keys: &dyn Keymap,
+    ) {
+        match row.kind {
+            Kind::None => {
+                theme::hint(
+                    ui,
+                    if replaced {
+                        "Disabled: the button does nothing at all."
+                    } else {
+                        "Unbound: the button keeps its normal job."
+                    },
+                );
+            }
+            Kind::Key => {
+                ui.horizontal(|ui| {
+                    let capturing = self.capturing == Some(button);
+                    let label = if capturing { "Press a key" } else { "Capture" };
+                    if ui.selectable_label(capturing, label).clicked() {
+                        self.capturing = if capturing { None } else { Some(button) };
+                    }
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut row.key)
+                            .hint_text("ctrl+c")
+                            .desired_width(w),
+                    );
+                    self.end_capture_for(&r);
+                });
+                if self.capturing == Some(button) {
+                    ui.add_space(4.0);
+                    theme::hint(
+                        ui,
+                        "Waiting for a key press. Escape cancels. Super is not \
+                         visible to this window, so type super+l for that one; \
+                         ctrl+v with an empty clipboard, and a dedicated \
+                         Copy, Cut or Paste key, send this window nothing \
+                         usable, so type those.",
+                    );
+                }
+            }
+            Kind::Text => {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut row.text)
+                        .hint_text("Hello there")
+                        .desired_width(w),
+                );
+                self.end_capture_for(&r);
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "Typed as key presses on a US layout; other layouts produce \
+                     other characters.",
+                );
+            }
+            Kind::Mouse => {
+                egui::ComboBox::from_id_salt(("bind-mouse", button))
+                    .selected_text(mouse_label(row.mouse))
+                    .show_ui(ui, |ui| {
+                        for (n, c) in actions::MOUSE_BUTTONS {
+                            ui.selectable_value(&mut row.mouse, *c, *n);
+                        }
+                    });
+            }
+            Kind::Command => {
+                let r = ui.add(
+                    egui::TextEdit::singleline(&mut row.command)
+                        .hint_text("notify-send hi")
+                        .desired_width(w),
+                );
+                self.end_capture_for(&r);
+                ui.add_space(4.0);
+                theme::hint(
+                    ui,
+                    "Runs as you, with your environment: as trusted as ~/.profile. \
+                     A pipe, a glob, quoting or $VAR sends it through /bin/sh.",
+                );
+            }
+        }
+
+        if let Err(e) = row.action(keys) {
+            if row.is_set() {
+                ui.add_space(4.0);
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(e).color(theme::WARN).size(11.5),
+                    )
+                    .wrap(),
+                );
+            }
+        }
+    }
+
     fn draw_row(&mut self, ui: &mut egui::Ui, button: u8, count: u8, keys: &dyn Keymap) {
         // Edited on a copy, so one row's widgets cannot borrow the whole
         // editor and the write-back is the only place the model changes.
@@ -856,7 +1200,8 @@ impl BindingsEditor {
         let replaced = row.mode == BindMode::Replace;
 
         ui.horizontal(|ui| {
-            ui.add_sized(
+            let name = self.label_for(button);
+            let resp = ui.add_sized(
                 egui::vec2(74.0, 20.0),
                 egui::Label::new(
                     egui::RichText::new(format!("Button {button}"))
@@ -864,6 +1209,9 @@ impl BindingsEditor {
                         .color(if button == 1 { theme::TEXT } else { theme::DIM }),
                 ),
             );
+            if let Some(n) = name {
+                resp.on_hover_text(format!("On the mouse itself: {n}"));
+            }
             egui::ComboBox::from_id_salt(("bind-kind", button))
                 .selected_text(row.kind.label())
                 .width(136.0)
@@ -903,93 +1251,7 @@ impl BindingsEditor {
             ui.add_space(74.0);
             ui.vertical(|ui| {
                 let w = (ui.available_width() - 110.0).max(140.0);
-                match row.kind {
-                    Kind::None => {
-                        theme::hint(
-                            ui,
-                            if replaced {
-                                "Disabled: the button does nothing at all."
-                            } else {
-                                "Unbound: the button keeps its normal job."
-                            },
-                        );
-                    }
-                    Kind::Key => {
-                        ui.horizontal(|ui| {
-                            let capturing = self.capturing == Some(button);
-                            let label = if capturing { "Press a key" } else { "Capture" };
-                            if ui.selectable_label(capturing, label).clicked() {
-                                self.capturing = if capturing { None } else { Some(button) };
-                            }
-                            let r = ui.add(
-                                egui::TextEdit::singleline(&mut row.key)
-                                    .hint_text("ctrl+c")
-                                    .desired_width(w),
-                            );
-                            self.end_capture_for(&r);
-                        });
-                        if self.capturing == Some(button) {
-                            ui.add_space(4.0);
-                            theme::hint(
-                                ui,
-                                "Waiting for a key press. Escape cancels. Super is not \
-                                 visible to this window, so type super+l for that one; \
-                                 ctrl+v with an empty clipboard, and a dedicated \
-                                 Copy, Cut or Paste key, send this window nothing \
-                                 usable, so type those.",
-                            );
-                        }
-                    }
-                    Kind::Text => {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut row.text)
-                                .hint_text("Hello there")
-                                .desired_width(w),
-                        );
-                        self.end_capture_for(&r);
-                        ui.add_space(4.0);
-                        theme::hint(
-                            ui,
-                            "Typed as key presses on a US layout; other layouts produce \
-                             other characters.",
-                        );
-                    }
-                    Kind::Mouse => {
-                        egui::ComboBox::from_id_salt(("bind-mouse", button))
-                            .selected_text(mouse_label(row.mouse))
-                            .show_ui(ui, |ui| {
-                                for (n, c) in actions::MOUSE_BUTTONS {
-                                    ui.selectable_value(&mut row.mouse, *c, *n);
-                                }
-                            });
-                    }
-                    Kind::Command => {
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut row.command)
-                                .hint_text("notify-send hi")
-                                .desired_width(w),
-                        );
-                        self.end_capture_for(&r);
-                        ui.add_space(4.0);
-                        theme::hint(
-                            ui,
-                            "Runs as you, with your environment: as trusted as ~/.profile. \
-                             A pipe, a glob, quoting or $VAR sends it through /bin/sh.",
-                        );
-                    }
-                }
-
-                if let Err(e) = row.action(keys) {
-                    if row.is_set() {
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(e).color(theme::WARN).size(11.5),
-                            )
-                            .wrap(),
-                        );
-                    }
-                }
+                self.draw_value(ui, &mut row, button, replaced, w, keys);
 
                 // Confirmation for left click, inline where the click was.
                 if self.confirm == Some(button) {
@@ -2414,5 +2676,82 @@ mod tests {
         }
         let errs = e.render(&keymap()).expect_err("must not render");
         assert!(errs[0].contains("one line"), "{errs:?}");
+    }
+
+    // ---- macros ----
+
+    const MACRO_SRC: &str = "button 6 x3 within 400 = command notify-send three\n\
+                             button 2 = key ctrl+c\n";
+
+    #[test]
+    fn a_macro_line_loads_into_its_row_and_saves_back_unchanged() {
+        let e = editor(MACRO_SRC);
+        let r = e.rows.iter().find(|r| r.button == 6).unwrap();
+        assert!(r.is_macro());
+        assert_eq!((r.presses, r.within_ms), (3, 400));
+        assert_eq!(r.kind, Kind::Command);
+        assert_eq!(r.command, "notify-send three");
+        assert!(!e.rows.iter().find(|r| r.button == 2).unwrap().is_macro());
+        let (text, silence) = e.render(&keymap()).unwrap();
+        assert!(text.contains("button 6 x3 within 400 = command notify-send three"), "{text}");
+        assert!(silence.is_empty(), "a macro must never silence a button");
+    }
+
+    #[test]
+    fn adding_a_macro_prefers_the_sniper_button_when_it_is_free() {
+        let mut e = editor("button 1 = key a\n");
+        e.labels = (1..=11)
+            .map(|b| if b == 6 { "sniper (dpi-shift)".to_string() } else { String::new() })
+            .collect();
+        e.add_macro(11);
+        let r = e.rows.iter().find(|r| r.is_macro()).unwrap();
+        assert_eq!(r.button, 6);
+        assert_eq!((r.kind, r.presses), (Kind::Command, DEFAULT_MACRO_PRESSES));
+        // Not yet written until it has a command: it reports what is missing.
+        assert!(e.render(&keymap()).is_err());
+    }
+
+    #[test]
+    fn adding_a_macro_skips_buttons_that_are_taken() {
+        let mut e = editor("button 1 = key a\nbutton 2 = key b\n");
+        e.add_macro(11);
+        assert_eq!(e.rows.iter().find(|r| r.is_macro()).unwrap().button, 3);
+    }
+
+    #[test]
+    fn a_macro_moves_only_onto_a_free_button() {
+        let mut e = editor(MACRO_SRC);
+        // Button 2 is bound: the move is refused and nothing is lost.
+        e.move_macro(6, 2);
+        assert!(e.rows.iter().find(|r| r.button == 6).unwrap().is_macro());
+        assert_eq!(e.rows.iter().find(|r| r.button == 2).unwrap().kind, Kind::Key);
+        // Button 7 is free.
+        e.move_macro(6, 7);
+        assert!(!e.rows.iter().find(|r| r.button == 6).unwrap().is_set());
+        let moved = e.rows.iter().find(|r| r.button == 7).unwrap();
+        assert!(moved.is_macro());
+        assert_eq!((moved.button, moved.command.as_str()), (7, "notify-send three"));
+    }
+
+    #[test]
+    fn only_the_buttons_the_profile_names_get_labels() {
+        assert_eq!(friendly_job("dpi-shift"), "sniper (dpi-shift)");
+        assert_eq!(friendly_job("dpi-up"), "dpi-up");
+        assert!(button_labels(&Snapshot::default()).is_empty());
+    }
+
+    #[test]
+    fn painting_the_macro_section_changes_nothing() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(MACRO_SRC));
+        egui::__run_test_ui(|ui| {
+            let mut e = ed.borrow_mut();
+            let keys = keymap();
+            e.draw_macros(ui, 11, &keys);
+            e.draw_rows(ui, 11, &keys);
+        });
+        let e = ed.borrow();
+        assert!(!e.dirty(), "painting made the editor think it had edits");
+        assert_eq!(e.rows, editor(MACRO_SRC).rows);
     }
 }

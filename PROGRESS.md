@@ -196,6 +196,19 @@ retried every 3 s (up to 100 times; a tray-only start waits up to five
 minutes). Reproduced with a private session bus whose watcher appears 8 s late:
 the tray stayed up, logged once, and registered when the watcher came.
 
+## Macros
+
+A binding can wait for a streak: `button 6 x3 within 400 = command ...` runs
+the command on the third press in a row, each within 400 ms of the last, and
+starts counting again after (`src/streak.rs`, the syntax in `src/actions.rs`).
+One press does nothing extra, so the button keeps its job. A streak must be
+`augment`: a replaced button would lose its own job on every press of it. The
+Buttons tab has a Macros section above the plain rows, and `logi bind watch`
+prints button numbers as they are pressed. Unit-tested (the counter, the
+syntax and its refusals, the editor); **not yet run against the mouse**: that
+the sniper button reports through the button spy, and what number it has, is
+to be checked by pressing it.
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or

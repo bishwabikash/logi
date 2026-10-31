@@ -36,6 +36,12 @@ Run `logi` for the window, or `logi --help` for the command line.
 * **Button bindings.** Bind a physical button to a key or chord, typed text, a
   command, or another mouse button, either alongside its normal job or in place
   of it.
+* **Macros.** Run a command you type when a button is pressed several times in
+  a row: one press does nothing extra, so the button keeps its own job (the
+  sniper button still holds its DPI stage), and the configured number of
+  presses, each within a time limit of the last, runs the command. Set up under
+  Buttons, or `button 6 x3 = command ...` in `bindings.conf`. `logi bind watch`
+  shows which number is which button.
 * **Per-application profiles.** Switch profile while a given program is running.
 * **A tray icon** showing the service state, with a menu. It is there whenever
   the service is running, window or not.
