@@ -85,6 +85,7 @@ taken first.
 | The window following DPI and profile changes made by another process | yes |
 | The window following presses of the mouse's own DPI buttons | yes (the mouse announces each press; about 75 tracked in 50 s) |
 | The tray icon registering with GNOME | yes |
+| A macro on the sniper button (button 6) firing on the third press of three, via `logi bind run` | yes |
 
 | **Implemented and unit-tested, never run against hardware** | |
 |---|---|

@@ -205,9 +205,11 @@ One press does nothing extra, so the button keeps its job. A streak must be
 `augment`: a replaced button would lose its own job on every press of it. The
 Buttons tab has a Macros section above the plain rows, and `logi bind watch`
 prints button numbers as they are pressed. Unit-tested (the counter, the
-syntax and its refusals, the editor); **not yet run against the mouse**: that
-the sniper button reports through the button spy, and what number it has, is
-to be checked by pressing it.
+syntax and its refusals, the editor). Run on the G502 HERO with `logi bind
+run`: the sniper button reports through the spy as button 6, and with
+`button 6 x3` a single press fired nothing, three quick presses fired once and
+six fired twice, as intended. **Not run on hardware:** the same through the
+service, and the Macros section on screen.
 
 ## Warnings
 
