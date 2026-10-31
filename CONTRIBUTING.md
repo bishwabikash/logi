@@ -107,9 +107,9 @@ first, then describe what led up to it.
 * **Match the surrounding code.** The code is not rustfmt-formatted, so do not
   run `cargo fmt` over a file: it would bury your change in unrelated
   reformatting.
-* **Comments say why**, not what. The reasoning behind an odd choice (a delay, a
-  refusal, an ordering) belongs next to it, because the odd choices are mostly
-  scars.
+* **Comments say why, briefly.** One line on an odd choice (a delay, a
+  refusal, an ordering). The history and the incident belong in the commit
+  message, not above the code.
 * **No compiler warnings.** The tree has none and CI builds with
   `-D warnings`. Code only a test uses is `#[cfg(test)]`; unused code is
   deleted, not silenced.

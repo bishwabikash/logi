@@ -1039,10 +1039,7 @@ fn perform(action: &actions::Action, vd: &mut uinput::VirtualDevice) -> std::io:
 }
 
 /// Print each button press and release by number, until Ctrl-C.
-///
-/// Read-only: it starts the spy and listens, and silences nothing. The spy is
-/// stopped on the way out only when the service is not running, because the
-/// service may be using it for bindings and stopping it would end those.
+/// Read-only; stops the spy on exit only if the service is not running, since it may be using it.
 fn cmd_bind_watch() -> Result<(), CliError> {
     let mut f = open()?;
     if !f.caps.button_spy {
@@ -1368,19 +1365,8 @@ fn silence_fits(silence: &[u8], count: u8) -> Result<(), String> {
     }
 }
 
-/// The background service.
-///
-/// Deliberately tolerant: with no rule file, or no device attached, it idles
-/// rather than exiting. A service that quits because its config is missing
-/// just flaps under systemd's restart policy and buries the real reason.
 /// Make sure the panel icon is up while the service is.
-///
-/// The icon is its own process (`logi tray`), and started through systemd as a
-/// transient unit of its own: a child of this service would be killed with it,
-/// and the icon is most useful when the service is stopped, because that is when
-/// its menu offers to start it. The tray takes a lock, so one already running
-/// (the window's, or an earlier one) makes this a no-op. Best effort: with no
-/// systemd-run, or no panel to show an icon in, the service carries on without.
+/// Started as its own transient systemd unit, since a child of the service would die with it. Best effort.
 fn ensure_tray() {
     let Ok(exe) = std::env::current_exe() else { return };
     let started = std::process::Command::new("systemd-run")
@@ -1399,6 +1385,11 @@ fn ensure_tray() {
     }
 }
 
+/// The background service.
+///
+/// Deliberately tolerant: with no rule file, or no device attached, it idles
+/// rather than exiting. A service that quits because its config is missing
+/// just flaps under systemd's restart policy and buries the real reason.
 fn cmd_serve() -> Result<(), CliError> {
     install_interrupt_handler();
     install_panic_restore();
@@ -1722,7 +1713,6 @@ struct SpyState {
     listener: hidpp::Device,
     vd: uinput::VirtualDevice,
     bindings: actions::Bindings,
-    /// Counts presses for bindings that wait for a streak of them.
     streaks: streak::Streaks,
     silenced: bool,
 }

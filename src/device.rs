@@ -35,9 +35,7 @@ pub enum Cmd {
     StartEffect { name: String, color: [u8; 3], period_ms: u32 },
     StopEffect,
     Backup(String),
-    /// The safety backup taken once per launch, before any automatic flash
-    /// write. Goes to the app's own data directory, and writes nothing when
-    /// the newest backup there already holds exactly what the mouse holds.
+    /// Safety backup taken once per launch, before any automatic flash write.
     AutoBackup,
     WriteProfile { index: u8, profile: Box<Profile> },
     SetButton { index: u8, button: u8, binding: crate::profile_blob::Button },
@@ -649,8 +647,7 @@ fn connect() -> Result<Live, String> {
     let listener = profiles.as_ref().and_then(|p| {
         crate::live::Listener::spawn(&dev, p.feature_index(), Arc::clone(&pulse)).ok()
     });
-    // Read-only, and only when the device lists the feature. A failure leaves
-    // the line blank: the firmware version is information, not a control.
+    // Read-only and only if the device lists the feature; failure just leaves the firmware line blank.
     let firmware = caps
         .firmware
         .then(|| crate::deviceinfo::firmware(&mut dev).ok())
@@ -884,12 +881,8 @@ fn write_backup(
     }))
 }
 
-/// Take the safety backup, or say that the newest one already covers this.
-///
-/// A partial dump is refused, not written. The point of this backup is to be
-/// the way back from a flash write, and a file with sectors missing is not
-/// that: restoring it would leave the absent ones as they were, which may be
-/// the very ones a bad write damaged.
+/// Take the safety backup, or say the newest already covers this.
+/// A partial dump is refused: restoring it would leave sectors a bad write may have damaged.
 fn auto_backup(
     model: &str,
     dump: &[(u16, Option<Vec<u8>>)],
@@ -908,9 +901,7 @@ fn auto_backup(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Not Error::Io: the worker reads that as "the device vanished" and drops
-    // a good handle, and a backup directory that cannot be written has nothing
-    // to do with the mouse.
+    // Not Error::Io: the worker reads that as "device vanished" and drops a good handle.
     let plan = crate::backups::plan(&crate::backups::dir(), &json, now).map_err(|e| {
         Error::Protocol(format!("preparing {}: {e}", crate::backups::dir().display()))
     })?;
@@ -1237,9 +1228,7 @@ fn worker(
                     })
                 })
             }),
-            // The live setter is refused outside host mode (measured, see
-            // PROTOCOL.md), so it goes there first, as the lighting commands do.
-            // Without this a click on the Sensor tab got "invalid argument".
+            // The live setter is refused outside host mode (see PROTOCOL.md), so go there first.
             Cmd::SetRate(hz) => ensure_host(l)
                 .and_then(|_| feat!(l, rate, "adjustable report rate"))
                 .and_then(|(r, dev)| r.set(dev, hz).map(|_| Some(format!("{hz} Hz")))),

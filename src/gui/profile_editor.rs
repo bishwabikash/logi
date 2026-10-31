@@ -1,10 +1,7 @@
 //! Editing one onboard profile from the GUI.
 //!
-//! Every control here edits a staged copy held in memory. It reaches the mouse
-//! by itself, but only once it has stopped changing (`tick`), because writing a
-//! profile is a flash write with finite endurance: a write per keystroke would
-//! both wear the sector out and leave half-built profiles on the device while
-//! the user is still typing.
+//! Every control edits a staged copy in memory. It reaches the mouse on its own, but only once it has
+//! stopped changing (`tick`): a profile write is flash with finite endurance.
 //!
 //! Two other rules are load-bearing rather than stylistic:
 //!
@@ -559,30 +556,23 @@ pub struct ProfileEditor {
     /// mouse had in fact taken would sit staged as unsaved for the rest of
     /// the session.
     writes: HashMap<u8, Write>,
-    /// Per profile, what the automatic send is waiting on.
     auto: HashMap<u8, Auto>,
-    /// What `tick` last saw of the backup, so the panels can say why an edit
-    /// has not gone yet.
+    /// What `tick` last saw of the backup, so panels can say why an edit has not gone yet.
     safety: Safety,
-    /// The stage slot the Sensor tab's slider is editing.
     stage_sel: usize,
     /// A stage being typed into: its slot and the text so far.
     stage_edit: Option<(usize, String)>,
 }
 
-/// Where one profile's edits stand on their way to the mouse.
 #[derive(Debug, Default, Clone)]
 struct Auto {
-    /// The draft as of the last look, to notice that it changed.
     seen: Option<Draft>,
     settle: Settle,
-    /// The last draft handed to the worker. Never sent twice: a write that
-    /// failed is not retried on its own, since a loop of failing flash writes
-    /// is exactly what must not happen. An edit, or Try again, sends it anew.
+    /// The last draft handed to the worker; never re-sent, since a loop of failing flash writes must not happen.
+    /// An edit, or Try again, sends it anew.
     tried: Option<Draft>,
 }
 
-/// Why a profile is not sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Blocked {
     NoLeftClick,
@@ -590,12 +580,8 @@ enum Blocked {
     NoStages,
 }
 
-/// Whether `draft` may be written over `original`, and if not why.
-///
-/// With no editable buttons the editor never touches the remapping table (it
-/// is written back as read), so there is nothing to refuse. The flash path
-/// refuses a sector whose stored checksum is wrong, so that it does not bless a
-/// corruption with a fresh one.
+/// Whether `draft` may be written over `original`, and if not why. A sector with a bad checksum is
+/// refused so a fresh one does not bless the corruption; with no editable buttons the table is untouched.
 fn blocked(draft: &Draft, original: &Profile) -> Option<Blocked> {
     if !original.crc_ok() {
         Some(Blocked::BadChecksum)
@@ -608,7 +594,6 @@ fn blocked(draft: &Draft, original: &Profile) -> Option<Blocked> {
     }
 }
 
-/// What to tell the user about an edit that is on its way to the mouse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Line {
     InSync,
@@ -646,8 +631,7 @@ fn send_line(
     }
 }
 
-/// The slot a new stage goes in: just after the last one in use, so the
-/// mouse's button reaches it last, and failing that the first free one.
+/// The slot for a new stage: just after the last in use so the mouse's button reaches it last, else the first free.
 fn free_slot(dpi: &[u16; N_DPI]) -> Option<usize> {
     let after = dpi.iter().rposition(|d| *d != 0).map_or(0, |i| i + 1);
     if after < N_DPI {
@@ -657,8 +641,7 @@ fn free_slot(dpi: &[u16; N_DPI]) -> Option<usize> {
     }
 }
 
-/// A value for a new stage: the current DPI if no stage has it, else the first
-/// common value that is free.
+/// A value for a new stage: the current DPI if no stage has it, else the first free common value.
 fn new_stage_value(existing: &[u16], live: u16, cap: Option<&Capability>) -> u16 {
     let live = if live == 0 { 1600 } else { live };
     for c in [live, 800, 1600, 3200, 6400, 400, 12800] {
@@ -670,14 +653,11 @@ fn new_stage_value(existing: &[u16], live: u16, cap: Option<&Capability>) -> u16
     snap_stage(cap, live)
 }
 
-/// (min, max, step) the sensor accepts. A list sensor has no step, so 50 is
-/// only a slider granularity there.
+/// (min, max, step) the sensor accepts; a list sensor has no step, so 50 is only slider granularity.
 fn range_of(cap: Option<&Capability>) -> (u16, u16, u16) {
     match cap {
         Some(Capability::Range { min, max, step }) => (*min, *max, (*step).max(1)),
-        // Extrema, not the first and last entry: the list is built in the
-        // order the device reported it, and a descending one would hand the
-        // slider an inverted range.
+        // Extrema, not first and last: the device's list order may be descending, which would invert the slider.
         Some(Capability::List(v)) => (
             v.iter().copied().min().unwrap_or(100),
             v.iter().copied().max().unwrap_or(25600),
@@ -730,9 +710,8 @@ impl ProfileEditor {
         self.auto.clear();
     }
 
-    /// Stage a report rate for profile `index`, to be stored by the next
-    /// automatic send. The Sensor tab's rate buttons call this alongside the
-    /// live setter, so the rate holds after the mouse goes back to onboard mode.
+    /// Stage a report rate for profile `index`, stored by the next automatic send; the live setter alone
+    /// would not survive going back to onboard mode.
     pub fn set_rate(&mut self, snap: &Snapshot, index: u8, hz: u16) {
         if snap.profile_format != 2 {
             return;
@@ -750,7 +729,6 @@ impl ProfileEditor {
         }
     }
 
-    /// The rate profile `index` will hold once everything staged is sent.
     pub fn stored_rate_hz(&self, snap: &Snapshot, index: u8) -> Option<u16> {
         let staged = self.staged.get(&index).map(|s| s.draft.report_rate_hz());
         let read = snap.profiles.get(index as usize).map(|p| {
@@ -759,7 +737,6 @@ impl ProfileEditor {
         staged.or(read).filter(|hz| *hz != 0)
     }
 
-    /// Hand a draft to the worker and start tracking its answer.
     fn start_write(
         &mut self,
         index: u8,
@@ -769,9 +746,7 @@ impl ProfileEditor {
         cmds: &mut Vec<Cmd>,
     ) {
         cmds.push(Cmd::WriteProfile { index, profile: Box::new(draft.build(original)) });
-        // Read before the command is sent (the host's dispatch loop sends it
-        // after this returns), so every outcome on the books now is older than
-        // this write's own.
+        // Read before the command is sent, so every outcome on the books is older than this write's own.
         self.writes.insert(
             index,
             Write {
@@ -781,22 +756,14 @@ impl ProfileEditor {
                 state: WriteState::Waiting,
             },
         );
-        // The draft is deliberately left as it is. It is what was sent, and
-        // until the outcome says the device took it, adopting it as the truth
-        // would be a guess.
+        // The draft is left as is: adopting it as truth before the outcome says the device took it would be a guess.
         let a = self.auto.entry(index).or_default();
         a.tried = Some(draft.clone());
         a.settle.clear();
     }
 
-    /// Send edits that have stopped changing. Called every frame, whichever tab
-    /// is showing, so an edit made on the Sensor tab goes out as surely as one
-    /// made here.
-    ///
-    /// `busy` is another flash write in flight, which this must not overlap: the
-    /// panels judge what to write from a snapshot that does not include it yet.
-    /// Returns the commands and how long until the next one is due, to schedule
-    /// the repaint that will send it: nothing else wakes an idle window.
+    /// Send edits that have stopped changing; called every frame, whichever tab is showing. `busy` is another
+    /// flash write in flight, which this must not overlap. Returns commands and time until the next is due.
     pub fn tick(
         &mut self,
         snap: &Snapshot,
@@ -818,9 +785,7 @@ impl ProfileEditor {
             let Some(original) = snap.profiles.get(index as usize) else { continue };
             let n_buttons = (snap.button_count as usize).min(original.buttons.len());
             let base = Draft::from_profile(original, n_buttons);
-            // Brought up to date with what the mouse holds, the same way the
-            // panel does, so a write built here never carries stale bytes for
-            // fields nobody touched.
+            // Brought up to date with what the mouse holds, so a write never carries stale bytes for untouched fields.
             let st = stage_for(self.staged.remove(&index), &base);
             if !st.dirty() {
                 self.auto.remove(&index);
@@ -856,8 +821,7 @@ impl ProfileEditor {
         (cmds, wake)
     }
 
-    /// Everything unsent that could be sent, right now, for the window closing.
-    /// The quiet period is skipped because there will be no later.
+    /// Everything unsent that could be sent now, for the window closing (there is no later to wait for).
     pub fn flush(&mut self, snap: &Snapshot, safety: &Safety) -> Vec<Cmd> {
         let mut cmds = Vec::new();
         if !snap.connected || !snap.has_profiles || snap.profile_format != 2 || !safety.allows_flash()
@@ -877,8 +841,7 @@ impl ProfileEditor {
             }
             let d = st.draft.clone();
             self.start_write(index, &d, original, snap, &mut cmds);
-            // One at a time: the worker takes them in order, but each is built
-            // from the same snapshot.
+            // One at a time: the worker takes them in order, but each is built from the same snapshot.
             break;
         }
         cmds
@@ -1529,9 +1492,7 @@ impl ProfileEditor {
                     // Never onto a file that is already there: the backup
                     // taken before a write is the way back from it.
                     //
-                    // Trimmed first: a pasted path with a trailing space made
-                    // a file whose name ends in one, which no later look for
-                    // it finds.
+                    // Trimmed: a pasted trailing space would make a file name nobody finds again.
                     let typed = self.backup_path.trim().to_string();
                     let target = free_backup_path(&typed, |p| {
                         self.backup_sent.iter().any(|s| s == p)
@@ -1552,9 +1513,7 @@ impl ProfileEditor {
                     let d = st.draft.clone();
                     self.start_write(index, &d, original, snap, cmds);
                 }
-                // Not while one is in flight. Reverting would throw away the
-                // very edits that were sent, and then the failure text below,
-                // "your edits are still here", would be a lie.
+                // Not while one is in flight: reverting would discard the sent edits and make "your edits are still here" a lie.
                 if ui.add_enabled(dirty && !waiting, egui::Button::new("Revert")).clicked() {
                     reverted = true; // dropping the staged entry is the revert
                     self.drop_settled_write(index);
@@ -1585,12 +1544,8 @@ impl ProfileEditor {
 }
 
 impl ProfileEditor {
-    /// The DPI stages of profile `index`, for the Sensor tab: a chip per stage,
-    /// one slider for the chosen chip, and a value that can be typed.
-    ///
-    /// It edits the same staged draft as the Profiles tab, so the two always
-    /// agree, and the edit goes out through `tick` like any other. Returns
-    /// commands to dispatch (a live DPI, a retry).
+    /// The DPI stages of profile `index` for the Sensor tab: a chip per stage, a slider for the chosen one, a typeable value.
+    /// Edits the same draft as the Profiles tab and goes out through `tick`. Returns commands to dispatch.
     pub fn stages_ui(&mut self, ui: &mut egui::Ui, snap: &Snapshot, index: u8) -> Vec<Cmd> {
         let mut cmds: Vec<Cmd> = Vec::new();
         if !snap.has_profiles || snap.profile_format != 2 {
@@ -1673,9 +1628,7 @@ impl ProfileEditor {
                 }
             });
 
-            // The slider for the chosen one. A local copy, written back only on
-            // a change: egui's slider otherwise rounds an existing value to the
-            // step while painting and would rewrite the draft by being drawn.
+            // A local copy, written back only on change: egui's slider rounds an existing value to the step while painting.
             if on.contains(&self.stage_sel) {
                 let i = self.stage_sel;
                 ui.add_space(10.0);
@@ -1694,8 +1647,7 @@ impl ProfileEditor {
                         d.dpi[i] = v;
                     }
                 }
-                // Live only once the drag lets go, as the main slider does: a
-                // command per frame would queue behind the worker for no gain.
+                // Live only once the drag lets go: a command per frame would queue behind the worker.
                 if resp.drag_stopped() || (resp.changed() && !resp.dragged()) {
                     changed_slot = Some(i);
                 }
@@ -1715,9 +1667,7 @@ impl ProfileEditor {
                     }
                 });
             }
-            // The mouse follows an edit to the stage it is on, so a drag is felt
-            // as it happens. Not flash: this is the live DPI, and it costs the
-            // mouse nothing.
+            // The mouse follows an edit to its current stage. Live DPI, not flash.
             if let Some(i) = changed_slot {
                 if active_slot == Some(i) && d.dpi[i] != 0 && d.dpi[i] != snap.dpi {
                     cmds.push(Cmd::SetDpi(d.dpi[i]));
@@ -1754,8 +1704,7 @@ impl ProfileEditor {
     }
 }
 
-/// The one-line account of where an edit stands. Shared by this panel and the
-/// Sensor tab's stage editor, so both say the same thing.
+/// The one-line account of where an edit stands, shared with the Sensor tab's stage editor.
 fn send_line_ui(ui: &mut egui::Ui, line: &Line, index: u8) {
     let bad = |ui: &mut egui::Ui, t: &str| {
         ui.label(egui::RichText::new(t).color(theme::BAD).size(13.0).strong());

@@ -261,15 +261,12 @@ pub enum BindMode {
     Replace,
 }
 
-/// The most presses a binding can wait for. Past this a person is counting,
-/// not pressing, and a long streak is mostly the mouse's own jitter.
+/// Cap on presses per streak: past this a person is counting, and mouse jitter dominates.
 pub const MAX_PRESSES: u8 = 8;
 
-/// The default time allowed between one press and the next.
 pub const DEFAULT_WITHIN_MS: u16 = 500;
 
-/// The bounds on that time. Below the floor a deliberate press cannot make it;
-/// above the ceiling a streak is just ordinary use of the button.
+/// Window bounds: below the floor no deliberate press makes it; above the ceiling it is ordinary use.
 pub const WITHIN_MS_RANGE: std::ops::RangeInclusive<u16> = 100..=3000;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -277,18 +274,13 @@ pub struct Binding {
     pub button: u8,
     pub action: Action,
     pub mode: BindMode,
-    /// How many presses in a row run the action. One means every press, as
-    /// before; more means the action waits for a streak, and a lone press does
-    /// nothing. This is how a button that already has a job (the sniper button
-    /// holds a DPI stage) can also trigger a macro without getting in the
-    /// way of that job.
+    /// Presses in a row that run the action; 1 is every press. Above 1 a lone press does nothing,
+    /// so a button with its own job (sniper's DPI stage) can also trigger a macro.
     pub presses: u8,
-    /// The longest pause allowed between presses of a streak.
     pub within_ms: u16,
 }
 
 impl Binding {
-    /// A binding that fires on every press.
     #[cfg(test)]
     pub fn new(button: u8, action: Action, mode: BindMode) -> Self {
         Binding { button, action, mode, presses: 1, within_ms: DEFAULT_WITHIN_MS }
@@ -425,9 +417,6 @@ fn strip_comment(line: &str) -> &str {
 
 /// The left-hand side: `button 10`, `button 10 replace`, `button 6 x3`,
 /// `button 6 x3 within 400`, or just `10`.
-///
-/// `xN` is how many presses in a row run the action, and `within` the longest
-/// pause between them in milliseconds.
 fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), String> {
     let mut words = lhs.split_whitespace().peekable();
     if words.peek().map(|w| w.eq_ignore_ascii_case("button")) == Some(true) {
@@ -470,8 +459,7 @@ fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), Strin
             };
             let digits = v.to_ascii_lowercase();
             let digits = digits.strip_suffix("ms").unwrap_or(&digits);
-            // Wider than the range allows, so "99999" is out of range rather
-            // than unreadable.
+            // Parse wide so "99999" is out of range, not unreadable.
             let ms: u32 = digits
                 .parse()
                 .map_err(|_| format!("bad time {v:?} after `within`; want milliseconds"))?;
@@ -493,9 +481,7 @@ fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), Strin
     if within.is_some() && presses == 1 {
         return Err("`within` only means something with a press count, like `x3`".into());
     }
-    // A streak keeps the button's own job: that is the point of it, and a
-    // replaced button would lose that job on every press while only the last
-    // one of the streak did anything.
+    // A streak keeps the button's own job; a replaced button would lose it on every press.
     if presses > 1 && mode == BindMode::Replace {
         return Err(
             "a press count needs `augment`: the button keeps its own job, and the \
@@ -952,7 +938,6 @@ mod tests {
         let bind = b.get(3).unwrap();
         assert_eq!(bind.presses, 1);
         assert!(!bind.is_streak());
-        // And is written back without any trace of the feature.
         assert_eq!(b.render(&FakeKeys), "button 3 = command true\n");
     }
 

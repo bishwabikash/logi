@@ -83,8 +83,7 @@ impl Firmware {
     }
 }
 
-/// The firmware line shown for a device: the main entity, then any others
-/// ("bootloader U2 ...") after it. Empty when the device reported none.
+/// Firmware line: the main entity, then others ("bootloader U2 ..."); empty if none reported.
 pub fn firmware_summary(list: &[Firmware]) -> String {
     let main = list.iter().find(|f| f.kind == "main");
     let rest = list.iter().filter(|f| f.kind != "main");

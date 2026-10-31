@@ -1,15 +1,5 @@
-//! Safety backups taken without being asked.
-//!
-//! Changes now go to the mouse on their own, and a profile write is flash with
-//! finite endurance that cannot be undone from the app. The advice to take a
-//! backup first was only ever advice. So the app takes one by itself, once per
-//! launch, before any automatic flash write.
-//!
-//! They live in the user's data directory, not in `$HOME`, and a launch whose
-//! mouse has not changed since the last backup writes nothing: without that,
-//! every launch would leave another identical file behind. Files are named for
-//! the moment they were taken, so the newest sorts last and any of them is a
-//! point `logi restore` can go back to.
+//! Safety backups taken automatically, once per launch, before any automatic flash write.
+//! Stored in the data directory; nothing is written if the mouse is unchanged since the newest backup.
 
 use std::path::{Path, PathBuf};
 
@@ -25,22 +15,14 @@ pub fn dir() -> PathBuf {
     base.join("logi/backups")
 }
 
-/// What to do with a backup whose text is already in hand.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Plan {
-    /// The newest backup already holds exactly this. Write nothing.
     Same(PathBuf),
-    /// Write here.
     Write(PathBuf),
 }
 
-/// Decide where a backup goes, or that it is not needed.
-///
-/// Only the newest existing backup is compared. If the mouse has since changed
-/// back to an older state, that is a new restore point worth keeping, and a
-/// comparison against every file would quietly decline to take it.
-///
-/// Creates the directory when a write is called for.
+/// Where a backup goes, or that none is needed. Only the newest backup is compared, so A -> B -> A
+/// still takes a new restore point.
 pub fn plan(dir: &Path, json: &str, now_unix: u64) -> std::io::Result<Plan> {
     let mut names: Vec<String> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
@@ -48,12 +30,11 @@ pub fn plan(dir: &Path, json: &str, now_unix: u64) -> std::io::Result<Plan> {
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|n| n.starts_with("backup-") && n.ends_with(".json"))
             .collect(),
-        // Nothing there yet is the ordinary first run, not a failure.
+        // No directory yet is the normal first run.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e),
     };
-    // Stamps are fixed-width and most significant first, so name order is
-    // time order.
+    // Fixed-width stamps, most significant first: name order is time order.
     names.sort();
     if let Some(newest) = names.last() {
         let path = dir.join(newest);
@@ -65,8 +46,7 @@ pub fn plan(dir: &Path, json: &str, now_unix: u64) -> std::io::Result<Plan> {
     std::fs::create_dir_all(dir)?;
     let stamp = stamp(now_unix);
     let mut candidate = format!("backup-{stamp}.json");
-    // Two in one second would otherwise land on one name, and the second
-    // would replace the first.
+    // Two in one second would land on one name.
     let mut n = 2;
     while dir.join(&candidate).exists() {
         candidate = format!("backup-{stamp}-{n}.json");
@@ -75,11 +55,7 @@ pub fn plan(dir: &Path, json: &str, now_unix: u64) -> std::io::Result<Plan> {
     Ok(Plan::Write(dir.join(candidate)))
 }
 
-/// `20261029-163452`: the time in UTC, written so names sort by time.
-///
-/// UTC and no date library: the project has none and does not need one for a
-/// file name, and a name that does not depend on the local zone cannot go
-/// backwards when the clocks do.
+/// `20261029-163452`: UTC, so names sort by time and never go backwards with the local zone. No date library.
 pub fn stamp(unix_secs: u64) -> String {
     let days = (unix_secs / 86_400) as i64;
     let rem = unix_secs % 86_400;
@@ -92,8 +68,7 @@ pub fn stamp(unix_secs: u64) -> String {
     )
 }
 
-/// Days since 1970-01-01 to (year, month, day) in the proleptic Gregorian
-/// calendar. Howard Hinnant's `civil_from_days`.
+/// Days since 1970-01-01 to (year, month, day); Howard Hinnant's `civil_from_days`.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
@@ -178,9 +153,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_backup_is_compared() {
-        // The mouse went A, then B, and is back at A. Comparing against every
-        // file would call that "already backed up" and decline to keep the
-        // restore point, though the newest backup is B.
+        // A, then B, then back at A: comparing every file would skip the restore point.
         let dir = temp("newest");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("backup-20240101-000000.json"), "A").unwrap();
@@ -213,8 +186,7 @@ mod tests {
 
     #[test]
     fn an_unreadable_directory_is_an_error_not_a_silent_skip() {
-        // A file where the directory should be: planning must say so rather
-        // than conclude there is nothing to compare against and carry on.
+        // A file where the directory should be must be an error, not "nothing to compare".
         let dir = temp("blocked");
         std::fs::write(&dir, "i am a file").unwrap();
         assert!(plan(&dir, "x", 1).is_err());

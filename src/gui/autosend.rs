@@ -1,12 +1,5 @@
-//! Sending changes to the mouse without a button.
-//!
-//! The rule it implements: a change is sent once it has stopped changing. Not
-//! on every keystroke or step of a drag, because a profile write is flash with
-//! finite endurance and a name typed a letter at a time would be a write per
-//! letter. After a short quiet, then.
-//!
-//! The shorter wait is for things that cost the mouse nothing, like a live
-//! colour; the longer one for flash.
+//! Sends changes to the mouse once they stop changing, not per keystroke: a profile write is flash with finite endurance.
+//! Live non-flash changes (colour) wait less than flash ones.
 
 use std::time::{Duration, Instant};
 
@@ -16,18 +9,13 @@ pub const LIVE_QUIET: Duration = Duration::from_millis(300);
 /// Quiet needed before a change that writes flash is sent.
 pub const FLASH_QUIET: Duration = Duration::from_millis(2000);
 
-/// Whether it is safe to send a change that writes flash on its own.
-///
-/// The app takes a backup once per launch before the first such write. Until
-/// that has happened, or if it could not be taken, nothing is sent
-/// automatically: sending flash writes with no way back, unasked, is the thing
-/// the backup exists to prevent.
+/// Whether a flash write may be sent unasked: not until the per-launch backup exists, since unasked
+/// writes with no way back are what the backup exists to prevent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Safety {
-    /// The backup is still being taken. A moment, not a problem.
     Pending,
     Ready,
-    /// It could not be taken, and why. Nothing is sent unless the user says to.
+    /// Could not be taken; nothing is sent unless the user says to.
     Failed(String),
 }
 
@@ -37,10 +25,7 @@ impl Safety {
     }
 }
 
-/// Tracks one edit that is waiting for its quiet period.
-///
-/// Holds no clock: callers pass the time, so the timing is testable without
-/// waiting for it.
+/// One edit waiting out its quiet period. Callers pass the time so tests do not wait.
 #[derive(Debug, Default, Clone)]
 pub struct Settle {
     changed: Option<Instant>,
@@ -51,8 +36,7 @@ impl Settle {
         Settle { changed: None }
     }
 
-    /// The value just changed. Restarts the wait, which is the point: every
-    /// further change pushes the send back.
+    /// Restarts the wait: every further change pushes the send back.
     pub fn touch(&mut self, now: Instant) {
         self.changed = Some(now);
     }
@@ -61,22 +45,17 @@ impl Settle {
         self.changed.is_some()
     }
 
-    /// True once it is pending and has been left alone for `quiet`.
     pub fn due(&self, now: Instant, quiet: Duration) -> bool {
         self.changed
             .is_some_and(|t| now.saturating_duration_since(t) >= quiet)
     }
 
-    /// How long until it is due, for scheduling the repaint that will send it.
-    ///
-    /// Needed because nothing else wakes an idle window: without this an edit
-    /// would sit until the user moved the mouse.
+    /// Time until due, to schedule the repaint: nothing else wakes an idle window.
     pub fn wait_left(&self, now: Instant, quiet: Duration) -> Option<Duration> {
         self.changed
             .map(|t| quiet.saturating_sub(now.saturating_duration_since(t)))
     }
 
-    /// It was sent, or is no longer wanted.
     pub fn clear(&mut self) {
         self.changed = None;
     }
@@ -109,8 +88,7 @@ mod tests {
 
     #[test]
     fn every_further_change_pushes_the_send_back() {
-        // A name typed a letter at a time: each keystroke restarts the wait, so
-        // the write happens once, after the last one, and not once per letter.
+        // A name typed a letter at a time writes once, after the last letter.
         let mut s = Settle::new();
         let t = Instant::now();
         let mut sends = 0;

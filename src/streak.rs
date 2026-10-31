@@ -1,10 +1,4 @@
-//! Telling a streak of presses from presses.
-//!
-//! A binding that wants three presses in a row has to count them, and has to
-//! forget a count that went stale: a press now and another a minute later are
-//! not a streak. This is only that bookkeeping, with the clock passed in so it
-//! can be tested without waiting, and nothing to do with the device or with
-//! running the action.
+//! Counts presses toward a streak and forgets stale counts; the clock is passed in so tests do not wait.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -22,21 +16,15 @@ impl Streaks {
         Self::default()
     }
 
-    /// A press of `bind.button` at `now`. True when the binding's action should
-    /// run now.
-    ///
-    /// A binding with a press count of one runs on every press and keeps no
-    /// state. A longer one runs on the press that completes the streak and then
-    /// starts over, so six presses at a count of three run it twice, and a
-    /// streak cut short by a long pause simply starts again from that press.
+    /// A press of `bind.button` at `now`; true when the action should run.
+    /// A count of one runs every press with no state; longer runs on the press completing the streak, then restarts.
     pub fn press(&mut self, bind: &Binding, now: Instant) -> bool {
         if bind.presses <= 1 {
             return true;
         }
         let within = Duration::from_millis(bind.within_ms as u64);
         let entry = self.state.entry(bind.button).or_insert((0, now));
-        // `saturating`: a clock that stepped back is no reason to panic, and
-        // counts as no time having passed.
+        // `saturating`: a clock that stepped back counts as no time passing.
         if entry.0 > 0 && now.saturating_duration_since(entry.1) > within {
             entry.0 = 0;
         }

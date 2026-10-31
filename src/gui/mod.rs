@@ -42,13 +42,11 @@ pub struct App {
     period_ms: u16,
     waveform: usize,
     intensity: u8,
-    /// The lighting settings as last seen, so an edit can be told from the
-    /// panel merely being drawn. None until the panel has been looked at, so
-    /// opening it sends nothing.
+    /// Lighting settings as last seen, to tell an edit from the panel merely being drawn.
+    /// None until first looked at, so opening it sends nothing.
     light_key: Option<LightKey>,
-    /// What the panel was aimed at when `light_key` was taken. Changing the
-    /// zone is not an edit of the lighting, and the mode it forces on a zone
-    /// that lacks the old one must not be sent as if the user had picked it.
+    /// What the panel was aimed at when `light_key` was taken. Changing zone is not an edit, and the
+    /// mode forced on a zone lacking the old one must not be sent as if the user picked it.
     light_aim: (bool, usize),
     light_live: autosend::Settle,
     light_flash: autosend::Settle,
@@ -73,10 +71,8 @@ pub struct App {
     /// made for one profile must not stay armed over another: Apply writes
     /// flash.
     btn_profile: Option<u8>,
-    /// The choice last handed to the worker for each button. A choice is sent
-    /// once, on its own; if it did not take, it is not sent again until the
-    /// user picks again or presses Try again, so a refusal cannot become a loop
-    /// of flash writes.
+    /// The choice last handed to the worker per button. Sent once; if it did not take, not again until
+    /// the user picks again or presses Try again, so a refusal cannot loop into flash writes.
     btn_tried: std::collections::HashMap<u8, String>,
     /// The newest flash write (or profile switch) sent from here that the
     /// worker has not yet answered, and when it was sent.
@@ -146,12 +142,8 @@ impl App {
         }
     }
 
-    /// Take the safety backup once the mouse's profiles have been read, and
-    /// watch for its answer. Called every frame; does nothing once settled.
-    ///
-    /// Before any edit is possible, deliberately: automatic sends wait two
-    /// seconds after an edit and the backup takes about one, so by the time
-    /// the first flash write is due the backup has long since finished.
+    /// Take the safety backup once the profiles are read and watch for its answer; every frame, no-op once settled.
+    /// Runs before any edit is possible: automatic sends wait 2s and the backup takes about 1s.
     fn drive_backup(&mut self) {
         match self.backup.clone() {
             BackupState::NotStarted => {
@@ -236,7 +228,6 @@ impl App {
         target
     }
 
-    /// Set the chosen lighting on the zones selected, live.
     fn send_live_lighting(&mut self) {
         let c = self.rgb();
         let wf = led::WAVEFORMS[self.waveform].1;
@@ -281,13 +272,11 @@ impl App {
 /// Everything the lighting panel edits, minus which zone it is aimed at.
 type LightKey = (u8, [u8; 3], u16, usize, u8);
 
-/// Where the safety backup stands. See `autosend::Safety`.
 #[derive(Debug, Clone, PartialEq)]
 enum BackupState {
     /// Nothing sent yet: waiting for a mouse whose profiles have been read.
     NotStarted,
-    /// Sent. `after` is the newest outcome id read before sending, so the
-    /// backup's own answer is the first `AutoBackup` outcome newer than it.
+    /// Sent; its answer is the first `AutoBackup` outcome newer than `after`.
     Waiting { after: CmdId },
     Ready,
     Failed(String),
@@ -675,8 +664,7 @@ impl eframe::App for App {
                 self.flash_inflight = None;
             }
         }
-        // Edits that have stopped changing go to the mouse, whichever tab made
-        // them.
+        // Edits that have stopped changing go to the mouse, whichever tab made them.
         {
             let safety = self.safety();
             let busy = self.flash_inflight.is_some();
@@ -763,16 +751,12 @@ impl App {
         }
     }
 
-    /// Bring this window forward.
     fn show(&self, ctx: &egui::Context) {
-        // Un-minimise first. Focus does not restore a minimised window on most
-        // compositors, and a minimised window is the usual reason someone
-        // reaches for the icon at all.
+        // Un-minimise first: focus does not restore a minimised window on most compositors.
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        // A compositor may refuse to move focus to a window that was not asked
-        // for by the user; this at least makes the shell flag it.
+        // A compositor may refuse to move focus; this at least makes the shell flag the window.
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
             egui::UserAttentionType::Informational,
         ));
@@ -909,10 +893,7 @@ impl App {
                         });
                     }
                 });
-                // Changes that write flash wait for a backup, so when it could
-                // not be taken that has to be said where it cannot be missed,
-                // with the way past it. Otherwise edits would sit unsent with
-                // no explanation.
+                // Flash writes wait for a backup, so when it failed say so prominently, with the way past it.
                 if let autosend::Safety::Failed(why) = self.safety() {
                     ui.add_space(4.0);
                     ui.horizontal_wrapped(|ui| {
@@ -1102,9 +1083,7 @@ impl App {
         });
         }
 
-        // The stages are a range the mouse reported, edited in the active
-        // profile and sent on their own. A list sensor has fixed values to pick
-        // from instead, handled above.
+        // The stages are the sensor's reported range, edited in the active profile; list sensors pick from fixed values above.
         if self.snap.has_dpi
             && self.snap.has_profiles
             && self.snap.profile_format == 2
@@ -1136,9 +1115,7 @@ impl App {
                         .selectable_label(self.snap.rate == hz, format!("{hz} Hz"))
                         .clicked()
                     {
-                        // Live, so it takes effect now, and into the active
-                        // profile, so it is still the rate once the mouse is
-                        // back on its own. The second goes out by itself.
+                        // Live now, and into the active profile so it persists once the mouse is back on its own.
                         self.dev.send(Cmd::SetRate(hz));
                         let snap = self.snap.clone();
                         self.profile_editor.set_rate(&snap, snap.active_profile, hz);
@@ -1334,9 +1311,8 @@ impl App {
                 );
                 ui.add_space(8.0);
             }
-            // Sent by itself. A change to the settings (not to the zone) starts
-            // two waits: a short one for the live colour, which costs the mouse
-            // nothing, and a long one for the flash copy.
+            // Sent on its own: a settings change (not a zone change) starts a short wait for the live colour
+            // and a long one for the flash copy.
             let now = std::time::Instant::now();
             let key: LightKey =
                 (self.mode, self.rgb(), self.period_ms, self.waveform, self.intensity);
@@ -1359,8 +1335,7 @@ impl App {
             }
             if self.light_flash.pending() {
                 if blocked.is_some() {
-                    // Not for now, and not to be sent later behind the user's
-                    // back once something else unblocks it.
+                    // Not now, and not later behind the user's back once something else unblocks it.
                     self.light_flash.clear();
                 } else if self.light_flash.due(now, autosend::FLASH_QUIET)
                     && can_store
@@ -1802,9 +1777,8 @@ impl App {
                 }
             });
 
-            // The unit file lives in the user's own home, so writing it needs
-            // no sudo and no terminal. Only the udev rules do, and those are
-            // about the mouse being openable at all, not about this service.
+            // The unit file lives in the user's home, so no sudo. Only the udev rules need it,
+            // and those are about the mouse being openable, not this service.
             let has_unit = self.host.service.unit_file_exists();
             let idle = known && self.host.service.busy().is_none();
             if idle && !has_unit {
@@ -1821,8 +1795,7 @@ impl App {
                      packaging/install.sh adds them.",
                 );
             }
-            // Offered only when installing was refused because a different unit
-            // file is already there: replacing one is the user's call.
+            // Offered only when a different unit file is already there: replacing it is the user's call.
             if idle
                 && has_unit
                 && self.host.service.last_error().is_some_and(|e| e.contains("Reinstall"))
@@ -1947,9 +1920,7 @@ impl App {
     }
 }
 
-/// The window's icon, drawn from the same glyph as the panel icon so the two
-/// are recognisably one program. Wayland compositors take the icon from the
-/// desktop entry instead; this is for X11 and for any shell that reads it.
+/// The window's icon, from the panel icon's glyph. Wayland takes it from the desktop entry instead; this is for X11.
 fn window_icon() -> egui::IconData {
     let [r, g, b, _] = theme::ACCENT.to_array();
     let size = 256;
@@ -1962,15 +1933,13 @@ fn window_icon() -> egui::IconData {
     egui::IconData { rgba, width: size as u32, height: size as u32 }
 }
 
-/// Open the window and block until it is closed.
 fn window(host: std::sync::Arc<host::Host>) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([940.0, 700.0])
             .with_min_inner_size([720.0, 480.0])
             .with_title("Logi")
-            // The name the desktop entry is matched by (`logi.desktop`), which
-            // is what gives the window its icon and name in the shell on Wayland.
+            // Matches `logi.desktop`, which gives the window its icon and name on Wayland.
             .with_app_id("logi")
             .with_icon(std::sync::Arc::new(window_icon())),
         ..Default::default()
@@ -1979,10 +1948,7 @@ fn window(host: std::sync::Arc<host::Host>) -> eframe::Result {
 }
 
 /// Keep the panel icon alive with no window, until it asks for one.
-///
-/// Has a device worker of its own, so the icon's DPI and profile menus work and
-/// its tooltip stays true. That worker is handed back before the next window
-/// opens its own: two workers on one mouse would race each other's writes.
+/// Has its own device worker, handed back before the next window opens its own: two would race writes.
 fn background(host: &host::Host) -> host::Signal {
     use host::Signal;
     let dev = device::spawn();
@@ -2007,18 +1973,15 @@ pub fn run() -> eframe::Result {
     run_with(true)
 }
 
-/// The panel icon with no window, until it asks for one. Ends at once when the
-/// desktop has no panel icon area, since there would be nothing to show or to
-/// reopen it from.
+/// The panel icon with no window, until it asks for one. Ends at once with no panel icon area.
 pub fn run_tray_only() -> eframe::Result {
     run_with(false)
 }
 
 fn run_with(open_window_first: bool) -> eframe::Result {
     use host::Signal;
-    // Before the lock, not after: the first instance must already be able to
-    // receive SIGUSR1 by the time a second one finds it, because the default
-    // action for that signal is to end the process.
+    // Before the lock: the first instance must already handle SIGUSR1 when a second finds it,
+    // since the default action for that signal ends the process.
     instance::listen_for_raise();
     let _instance = match instance::acquire() {
         Ok(instance::Acquired::First(i)) => Some(i),
@@ -2048,11 +2011,8 @@ fn run_with(open_window_first: bool) -> eframe::Result {
                 return Ok(());
             }
         } else {
-            // Started without a window: start the registration and see whether
-            // there is anywhere to put the icon before settling in to wait.
-            //
-            // For minutes, not seconds: this is the login start, and the panel
-            // may not have its icon area up yet.
+            // Started without a window: start the registration and see if there is anywhere to put the icon.
+            // For minutes, not seconds: this is the login start and the panel may not be up yet.
             if !host.await_tray(std::time::Duration::from_secs(300)) {
                 eprintln!("logi: no panel icon area on this desktop; nothing to show.");
                 return Ok(());

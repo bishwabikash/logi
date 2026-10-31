@@ -1,11 +1,5 @@
 //! What outlives the window: the panel icon and the service watcher.
-//!
-//! Closing the window used to end the process, and the icon with it. Hiding a
-//! window is not an option where it matters most: Wayland has no way for an
-//! application to hide its own window, so a "hidden" one just stays on screen
-//! or sits minimised with its icon and title in the dock. So the window really
-//! closes, and this is what stays behind it. `run` in `gui` keeps the icon up
-//! between windows and opens a new one when the icon asks.
+//! The window really closes (Wayland cannot hide it); this stays behind and `run` in `gui` reopens it.
 
 use std::cell::RefCell;
 use std::sync::mpsc;
@@ -15,22 +9,13 @@ use crate::dpi::Capability;
 use crate::service;
 use crate::tray::{Event, Status, Tray};
 
-/// What the panel icon asked the window to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
-    /// Show the window.
     Open,
-    /// Leave altogether, icon included.
     Quit,
 }
 
-/// How soon, and how many times, a failed registration is tried again.
-///
-/// At login the panel's icon host often comes up after the programs that want
-/// it: GNOME Shell loads its tray extension a little into the session, and the
-/// service starts the moment the session does. A single attempt found nothing
-/// and gave up for good, so after a restart the icon was missing until someone
-/// opened the window.
+/// Retry timing for a failed registration: at login the panel's icon host often comes up after the service.
 const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_ATTEMPTS: u32 = 100;
 
@@ -38,15 +23,10 @@ const MAX_ATTEMPTS: u32 = 100;
 struct TrayCell {
     tried: bool,
     attempts: u32,
-    /// When the last attempt failed.
     failed_at: Option<std::time::Instant>,
-    /// Registration in flight. `Tray::spawn` blocks on a session-bus round trip,
-    /// and where the watcher name is activatable but never comes up it blocks
-    /// for the 25s D-Bus reply timeout, so it runs on its own thread and the
-    /// handle arrives through here.
+    /// Registration in flight: `Tray::spawn` blocks on D-Bus (up to 25s), so it runs on its own thread.
     rx: Option<mpsc::Receiver<Result<Tray, String>>>,
-    /// None when there is no StatusNotifierWatcher, which is normal on a
-    /// desktop without a tray host. The app works either way.
+    /// None when there is no StatusNotifierWatcher (a desktop without a tray host); the app works either way.
     tray: Option<Tray>,
 }
 
@@ -65,13 +45,11 @@ impl Host {
         }
     }
 
-    /// Whether there is an icon to come back to. Without one, closing the
-    /// window has to end the program: nothing would be left to reopen it from.
+    /// Whether there is an icon to come back to; without one, closing the window must end the program.
     pub fn has_tray(&self) -> bool {
         self.tray.borrow().tray.is_some()
     }
 
-    /// Take the registration's answer if it has arrived.
     fn collect(cell: &mut TrayCell) {
         match cell.rx.as_ref().map(|rx| rx.try_recv()) {
             Some(Ok(Ok(t))) => {
@@ -94,8 +72,7 @@ impl Host {
         }
     }
 
-    /// Keep trying to get an icon up for as long as `limit`, for a start with no
-    /// window: nothing else drives the retries then. True once there is one.
+    /// Keep trying for up to `limit`, for a start with no window to drive retries. True once there is an icon.
     pub fn await_tray(&self, limit: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + limit;
         loop {
@@ -110,17 +87,12 @@ impl Host {
         }
     }
 
-    /// Out of attempts, so waiting longer is pointless.
     fn gave_up(&self) -> bool {
         let cell = self.tray.borrow();
         cell.tray.is_none() && cell.rx.is_none() && cell.attempts >= MAX_ATTEMPTS
     }
 
-    /// Wait, for a short while, for a registration that is still in flight.
-    ///
-    /// A window closed within a second or two of opening would otherwise find
-    /// no icon yet, conclude there is none, and end the program, when the icon
-    /// was about to appear.
+    /// Briefly wait for a registration in flight, so a window closed right after opening does not conclude there is no icon.
     pub fn wait_for_tray(&self, limit: std::time::Duration) {
         let deadline = std::time::Instant::now() + limit;
         loop {
@@ -143,12 +115,10 @@ impl Host {
         self.quit.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Register the icon once, keep it in step with `snap`, and act on its
-    /// menu. `send` is how a command reaches the mouse, which differs between
-    /// the window (it tracks flash writes) and the background loop.
+    /// Register the icon once, keep it in step with `snap`, and act on its menu. `send` differs between
+    /// the window (tracks flash writes) and the background loop.
     pub fn sync(&self, snap: &Snapshot, send: &mut dyn FnMut(Cmd)) -> Option<Signal> {
-        // Build the real status first: registering with Status::default()
-        // made the first icon claim a service state nothing had looked at yet.
+        // Build the real status first: Status::default() would claim a service state nothing has looked at.
         let status = status_for(snap, self.service.state());
         let mut cell = self.tray.borrow_mut();
 
@@ -164,8 +134,7 @@ impl Host {
         if !cell.tried {
             cell.tried = true;
             cell.attempts += 1;
-            // Registering blocks, so it goes on a thread of its own, exactly
-            // as `Tray::spawn` says it must.
+            // Registering blocks, so it gets its own thread.
             let (tx, rx) = mpsc::channel();
             let initial = status.clone();
             match std::thread::Builder::new().name("logi-tray-register".into()).spawn(move || {
@@ -188,11 +157,8 @@ impl Host {
                 Event::Open => signal = signal.or(Some(Signal::Open)),
                 Event::Quit => signal = Some(Signal::Quit),
                 Event::ToggleService | Event::RestartService => {
-                    // The same gate the Service tab puts on its buttons. The
-                    // menu has no greyed state of its own, so without it a
-                    // click before the first poll acted on a default, one
-                    // during an action queued a second systemctl, and one
-                    // with no unit or no systemd could only produce an error.
+                    // Same gate as the Service tab's buttons: the menu has no greyed state, so clicks before the first poll,
+                    // mid-action, or with no systemd must be refused.
                     if let Some(a) = super::tray_service_action(
                         matches!(ev, Event::ToggleService),
                         self.service.known(),
@@ -210,7 +176,6 @@ impl Host {
     }
 }
 
-/// What the icon renders for this mouse and service.
 pub fn status_for(snap: &Snapshot, service: service::State) -> Status {
     Status {
         device: snap.connected.then(|| snap.model.clone()),
@@ -218,9 +183,7 @@ pub fn status_for(snap: &Snapshot, service: service::State) -> Status {
         active_profile: snap.active_profile,
         profile_count: snap.profile_count,
         dpi: snap.dpi,
-        // The device's own range, not a fixed list: with no mouse attached
-        // there is nothing to offer, and offering it anyway produced a DPI
-        // menu that could not work.
+        // The device's own range, not a fixed list: with no mouse there is nothing to offer.
         dpi_presets: match (snap.connected, &snap.dpi_cap) {
             (true, Some(Capability::Range { min, max, .. })) => [400u16, 800, 1600, 3200, 6400]
                 .into_iter()

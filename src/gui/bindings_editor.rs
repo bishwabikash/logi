@@ -109,9 +109,7 @@ struct Row {
     text: String,
     command: String,
     mouse: u16,
-    /// Presses in a row that run the action. One is every press.
     presses: u8,
-    /// The longest pause between those presses, in milliseconds.
     within_ms: u16,
 }
 
@@ -131,8 +129,7 @@ impl Row {
         }
     }
 
-    /// A macro: an action that waits for a streak of presses, shown in its own
-    /// section and not among the plain buttons.
+    /// A macro: waits for a streak of presses; shown in its own section.
     fn is_macro(&self) -> bool {
         self.presses > 1
     }
@@ -217,11 +214,9 @@ impl Row {
     }
 }
 
-/// Presses a new macro waits for. Three is hard to do by accident and quick to
-/// do on purpose.
+/// Presses a new macro waits for: hard to hit by accident, quick on purpose.
 const DEFAULT_MACRO_PRESSES: u8 = 3;
 
-/// A profile button's job as a person would name it.
 fn friendly_job(job: &str) -> String {
     match job {
         // The G502's thumb button, whose job is to hold a lower DPI.
@@ -230,9 +225,8 @@ fn friendly_job(job: &str) -> String {
     }
 }
 
-/// What each of the mouse's buttons does on the mouse, button 1 first, read
-/// from the active profile. The spy numbers its buttons in the order of the
-/// profile's table; an empty string where the profile does not say.
+/// What each button does on the mouse (button 1 first), from the active profile. The spy numbers
+/// buttons in the profile table's order; empty where the profile does not say.
 fn button_labels(snap: &Snapshot) -> Vec<String> {
     let Some(p) = snap.profiles.get(snap.active_profile as usize) else { return Vec::new() };
     p.buttons
@@ -385,8 +379,7 @@ pub struct BindingsEditor {
     /// so a Save can tell that something else changed the file since. `None`
     /// when it has not been read (or could not be).
     on_disk: Option<Vec<u8>>,
-    /// What each button does on the mouse itself, from the active profile, to
-    /// tell the user which number is which. Index 0 is button 1.
+    /// What each button does on the mouse itself, to tell the user which number is which.
     labels: Vec<String>,
     loaded: bool,
 }
@@ -837,7 +830,6 @@ impl BindingsEditor {
         cmds
     }
 
-    /// What the mouse itself does on `button`, for the label, when known.
     fn label_for(&self, button: u8) -> Option<String> {
         self.labels
             .get(button as usize - 1)
@@ -852,8 +844,7 @@ impl BindingsEditor {
         }
     }
 
-    /// Add a macro on the best free button: the sniper button if it is free,
-    /// since that is the one people want a spare job on, else the first free.
+    /// Add a macro on a free button, preferring the sniper button (where people want a spare job).
     fn add_macro(&mut self, count: u8) {
         let free: Vec<u8> = (1..=count)
             .filter(|b| self.rows.iter().any(|r| r.button == *b && !r.is_set()))
@@ -870,7 +861,6 @@ impl BindingsEditor {
         }
     }
 
-    /// Move the macro on `from` to `to`, which must be free.
     fn move_macro(&mut self, from: u8, to: u8) {
         if from == to {
             return;
@@ -946,8 +936,7 @@ impl BindingsEditor {
                             }
                         });
                     ui.label(egui::RichText::new("within").color(theme::DIM).size(12.5));
-                    // A local copy, assigned only on a change: the widget would
-                    // otherwise clamp what the file holds just by being drawn.
+                    // A local copy, assigned only on change: the widget would clamp what the file holds just by being drawn.
                     let mut ms = row.within_ms;
                     let r = ui.add(
                         egui::DragValue::new(&mut ms)
@@ -1091,9 +1080,7 @@ impl BindingsEditor {
         });
     }
 
-    /// The editor for what a row does: the key to capture, the text to type,
-    /// the command to run. Shared by the plain rows and the macro rows, so the
-    /// two cannot drift apart in what they accept.
+    /// The editor for what a row does; shared by plain and macro rows so they accept the same things.
     fn draw_value(
         &mut self,
         ui: &mut egui::Ui,

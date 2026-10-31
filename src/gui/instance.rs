@@ -1,9 +1,4 @@
-//! One logi window-and-icon per user.
-//!
-//! The process stays up as the panel icon after its window closes, so starting
-//! `logi` again (the launcher, a second terminal) must not make a second icon
-//! and a second device worker. It asks the first one to show its window instead,
-//! with SIGUSR1, and exits.
+//! One logi window-and-icon per user: a second start asks the first to show its window (SIGUSR1) and exits.
 
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -11,16 +6,14 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Holds the lock for as long as it lives. Dropping it, or the process dying,
-/// releases the lock: nothing is left behind to go stale.
+/// Holds the lock while alive; dropping it or dying releases it, so nothing goes stale.
 pub struct Instance {
     _file: std::fs::File,
 }
 
 pub enum Acquired {
-    /// This process is the one.
     First(Instance),
-    /// Another is running, and this was its pid (0 if it had not written it yet).
+    /// Another is running, with this pid (0 if not yet written).
     Running(i32),
 }
 
@@ -70,7 +63,6 @@ extern "C" fn on_usr1(_: libc::c_int) {
     RAISE.store(true, Ordering::SeqCst);
 }
 
-/// Start listening for "show your window".
 pub fn listen_for_raise() {
     // SAFETY: installs a handler that only stores to an atomic.
     unsafe {
@@ -78,7 +70,6 @@ pub fn listen_for_raise() {
     }
 }
 
-/// True once per request.
 pub fn take_raise() -> bool {
     RAISE.swap(false, Ordering::SeqCst)
 }
