@@ -21,7 +21,7 @@
 //!     would be applied.
 
 use super::theme;
-use crate::actions::{self, Action, BindMode, Binding, Bindings, FnKeymap, Keymap, MAX_BUTTON};
+use crate::actions::{self, Action, BindMode, Binding, Bindings, Combo, FnKeymap, Keymap, MAX_BUTTON};
 use crate::device::{Cmd, CmdId, CmdKind, Snapshot};
 use crate::uinput;
 use eframe::egui;
@@ -236,6 +236,42 @@ fn button_labels(snap: &Snapshot) -> Vec<String> {
         .collect()
 }
 
+/// A button combo being edited. Typed commands only in the window; a combo
+/// with another action loaded from the file keeps it in `other`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ComboRow {
+    steps: Vec<(u8, u8)>,
+    within_ms: u16,
+    command: String,
+    other: Option<String>,
+}
+
+impl ComboRow {
+    fn action(&self, keys: &dyn Keymap) -> Result<Action, String> {
+        if let Some(o) = &self.other {
+            return Action::parse(o, keys);
+        }
+        let t = self.command.trim();
+        if t.is_empty() {
+            return Err("no command yet".into());
+        }
+        if t.contains('\n') {
+            return Err("one line only: the config file is a line per combo".into());
+        }
+        Ok(Action::Command(t.to_string()))
+    }
+
+    fn check_steps(&self) -> Result<(), String> {
+        if self.steps.len() < 2 {
+            return Err("a combo needs at least two steps".into());
+        }
+        if self.steps.windows(2).any(|w| w[0].0 == w[1].0) {
+            return Err("two steps in a row are the same button; make it one step with the total".into());
+        }
+        Ok(())
+    }
+}
+
 /// The key-name tables live in uinput; `FnKeymap` is the seam.
 fn keymap() -> impl Keymap {
     FnKeymap::new(uinput::key_code, |c| uinput::key_name(c).map(Into::into))
@@ -334,6 +370,8 @@ pub struct BindingsEditor {
     rows: Vec<Row>,
     /// The rows as last loaded or saved, so `dirty` has something to compare.
     saved: Vec<Row>,
+    combos: Vec<ComboRow>,
+    saved_combos: Vec<ComboRow>,
     /// Lines the config file could not parse. Kept visible: a binding that
     /// silently vanished is worse than one that complains.
     problems: Vec<String>,
@@ -395,6 +433,8 @@ impl BindingsEditor {
         BindingsEditor {
             rows: (1..=MAX_BUTTON).map(Row::blank).collect(),
             saved: (1..=MAX_BUTTON).map(Row::blank).collect(),
+            combos: Vec::new(),
+            saved_combos: Vec::new(),
             problems: Vec::new(),
             status: None,
             capturing: None,
@@ -450,7 +490,7 @@ impl BindingsEditor {
 
     /// Whether there are unsaved edits.
     pub fn dirty(&self) -> bool {
-        self.rows != self.saved
+        self.rows != self.saved || self.combos != self.saved_combos
     }
 
     /// Requests the integrator still has to turn into commands. Drains.
@@ -469,7 +509,19 @@ impl BindingsEditor {
                 *slot = Row::from_binding(b, &keys);
             }
         }
+        self.combos = bindings
+            .combos
+            .iter()
+            .map(|c| {
+                let (command, other) = match &c.action {
+                    Action::Command(t) => (t.clone(), None),
+                    a => (String::new(), Some(a.describe(&keys))),
+                };
+                ComboRow { steps: c.steps.clone(), within_ms: c.within_ms, command, other }
+            })
+            .collect();
         self.saved = self.rows.clone();
+        self.saved_combos = self.combos.clone();
         self.problems = problems;
         self.capturing = None;
         self.confirm = None;
@@ -493,6 +545,16 @@ impl BindingsEditor {
                     within_ms: r.within_ms,
                 }),
                 Err(e) => errs.push(format!("button {}: {e}", r.button)),
+            }
+        }
+        for (i, c) in self.combos.iter().enumerate() {
+            match c.check_steps().and_then(|_| c.action(keys)) {
+                Ok(action) => out.combos.push(Combo {
+                    steps: c.steps.clone(),
+                    within_ms: c.within_ms,
+                    action,
+                }),
+                Err(e) => errs.push(format!("combo {}: {e}", i + 1)),
             }
         }
         (out, errs)
@@ -585,6 +647,7 @@ impl BindingsEditor {
             format!("cannot replace {}: {e}", path.display())
         })?;
         self.saved = self.rows.clone();
+        self.saved_combos = self.combos.clone();
         self.problems.clear();
         self.kept_copy = kept;
         self.on_disk = Some(text.into_bytes());
@@ -783,7 +846,7 @@ impl BindingsEditor {
         errs.extend(hidden_replace_error(&self.hidden_replaces(count), count));
 
         theme::section(ui, "Host bindings", |ui| {
-            theme::readout(ui, &bindings.list.len().to_string(), "bound");
+            theme::readout(ui, &bindings.len().to_string(), "bound");
             ui.add_space(6.0);
             theme::value(ui, &silence.len().to_string(), "replaced");
             ui.add_space(10.0);
@@ -1014,6 +1077,138 @@ impl BindingsEditor {
                  profile's button table and are usually right. To check, run `logi bind watch` \
                  in a terminal and press the button.",
             );
+        });
+        ui.add_space(14.0);
+        self.draw_combos(ui, count, keys);
+    }
+
+    fn new_combo(&self, count: u8) -> ComboRow {
+        let first = (1..=count)
+            .find(|b| self.label_for(*b).is_some_and(|l| l.contains("sniper")))
+            .unwrap_or(count.min(6));
+        let second = if first == 4 { 5.min(count) } else { 4.min(count) };
+        ComboRow {
+            steps: vec![(first, 2), (if second == first { 1 } else { second }, 1)],
+            within_ms: actions::DEFAULT_WITHIN_MS,
+            command: String::new(),
+            other: None,
+        }
+    }
+
+    fn draw_combos(&mut self, ui: &mut egui::Ui, count: u8, _keys: &dyn Keymap) {
+        theme::section(ui, "Button combos", |ui| {
+            theme::hint(
+                ui,
+                "A sequence of buttons, each pressed a set number of times, that runs a \
+                 command: sniper twice then the front button once, or sniper three times \
+                 then right click twice. It runs on the last press, counts must be exact, \
+                 and each press must come within the time limit of the one before. The \
+                 buttons keep doing their own jobs while you press them.",
+            );
+            ui.add_space(10.0);
+            let mut remove: Option<usize> = None;
+            for i in 0..self.combos.len() {
+                if i > 0 {
+                    ui.add_space(6.0);
+                    let r = ui.available_rect_before_wrap();
+                    ui.painter().hline(
+                        r.x_range(),
+                        ui.cursor().top() - 2.0,
+                        egui::Stroke::new(1.0_f32, theme::LINE),
+                    );
+                    ui.add_space(6.0);
+                }
+                let mut c = self.combos[i].clone();
+                let titles: Vec<String> = (1..=count).map(|b| self.button_title(b)).collect();
+                let n_steps = c.steps.len();
+                let mut drop_step: Option<usize> = None;
+                for k in 0..n_steps {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(format!("{}.", k + 1)).color(theme::DIM).size(12.5));
+                        let before = c.steps.get(k.wrapping_sub(1)).map(|s| s.0);
+                        let after = c.steps.get(k + 1).map(|s| s.0);
+                        let mut b = c.steps[k].0;
+                        egui::ComboBox::from_id_salt(("combo-button", i, k))
+                            .selected_text(titles.get(b as usize - 1).cloned().unwrap_or_else(|| format!("Button {b}")))
+                            .show_ui(ui, |ui| {
+                                for (n, t) in titles.iter().enumerate() {
+                                    let cand = n as u8 + 1;
+                                    // Next to the same button it would merge into one step.
+                                    if Some(cand) != before && Some(cand) != after {
+                                        ui.selectable_value(&mut b, cand, t);
+                                    }
+                                }
+                            });
+                        c.steps[k].0 = b;
+                        let mut n = c.steps[k].1;
+                        egui::ComboBox::from_id_salt(("combo-count", i, k))
+                            .selected_text(if n == 1 { "once".to_string() } else { format!("{n} times") })
+                            .width(84.0)
+                            .show_ui(ui, |ui| {
+                                for v in 1..=actions::MAX_PRESSES {
+                                    let label = if v == 1 { "once".to_string() } else { format!("{v} times") };
+                                    ui.selectable_value(&mut n, v, label);
+                                }
+                            });
+                        c.steps[k].1 = n;
+                        if n_steps > 2 && ui.small_button("remove step").clicked() {
+                            drop_step = Some(k);
+                        }
+                    });
+                }
+                if let Some(k) = drop_step {
+                    c.steps.remove(k);
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if c.steps.len() < actions::MAX_STEPS
+                        && ui.small_button("add a step").clicked()
+                    {
+                        let last = c.steps.last().map(|s| s.0).unwrap_or(1);
+                        let next = (1..=count).find(|b| *b != last).unwrap_or(1);
+                        c.steps.push((next, 1));
+                    }
+                    ui.label(egui::RichText::new("within").color(theme::DIM).size(12.5));
+                    let mut ms = c.within_ms;
+                    if ui.add(egui::DragValue::new(&mut ms).speed(10.0).suffix(" ms")).changed() {
+                        c.within_ms = ms.clamp(
+                            *actions::WITHIN_MS_RANGE.start(),
+                            *actions::WITHIN_MS_RANGE.end(),
+                        );
+                    }
+                    if ui.button("Remove combo").clicked() {
+                        remove = Some(i);
+                    }
+                });
+                ui.add_space(6.0);
+                match &c.other {
+                    Some(o) => theme::hint(ui, &format!("Runs `{o}` (set in the file; edit it there).")),
+                    None => {
+                        let w = (ui.available_width() - 40.0).max(160.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut c.command)
+                                .hint_text("command to run, e.g. notify-send hi")
+                                .desired_width(w),
+                        );
+                    }
+                }
+                if let Err(e) = c.check_steps().and_then(|_| c.action(&keymap())) {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(e).color(theme::WARN).size(11.5));
+                }
+                if c != self.combos[i] {
+                    self.combos[i] = c;
+                }
+            }
+            if let Some(i) = remove {
+                self.combos.remove(i);
+            }
+            if !self.combos.is_empty() {
+                ui.add_space(10.0);
+            }
+            if ui.button("Add a combo").clicked() {
+                let c = self.new_combo(count);
+                self.combos.push(c);
+            }
         });
         ui.add_space(14.0);
     }
@@ -1526,6 +1721,7 @@ impl BindingsEditor {
                     .clicked()
                 {
                     self.rows = self.saved.clone();
+                    self.combos = self.saved_combos.clone();
                     self.capturing = None;
                     self.confirm = None;
                     self.refused = None;
@@ -2740,5 +2936,77 @@ mod tests {
         let e = ed.borrow();
         assert!(!e.dirty(), "painting made the editor think it had edits");
         assert_eq!(e.rows, editor(MACRO_SRC).rows);
+    }
+
+    const COMBO_SRC: &str = "combo 6x2 4 = command notify-send a\n\
+                             combo 6x3 2x2 within 700 = command notify-send b\n";
+
+    #[test]
+    fn combos_load_save_and_never_silence() {
+        let e = editor(COMBO_SRC);
+        assert_eq!(e.combos.len(), 2);
+        assert_eq!(e.combos[0].steps, vec![(6, 2), (4, 1)]);
+        assert_eq!((e.combos[1].within_ms, e.combos[1].command.as_str()), (700, "notify-send b"));
+        assert!(!e.dirty());
+        let (text, silence) = e.render(&keymap()).unwrap();
+        assert!(text.contains("combo 6x2 4 = command notify-send a"), "{text}");
+        assert!(text.contains("combo 6x3 2x2 within 700 = command notify-send b"), "{text}");
+        assert!(silence.is_empty());
+    }
+
+    #[test]
+    fn editing_a_combo_makes_the_editor_dirty_and_reverting_clears_it() {
+        let mut e = editor(COMBO_SRC);
+        e.combos[0].steps[0].1 = 3;
+        assert!(e.dirty());
+        e.combos[0].steps[0].1 = 2;
+        assert!(!e.dirty());
+    }
+
+    #[test]
+    fn a_combo_with_no_command_or_one_step_blocks_save_with_a_reason() {
+        let mut e = editor("");
+        e.combos.push(e.new_combo(11));
+        let errs = e.render(&keymap()).unwrap_err();
+        assert!(errs.iter().any(|m| m.contains("combo 1") && m.contains("no command")), "{errs:?}");
+        e.combos[0].command = "true".into();
+        assert!(e.render(&keymap()).is_ok());
+        e.combos[0].steps.truncate(1);
+        assert!(e.render(&keymap()).unwrap_err().iter().any(|m| m.contains("two steps")));
+        e.combos[0].steps = vec![(6, 1), (6, 2)];
+        assert!(e.render(&keymap()).unwrap_err().iter().any(|m| m.contains("same button")));
+    }
+
+    #[test]
+    fn a_new_combo_starts_on_the_sniper_button_and_two_different_buttons() {
+        let mut e = editor("");
+        e.labels = (1..=11)
+            .map(|b| if b == 6 { "sniper (dpi-shift)".to_string() } else { String::new() })
+            .collect();
+        let c = e.new_combo(11);
+        assert_eq!(c.steps[0], (6, 2));
+        assert_ne!(c.steps[0].0, c.steps[1].0);
+        let on_one = editor("").new_combo(1);
+        assert_eq!(on_one.steps.len(), 2);
+    }
+
+    #[test]
+    fn a_combo_with_another_action_keeps_it_through_the_editor() {
+        let e = editor("combo 6x2 4 = key ctrl+c\n");
+        assert_eq!(e.combos[0].other.as_deref(), Some("key ctrl+c"));
+        let (text, _) = e.render(&keymap()).unwrap();
+        assert!(text.contains("combo 6x2 4 = key ctrl+c"), "{text}");
+    }
+
+    #[test]
+    fn painting_the_combo_section_changes_nothing() {
+        use std::cell::RefCell;
+        let ed = RefCell::new(editor(COMBO_SRC));
+        egui::__run_test_ui(|ui| {
+            ed.borrow_mut().draw_combos(ui, 11, &keymap());
+        });
+        let e = ed.borrow();
+        assert!(!e.dirty());
+        assert_eq!(e.combos, editor(COMBO_SRC).combos);
     }
 }

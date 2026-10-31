@@ -1151,9 +1151,14 @@ fn cmd_bind(args: &[String]) -> Result<(), CliError> {
                     actions::BindMode::Augment => "augment",
                     actions::BindMode::Replace => "replace",
                 };
-                println!("  button {:<3} {:<9} {}", bind.button, mode, bind.action.describe(&km));
+                let streak = if bind.is_streak() { format!(" x{}", bind.presses) } else { String::new() };
+                println!("  button {:<3} {:<9} {}{}", bind.button, mode, bind.action.describe(&km), streak);
             }
-            if b.list.is_empty() {
+            for c in &b.combos {
+                let steps: Vec<String> = c.steps.iter().map(|(b, n)| format!("{b}x{n}")).collect();
+                println!("  combo {:<12} {}", steps.join(" "), c.action.describe(&km));
+            }
+            if b.is_empty() {
                 println!("  (no bindings)");
             }
             Ok(())
@@ -1181,7 +1186,7 @@ fn cmd_bind_run() -> Result<(), CliError> {
     for p in &problems {
         eprintln!("logi: {}: {p}", path.display());
     }
-    if bindings.list.is_empty() {
+    if bindings.is_empty() {
         return Err(CliError::Failed(format!("{} has no bindings", path.display())));
     }
 
@@ -1240,9 +1245,10 @@ fn cmd_bind_run() -> Result<(), CliError> {
             spy.silence(&mut f.device, &silence)?;
         }
         let idx = spy.feature_index();
-        println!("logi: acting on {} binding(s); Ctrl-C to stop", bindings.list.len());
+        println!("logi: acting on {} binding(s); Ctrl-C to stop", bindings.len());
         let mut prev: u16 = 0;
         let mut streaks = streak::Streaks::new();
+        let mut sequences = streak::Sequences::new();
         while !leaving() {
             let Some(report) =
                 listener.read_event(std::time::Duration::from_millis(250))?
@@ -1254,6 +1260,11 @@ fn cmd_bind_run() -> Result<(), CliError> {
             prev = now;
             let at = std::time::Instant::now();
             for b in pressed {
+                for i in sequences.press(&bindings.combos, b, at) {
+                    if let Err(e) = perform(&bindings.combos[i].action, &mut vd) {
+                        eprintln!("logi: combo {}: {e}", i + 1);
+                    }
+                }
                 if let Some(bind) = bindings.get(b) {
                     if !streaks.press(bind, at) {
                         continue;
@@ -1319,7 +1330,7 @@ fn service_bindings() -> Option<actions::Bindings> {
     for p in &problems {
         eprintln!("logi: bindings: {p}");
     }
-    Some(b).filter(|b| !b.list.is_empty())
+    Some(b).filter(|b| !b.is_empty())
 }
 
 /// Whether the file at `path` holds bindings for the service to run, without
@@ -1336,7 +1347,7 @@ fn bindings_in(path: &std::path::Path) -> Result<bool, String> {
         Err(e) => return Err(format!("reading {}: {e}", path.display())),
     };
     let km = keymap();
-    Ok(!actions::Bindings::parse(&text, &km).0.list.is_empty())
+    Ok(!actions::Bindings::parse(&text, &km).0.is_empty())
 }
 
 /// True when `now` differs from what was last announced, and remembers it.
@@ -1592,7 +1603,7 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
     eprintln!(
         "logi: watching {name}: {} rule(s), {} binding(s)",
         cfg.rules.len(),
-        bindings.as_ref().map(|b| b.list.len()).unwrap_or(0)
+        bindings.as_ref().map(|b| b.len()).unwrap_or(0)
     );
 
     let poll = cfg.poll;
@@ -1620,6 +1631,11 @@ fn serve_once(cfg: appwatch::Config) -> Result<(), hidpp::Error> {
                         prev_mask = now;
                         let at = std::time::Instant::now();
                         for b in pressed {
+                            for i in s.sequences.press(&s.bindings.combos, b, at) {
+                                if let Err(e) = perform(&s.bindings.combos[i].action, &mut s.vd) {
+                                    eprintln!("logi: combo {}: {e}", i + 1);
+                                }
+                            }
                             if let Some(bind) = s.bindings.get(b) {
                                 if !s.streaks.press(bind, at) {
                                     continue;
@@ -1714,6 +1730,7 @@ struct SpyState {
     vd: uinput::VirtualDevice,
     bindings: actions::Bindings,
     streaks: streak::Streaks,
+    sequences: streak::Sequences,
     silenced: bool,
 }
 
@@ -1755,7 +1772,7 @@ fn start_spy(
     })();
 
     match brought_up {
-        Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), streaks: streak::Streaks::new(), silenced }),
+        Ok(listener) => Ok(SpyState { spy, listener, vd, bindings: bindings.clone(), streaks: streak::Streaks::new(), sequences: streak::Sequences::new(), silenced }),
         Err(e) => {
             if silenced {
                 match try_twice(|| spy.restore(dev)) {

@@ -42,6 +42,10 @@ Run `logi` for the window, or `logi --help` for the command line.
   presses, each within a time limit of the last, runs the command. Set up under
   Buttons, or `button 6 x3 = command ...` in `bindings.conf`. `logi bind watch`
   shows which number is which button.
+* **Button combos.** A sequence of buttons, each pressed a set number of times,
+  runs a command: sniper twice then the front button once, or sniper three
+  times then right click twice (`combo 6x2 4 = command ...`). Counts are exact,
+  and each press must follow the last within a time limit. Set up under Buttons.
 * **Per-application profiles.** Switch profile while a given program is running.
 * **A tray icon** showing the service state, with a menu. It is there whenever
   the service is running, window or not.

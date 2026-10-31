@@ -291,12 +291,35 @@ impl Binding {
     }
 }
 
+/// The most steps in a combo.
+pub const MAX_STEPS: usize = 6;
+
+/// A sequence of button presses that runs an action: each step is a button
+/// pressed some number of times in a row, e.g. sniper twice then front once.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Combo {
+    /// (button, presses), in order. Adjacent steps are different buttons.
+    pub steps: Vec<(u8, u8)>,
+    /// The longest pause allowed between any two presses.
+    pub within_ms: u16,
+    pub action: Action,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Bindings {
     pub list: Vec<Binding>,
+    pub combos: Vec<Combo>,
 }
 
 impl Bindings {
+    pub fn is_empty(&self) -> bool {
+        self.list.is_empty() && self.combos.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.list.len() + self.combos.len()
+    }
+
     pub fn get(&self, button: u8) -> Option<&Binding> {
         self.list.iter().find(|b| b.button == button)
     }
@@ -340,6 +363,20 @@ impl Bindings {
                 problems.push(format!("line {}: expected `button N = action`", n + 1));
                 continue;
             };
+            if lhs.split_whitespace().next().is_some_and(|w| w.eq_ignore_ascii_case("combo")) {
+                match parse_combo(lhs, rhs, keys) {
+                    Ok(c) => {
+                        if let Some(pos) = out.combos.iter().position(|x| x.steps == c.steps) {
+                            problems.push(format!("line {}: that combo was already bound; this line wins", n + 1));
+                            out.combos[pos] = c;
+                        } else {
+                            out.combos.push(c);
+                        }
+                    }
+                    Err(e) => problems.push(format!("line {}: {e}", n + 1)),
+                }
+                continue;
+            }
             let (button, mode, presses, within_ms) = match parse_target(lhs) {
                 Ok(v) => v,
                 Err(e) => {
@@ -389,6 +426,19 @@ impl Bindings {
                 streak,
                 b.action.describe(keys)
             ));
+        }
+        for c in &self.combos {
+            let steps: Vec<String> = c
+                .steps
+                .iter()
+                .map(|(b, n)| if *n == 1 { b.to_string() } else { format!("{b}x{n}") })
+                .collect();
+            let within = if c.within_ms == DEFAULT_WITHIN_MS {
+                String::new()
+            } else {
+                format!(" within {}", c.within_ms)
+            };
+            s.push_str(&format!("combo {}{} = {}\n", steps.join(" "), within, c.action.describe(keys)));
         }
         s
     }
@@ -454,24 +504,7 @@ fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), Strin
             if within.is_some() {
                 return Err("`within` given twice".into());
             }
-            let Some(v) = words.next() else {
-                return Err("`within` needs a time in milliseconds, like `within 400`".into());
-            };
-            let digits = v.to_ascii_lowercase();
-            let digits = digits.strip_suffix("ms").unwrap_or(&digits);
-            // Parse wide so "99999" is out of range, not unreadable.
-            let ms: u32 = digits
-                .parse()
-                .map_err(|_| format!("bad time {v:?} after `within`; want milliseconds"))?;
-            let ms = u16::try_from(ms).unwrap_or(u16::MAX);
-            if !WITHIN_MS_RANGE.contains(&ms) {
-                return Err(format!(
-                    "`within {ms}` is out of range; want {} to {} milliseconds",
-                    WITHIN_MS_RANGE.start(),
-                    WITHIN_MS_RANGE.end()
-                ));
-            }
-            within = Some(ms);
+            within = Some(parse_within(words.next())?);
         } else {
             return Err(format!("expected `replace`, `augment`, `xN` or `within MS`, got {w:?}"));
         }
@@ -490,6 +523,68 @@ fn parse_target(lhs: &str) -> std::result::Result<(u8, BindMode, u8, u16), Strin
         );
     }
     Ok((button, mode, presses, within.unwrap_or(DEFAULT_WITHIN_MS)))
+}
+
+/// The time after `within`, in milliseconds, with an optional `ms`.
+fn parse_within(word: Option<&str>) -> std::result::Result<u16, String> {
+    let Some(v) = word else {
+        return Err("`within` needs a time in milliseconds, like `within 400`".into());
+    };
+    let lower = v.to_ascii_lowercase();
+    let digits = lower.strip_suffix("ms").unwrap_or(&lower);
+    let ms: u32 = digits
+        .parse()
+        .map_err(|_| format!("bad time {v:?} after `within`; want milliseconds"))?;
+    let ms = u16::try_from(ms).unwrap_or(u16::MAX);
+    if !WITHIN_MS_RANGE.contains(&ms) {
+        return Err(format!(
+            "`within {ms}` is out of range; want {} to {} milliseconds",
+            WITHIN_MS_RANGE.start(),
+            WITHIN_MS_RANGE.end()
+        ));
+    }
+    Ok(ms)
+}
+
+/// `combo 6x2 4 within 600 = action`: sniper twice, then button 4 once.
+fn parse_combo(lhs: &str, rhs: &str, keys: &dyn Keymap) -> std::result::Result<Combo, String> {
+    let mut words = lhs.split_whitespace().skip(1);
+    let mut steps: Vec<(u8, u8)> = Vec::new();
+    let mut within = None;
+    while let Some(w) = words.next() {
+        if w.eq_ignore_ascii_case("within") {
+            if within.is_some() {
+                return Err("`within` given twice".into());
+            }
+            within = Some(parse_within(words.next())?);
+            continue;
+        }
+        if within.is_some() {
+            return Err(format!("unexpected {w:?} after `within`"));
+        }
+        let lower = w.to_ascii_lowercase();
+        let (b, n) = lower.split_once('x').unwrap_or((&lower, "1"));
+        let button: u8 = b.parse().map_err(|_| format!("bad step {w:?}; want a button, or button x count, like 6x2"))?;
+        if button == 0 || button > MAX_BUTTON {
+            return Err(format!("button {button} is out of range (1..={MAX_BUTTON})"));
+        }
+        let count: u8 = n.parse().map_err(|_| format!("bad press count in {w:?}"))?;
+        if count == 0 || count > MAX_PRESSES {
+            return Err(format!("{w:?}: the count must be 1 to {MAX_PRESSES}"));
+        }
+        if steps.last().is_some_and(|(prev, _)| *prev == button) {
+            return Err(format!("{w:?} repeats the button before it; make it one step with the total count"));
+        }
+        steps.push((button, count));
+    }
+    if steps.len() < 2 {
+        return Err("a combo needs at least two steps; for one button use `button N xK`".into());
+    }
+    if steps.len() > MAX_STEPS {
+        return Err(format!("a combo has at most {MAX_STEPS} steps"));
+    }
+    let action = Action::parse(rhs, keys)?;
+    Ok(Combo { steps, within_ms: within.unwrap_or(DEFAULT_WITHIN_MS), action })
 }
 
 /// Metacharacters that mean the string wants a shell rather than a bare exec.
@@ -595,6 +690,13 @@ pub const EXAMPLE: &str = "\
 #
 #   button 6 x3 = command notify-send three-presses
 #   button 6 x2 within 300 = command my-script --flag
+#
+# COMBOS. A sequence of buttons, each pressed some number of times, runs an
+# action on its last press: `combo 6x2 4 = ...` is button 6 twice then button 4
+# once; `within MS` is the longest pause between presses. Counts are exact.
+#
+#   combo 6x2 4 = command notify-send sniper-twice-then-4
+#   combo 6x3 2x2 within 700 = command notify-send sniper-3-then-right-2
 #
 # `logi bind watch` prints each button's number as you press it. A press count
 # needs the default `augment`, never `replace`.
@@ -976,5 +1078,52 @@ mod tests {
         let (b, problems) = parse_one("button 6 x3 = command notify-send \"three presses\"\n");
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(b.get(6).unwrap().presses, 3);
+    }
+
+    // ---- combos ----
+
+    #[test]
+    fn a_combo_is_read_and_written_back() {
+        let (b, problems) = parse_one("combo 6x2 4 = command true\ncombo 6x3 2x2 within 700 = command false\n");
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(b.combos[0].steps, vec![(6, 2), (4, 1)]);
+        assert_eq!((b.combos[1].steps.clone(), b.combos[1].within_ms), (vec![(6, 3), (2, 2)], 700));
+        assert_eq!(b.render(&FakeKeys), "combo 6x2 4 = command true\ncombo 6x3 2x2 within 700 = command false\n");
+        assert!(b.list.is_empty() && !b.is_empty() && b.len() == 2);
+    }
+
+    #[test]
+    fn a_combo_does_not_silence_anything() {
+        let (b, _) = parse_one("combo 6x2 4 = command true\n");
+        assert!(b.to_silence().is_empty());
+    }
+
+    #[test]
+    fn bad_combos_are_refused_with_a_reason() {
+        for (line, want) in [
+            ("combo 6x2 = command true", "at least two"),
+            ("combo 6 6 = command true", "repeats the button"),
+            ("combo 6x2 4x0 = command true", "must be 1 to"),
+            ("combo 6x2 4x9 = command true", "must be 1 to"),
+            ("combo 6x2 0 = command true", "out of range"),
+            ("combo 6x2 99 = command true", "out of range"),
+            ("combo 6x2 four = command true", "bad step"),
+            ("combo 1 2 3 4 5 6 7 = command true", "at most"),
+            ("combo 6x2 4 within 5 = command true", "out of range"),
+            ("combo 6x2 4 within 400 5 = command true", "after `within`"),
+            ("combo 6x2 4 = ", "expected an action"),
+        ] {
+            let (b, problems) = parse_one(line);
+            assert!(b.combos.is_empty(), "{line} should not load");
+            assert!(problems.iter().any(|p| p.contains(want)), "{line}: wanted {want:?} in {problems:?}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_combo_keeps_the_later_line() {
+        let (b, problems) = parse_one("combo 6x2 4 = command one\ncombo 6x2 4 = command two\n");
+        assert_eq!(b.combos.len(), 1);
+        assert_eq!(b.combos[0].action, Action::Command("two".into()));
+        assert!(problems.iter().any(|p| p.contains("already bound")));
     }
 }

@@ -211,6 +211,16 @@ run`: the sniper button reports through the spy as button 6, and with
 six fired twice, as intended. **Not run on hardware:** the same through the
 service, and the Macros section on screen.
 
+## Button combos
+
+`combo 6x3 2x2 within 700 = command ...`: a list of (button, presses) steps that
+runs an action on the press that completes the last one (`Sequences` in
+`src/streak.rs`, syntax in `src/actions.rs`). Counts are exact, every press must
+follow the last within the limit, adjacent steps are different buttons, and two
+combos sharing a start are fine. Buttons keep their own jobs. A "Button combos"
+section sits under Macros in the Buttons tab. Unit-tested; **not yet run on the
+mouse**.
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or
