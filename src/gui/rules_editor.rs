@@ -628,6 +628,8 @@ enum Status {
 
 /// The rules panel.
 pub struct RulesEditor {
+    /// Ctrl+S was pressed; taken by the Save button, which keeps its checks.
+    save_requested: bool,
     path: PathBuf,
     model: Model,
     /// The model as last read from or written to disk, for `dirty`.
@@ -679,8 +681,13 @@ impl RulesEditor {
 
     /// Same, against a given path. Used by the tests so they never go near the
     /// real config.
+    pub fn request_save(&mut self) {
+        self.save_requested = true;
+    }
+
     pub fn with_path(path: PathBuf) -> Self {
         RulesEditor {
+            save_requested: false,
             path,
             model: Model::default(),
             disk: Model::default(),
@@ -1317,7 +1324,8 @@ impl RulesEditor {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 let can_save = errors == 0 && self.dirty() && self.unreadable.is_none();
-                if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+                let asked = std::mem::take(&mut self.save_requested);
+                if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() || (asked && can_save) {
                     self.save();
                 }
                 if ui.button("Reload from file").clicked() {
@@ -1703,6 +1711,32 @@ poll_ms = 500
         assert!(text.contains("csgo = 1, 800"), "{text}");
         assert!(text.contains("poll_ms = 750"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_s_saves_through_the_save_button_only_when_it_could_be_clicked() {
+        use std::cell::RefCell;
+        let dir = temp_dir("ctrl-s");
+        let path = dir.join("rules.conf");
+        let ed = RefCell::new(RulesEditor::with_path(path.clone()));
+        ed.borrow_mut().load();
+        // Nothing to save: the request does nothing and is not kept for later.
+        ed.borrow_mut().request_save();
+        egui::__run_test_ui(|ui| ed.borrow_mut().file_section(ui, 0));
+        assert!(!path.exists());
+        ed.borrow_mut().model.add("csgo", 1);
+        egui::__run_test_ui(|ui| ed.borrow_mut().file_section(ui, 0));
+        assert!(!path.exists(), "the stale request must not save a later edit");
+        // A real request on a dirty editor saves.
+        ed.borrow_mut().request_save();
+        egui::__run_test_ui(|ui| ed.borrow_mut().file_section(ui, 0));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("csgo"));
+        // And a blocked editor refuses, as the button would.
+        ed.borrow_mut().model.add("blender", 2);
+        ed.borrow_mut().request_save();
+        egui::__run_test_ui(|ui| ed.borrow_mut().file_section(ui, 1));
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("blender"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

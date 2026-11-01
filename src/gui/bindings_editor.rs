@@ -372,6 +372,8 @@ pub struct BindingsEditor {
     saved: Vec<Row>,
     combos: Vec<ComboRow>,
     saved_combos: Vec<ComboRow>,
+    /// Ctrl+S was pressed; taken by the Save button, which keeps its checks.
+    save_requested: bool,
     /// Lines the config file could not parse. Kept visible: a binding that
     /// silently vanished is worse than one that complains.
     problems: Vec<String>,
@@ -435,6 +437,7 @@ impl BindingsEditor {
             saved: (1..=MAX_BUTTON).map(Row::blank).collect(),
             combos: Vec::new(),
             saved_combos: Vec::new(),
+            save_requested: false,
             problems: Vec::new(),
             status: None,
             capturing: None,
@@ -489,6 +492,10 @@ impl BindingsEditor {
     }
 
     /// Whether there are unsaved edits.
+    pub fn request_save(&mut self) {
+        self.save_requested = true;
+    }
+
     pub fn dirty(&self) -> bool {
         self.rows != self.saved || self.combos != self.saved_combos
     }
@@ -1679,12 +1686,10 @@ impl BindingsEditor {
             let blocked = all_replaced(&self.rows, count);
             let ok = errs.is_empty() && !blocked;
             ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        ok && (self.dirty() || self.apply_pending(snap)),
-                        egui::Button::new("Save bindings"),
-                    )
-                    .clicked()
+                let can_save = ok && (self.dirty() || self.apply_pending(snap));
+                let asked = std::mem::take(&mut self.save_requested);
+                if ui.add_enabled(can_save, egui::Button::new("Save bindings")).clicked()
+                    || (asked && can_save)
                 {
                     match self.save(count) {
                         Ok(silence) => {

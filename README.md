@@ -163,6 +163,10 @@ installer" block in your shell profiles, `~/.config/logi/`, the two
 
 ## Using it
 
+Ctrl+S saves the current tab: the bindings and rules editors through their Save
+button, and on the other tabs it sends any change still waiting. The service
+picks up a saved bindings or rules file within a second.
+
 Closing the window does not end the program when the desktop has a panel icon
 area: the window really closes (a Wayland application cannot hide its own
 window, so there is no half-hidden one left in the dock) and the icon stays.

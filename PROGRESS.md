@@ -225,6 +225,19 @@ with a 1.5 s limit; the same presses at the 500 ms default were too slow to
 match, as intended. **Not run on hardware:** through the service, and the
 section on screen.
 
+## Saving takes effect, and Ctrl+S
+
+The service read `bindings.conf` and `rules.conf` only at start or on SIGHUP, so
+a macro changed in the app while it was running kept its old version. It now
+polls both files once a second and reloads itself when either changes (checked:
+touching the file produced a reload and a fresh load within a second). Macro
+commands also ran inside the service's sandbox, whose home is read-only, so
+a program that writes to `$HOME` could fail; under systemd they now run as
+transient units of their own (`systemd-run --user`), checked in the argv by a
+test and the sandbox failure shown by hand, not yet through a real macro in the
+service. Ctrl+S saves the current tab's editor through its own Save button,
+checks included; on the other tabs it sends what is waiting.
+
 ## Warnings
 
 The tree builds with no warnings and CI denies them. Dead code was deleted or

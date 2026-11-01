@@ -684,6 +684,9 @@ impl eframe::App for App {
         if instance::take_raise() {
             self.show(ctx);
         }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.save_shortcut();
+        }
         self.sync_tray(ctx);
         // The worker polls for the device, so keep repainting to pick up a
         // replug without the user having to click anything.
@@ -748,6 +751,21 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             None => {}
+        }
+    }
+
+    /// Ctrl+S: the host-side editors run their own Save, with its checks; the
+    /// rest send what is waiting now.
+    fn save_shortcut(&mut self) {
+        match self.tab {
+            Tab::Buttons => self.bindings.request_save(),
+            Tab::Apps => self.rules.request_save(),
+            _ => {
+                let safety = self.safety();
+                for c in self.profile_editor.flush(&self.snap, &safety) {
+                    self.send_tracked(c);
+                }
+            }
         }
     }
 

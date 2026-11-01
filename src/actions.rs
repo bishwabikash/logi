@@ -628,7 +628,27 @@ pub fn argv(command: &str) -> Vec<String> {
 /// reaper will not start, the error is returned and that one child is left for
 /// process exit to collect.
 pub fn spawn_detached(command: &str) -> std::io::Result<()> {
-    let args = argv(command);
+    spawn_with(command, std::env::var_os("INVOCATION_ID").is_some())
+}
+
+/// The argv to exec. Under systemd the service is sandboxed (read-only home),
+/// and a macro's command should not inherit that, so it goes out as a unit of
+/// its own.
+fn launch_argv(command: &str, under_systemd: bool) -> Vec<String> {
+    let mut args = argv(command);
+    if under_systemd && !args.is_empty() {
+        let mut wrapped: Vec<String> =
+            ["systemd-run", "--user", "--quiet", "--collect", "--no-block", "--"]
+                .map(String::from)
+                .into();
+        wrapped.append(&mut args);
+        return wrapped;
+    }
+    args
+}
+
+fn spawn_with(command: &str, under_systemd: bool) -> std::io::Result<()> {
+    let args = launch_argv(command, under_systemd);
     let Some((exe, rest)) = args.split_first() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -847,13 +867,13 @@ mod tests {
         // The child runs for a second; the call has to come straight back or a
         // bound button would freeze the event loop for as long as it runs.
         let t = std::time::Instant::now();
-        spawn_detached("/bin/sleep 1").expect("spawn /bin/sleep");
+        spawn_with("/bin/sleep 1", false).expect("spawn /bin/sleep");
         assert!(t.elapsed() < std::time::Duration::from_millis(500), "{:?}", t.elapsed());
     }
 
     #[test]
     fn a_missing_program_is_an_error_not_a_panic() {
-        assert!(spawn_detached("/nonexistent/no-such-program").is_err());
+        assert!(spawn_with("/nonexistent/no-such-program", false).is_err());
     }
 
     #[test]
@@ -1125,5 +1145,17 @@ mod tests {
         assert_eq!(b.combos.len(), 1);
         assert_eq!(b.combos[0].action, Action::Command("two".into()));
         assert!(problems.iter().any(|p| p.contains("already bound")));
+    }
+
+    #[test]
+    fn under_systemd_a_command_becomes_a_unit_of_its_own() {
+        let a = launch_argv("notify-send hi", true);
+        assert_eq!(&a[..2], ["systemd-run", "--user"]);
+        assert_eq!(&a[a.len() - 2..], ["notify-send", "hi"]);
+        assert_eq!(launch_argv("notify-send hi", false), ["notify-send", "hi"]);
+        // A shell command keeps its shell inside the wrapper.
+        let sh = launch_argv("echo a > /dev/null", true);
+        assert_eq!(&sh[sh.len() - 3..], ["/bin/sh", "-c", "echo a > /dev/null"]);
+        assert!(launch_argv("", true).is_empty());
     }
 }

@@ -1376,6 +1376,30 @@ fn silence_fits(silence: &[u8], count: u8) -> Result<(), String> {
     }
 }
 
+/// A file's change marker: its modified time and length, `None` if absent.
+fn file_mark(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.modified().ok()?, m.len()))
+}
+
+/// Ask the service to reload when either config file changes, so saving in the
+/// app takes effect without a restart.
+fn watch_config(paths: Vec<std::path::PathBuf>) {
+    let marks: Vec<_> = paths.iter().map(|p| file_mark(p)).collect();
+    let _ = std::thread::Builder::new().name("logi-config-watch".into()).spawn(move || {
+        let mut marks = marks;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1000));
+            let now: Vec<_> = paths.iter().map(|p| file_mark(p)).collect();
+            if now != marks {
+                marks = now;
+                eprintln!("logi: configuration changed; reloading");
+                RELOAD.store(true, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
 /// Make sure the panel icon is up while the service is.
 /// Started as its own transient systemd unit, since a child of the service would die with it. Best effort.
 fn ensure_tray() {
@@ -1410,6 +1434,7 @@ fn cmd_serve() -> Result<(), CliError> {
 
     let path = appwatch::config_path();
     let bindings_path = actions::config_path();
+    watch_config(vec![path.clone(), bindings_path.clone()]);
     // Idling is the steady state with no rules, and repeating the same
     // sentence into the journal every minute forever buries everything else.
     let mut announced_idle = false;
